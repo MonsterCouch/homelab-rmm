@@ -1,0 +1,14 @@
+/rmm-server
+/rmm-agent
+/rmm-server.exe
+/rmm-agent.exe
+/dist/
+/build/
+/web/node_modules/
+/web/dist/
+!/web/dist/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+*.log
+.DS_Store
