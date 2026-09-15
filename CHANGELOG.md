@@ -5,6 +5,12 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.0] - 2026-09-15
+
+Initial release.
+
 ### Security
 - **Install script endpoint hardened.** `GET /install/{token}` now renders a script only for a
   token that matches `^[A-Za-z0-9_-]{16,64}$` *and* could still enrol a device; anything else is
@@ -133,10 +139,6 @@ and versions follow [Semantic Versioning](https://semver.org/).
   container and must not be pointed at the gateway wholesale. The comment claiming
   `RMM_PUBLIC_URL` can be changed later in Settings is replaced by what actually happens: it
   seeds the setting on first start, and the saved setting wins afterwards.
-
-## [0.1.0] - 2026-09-15
-
-Initial release.
 
 ### Server
 - Single binary with embedded web console, JSON API, Server-Sent Events, SQLite (pure Go,
