@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,8 +21,27 @@ import (
 //   {"t":"in","data":"ls\r"}  {"t":"resize","cols":..,"rows":..}
 // and receives {"t":"out","data":...}, {"t":"opened","session":..}, {"t":"closed"}.
 
+// sameOrigin rejects cross-site WebSocket hijacking: browsers always send
+// Origin on WebSocket upgrades, and a legitimate viewer's origin host is the
+// host it loaded the console from.
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true // non-browser client; the cookie check already passed
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
 func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 	agentID := r.PathValue("id")
+	if !sameOrigin(r) {
+		writeErr(w, 403, "cross-origin websocket refused")
+		return
+	}
 	if !s.hub.IsOnline(agentID) {
 		writeErr(w, 409, "agent is offline")
 		return
@@ -128,6 +149,10 @@ func newDesktopBroker() *desktopBroker { return &desktopBroker{pending: map[stri
 
 func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 	agentID := r.PathValue("id")
+	if !sameOrigin(r) {
+		writeErr(w, 403, "cross-origin websocket refused")
+		return
+	}
 	if !s.hub.IsOnline(agentID) {
 		writeErr(w, 409, "agent is offline")
 		return

@@ -119,6 +119,22 @@ func (d *DB) agentByKey(key string) (string, bool) {
 	return id, true
 }
 
+// checkEnrollToken reports whether a token could still enrol a device.
+func (d *DB) checkEnrollToken(token string) error {
+	var usesLeft int
+	var expires int64
+	if err := d.QueryRow(`SELECT uses_left, expires_at FROM enroll_tokens WHERE token = ?`, token).Scan(&usesLeft, &expires); err != nil {
+		return errors.New("unknown token")
+	}
+	if expires < now() {
+		return errors.New("token expired")
+	}
+	if usesLeft == 0 {
+		return errors.New("token exhausted")
+	}
+	return nil
+}
+
 // enrollAgent consumes an enrolment token and creates the agent record.
 func (d *DB) enrollAgent(token string, hello protocol.Hello, ip string) (id, key string, err error) {
 	var (

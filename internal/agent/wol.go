@@ -11,6 +11,10 @@ import (
 // picks an agent on the target's subnet to call this, because directed
 // broadcasts rarely cross routers.
 func sendMagicPacket(mac, broadcast string) error {
+	return sendMagicPacketTo(mac, broadcast, "9")
+}
+
+func sendMagicPacketTo(mac, broadcast, port string) error {
 	hw, err := net.ParseMAC(strings.TrimSpace(mac))
 	if err != nil {
 		return err
@@ -26,7 +30,7 @@ func sendMagicPacket(mac, broadcast string) error {
 	if broadcast == "" {
 		broadcast = "255.255.255.255"
 	}
-	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(broadcast, "9"))
+	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(broadcast, port))
 	if err != nil {
 		return err
 	}

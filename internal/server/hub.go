@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -47,7 +48,7 @@ type agentConn struct {
 	connected time.Time
 	closed    chan struct{}
 	closeOnce sync.Once
-	lastPong  time.Time
+	lastPong  atomic.Int64 // unix nanos of the last frame from the agent
 }
 
 func newHub(s *Server) *Hub {
@@ -113,7 +114,12 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		}
 		agentID = id
 	case enroll != "":
-		// enrolment is completed after hello so the record has a hostname
+		// enrolment is completed after hello so the record has a hostname,
+		// but the token is checked now so a bad one never gets a socket
+		if err := h.s.db.checkEnrollToken(enroll); err != nil {
+			writeErr(w, http.StatusUnauthorized, "enrolment refused: "+err.Error())
+			return
+		}
 	default:
 		writeErr(w, http.StatusUnauthorized, "missing credentials")
 		return
@@ -150,14 +156,16 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		}
 		agentID, newKey = id, key
 		h.s.db.Audit("system", ip, "agent.enrolled", agentID, hello.Hostname)
+		defer h.s.sched.automation("enrolled", agentID, map[string]any{"hostname": hello.Hostname})
 	}
 	hello.AgentID = agentID
 
 	ac := &agentConn{
 		id: agentID, hello: hello, conn: conn, ip: ip,
 		pending: map[string]chan protocol.Envelope{}, streams: map[string]func(protocol.Envelope){},
-		connected: time.Now(), closed: make(chan struct{}), lastPong: time.Now(),
+		connected: time.Now(), closed: make(chan struct{}),
 	}
+	ac.lastPong.Store(time.Now().UnixNano())
 
 	// welcome: identity (for a new enrolment) + config
 	welcome := map[string]any{"agent_id": agentID, "config": h.s.agentConfig(agentID)}
@@ -206,7 +214,7 @@ func (h *Hub) keepalive(ac *agentConn) {
 		case <-ac.closed:
 			return
 		case <-t.C:
-			if time.Since(ac.lastPong) > 90*time.Second {
+			if time.Since(time.Unix(0, ac.lastPong.Load())) > 90*time.Second {
 				slog.Warn("agent unresponsive, dropping", "id", ac.id)
 				ac.close()
 				return
@@ -227,7 +235,7 @@ func (h *Hub) readLoop(ac *agentConn) {
 			slog.Warn("bad frame from agent", "id", ac.id, "err", err)
 			continue
 		}
-		ac.lastPong = time.Now()
+		ac.lastPong.Store(time.Now().UnixNano())
 		switch env.T {
 		case protocol.TypePong:
 		case protocol.TypeReply:
@@ -285,15 +293,16 @@ func (ac *agentConn) close() {
 		close(ac.closed)
 		ac.conn.Close()
 		ac.pmu.Lock()
-		for id, ch := range ac.pending {
-			ch <- protocol.Envelope{ID: id, Err: "agent disconnected"}
-			delete(ac.pending, id)
-		}
-		for id, sink := range ac.streams {
-			sink(protocol.Envelope{T: protocol.TypeReply, ID: id, Err: "agent disconnected"})
-			delete(ac.streams, id)
-		}
+		pending, streams := ac.pending, ac.streams
+		ac.pending, ac.streams = map[string]chan protocol.Envelope{}, map[string]func(protocol.Envelope){}
 		ac.pmu.Unlock()
+		// deliver outside the lock: a sink may call back into the hub
+		for id, ch := range pending {
+			ch <- protocol.Envelope{ID: id, Err: "agent disconnected"}
+		}
+		for id, sink := range streams {
+			sink(protocol.Envelope{T: protocol.TypeReply, ID: id, Err: "agent disconnected"})
+		}
 	})
 }
 
