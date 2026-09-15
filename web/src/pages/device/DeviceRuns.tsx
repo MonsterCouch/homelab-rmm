@@ -15,7 +15,7 @@ export function DeviceRuns({ agent }: TabProps) {
     <>
       {runs.error && <ErrorBox error={runs.error} onRetry={runs.reload} />}
       <RunsTable rows={runs.data} loading={runs.loading} onOpen={(r) => setOpen(r.id)} showDevice={false} emptyTitle="No scripts have run on this device" />
-      {open && <RunDrawer runId={open} onClose={() => setOpen(null)} onChanged={runs.reload} />}
+      {open && <RunDrawer runId={open} onClose={() => setOpen(null)} onChanged={runs.reload} onOpenRun={setOpen} />}
     </>
   );
 }

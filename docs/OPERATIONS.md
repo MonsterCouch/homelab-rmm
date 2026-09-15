@@ -35,6 +35,7 @@ the file names do not collide.
 
 ```
 rmm-server install [--listen :8443] [--data DIR] [--public-url URL] [--cert F --key F] [--insecure]
+                   [--trusted-proxies IP,CIDR,...]
 rmm-server uninstall | start | stop | restart | status
 rmm-agent  install --server URL --token TOKEN [--fingerprint HEX] [--no-service]
 rmm-agent  uninstall | start | stop | restart | status
@@ -47,9 +48,49 @@ you gave it. Change flags by running `install` again with the new set. Native to
 
 Running in the foreground for a test: `rmm-server run --data ./tmp --listen :8443`. Every flag
 has an environment twin (`RMM_LISTEN`, `RMM_DATA_DIR`, `RMM_PUBLIC_URL`, `RMM_CERT_FILE`,
-`RMM_KEY_FILE`, `RMM_INSECURE`, `RMM_DEV_WEB_DIR`), which is what the Docker image and the
-example systemd unit use. `RMM_DEBUG=1` switches both binaries to debug logging (every API
+`RMM_KEY_FILE`, `RMM_INSECURE`, `RMM_TRUSTED_PROXIES`, `RMM_DEV_WEB_DIR`), which is what the
+Docker image and the example systemd unit use. `RMM_DEBUG=1` switches both binaries to debug logging (every API
 request is logged with its duration).
+
+### First run: the one-time setup code
+
+Until an account exists, anyone who can reach the port could complete the setup form and become
+the administrator. So a server that starts with an **empty user table mints a random setup code**
+and prints it two ways:
+
+```
+==== FIRST-RUN SETUP CODE: 3f9a1c07 ====
+```
+
+on the console (stderr: `journalctl -u HomelabRMMServer`, `docker logs`) and — the place to look
+when it runs as a Windows service, where stderr goes nowhere — as a `WARN` line in `server.log`
+in the data directory:
+
+```
+level=WARN msg="FIRST RUN: no users yet. ..." setup_code=3f9a1c07
+```
+
+- The setup form **always** shows a **Setup code** field and the request is refused with 403
+  until it matches — from the LAN, from behind a reverse proxy, and from a browser on the server
+  itself. There is no loopback exemption: a peer address of `127.0.0.1` can equally be a same-host
+  reverse proxy relaying the whole LAN, any local process on the box, or a hostile page open in
+  your own browser, and none of those should be able to claim the account that is root on every
+  device you later enrol. Reading the code proves you can see the server's console or log, which
+  is the thing worth proving.
+- Wrong codes are rate-limited like logins and audited as `setup.refused`.
+- Concurrent setup requests do not race: the "no users yet?" check and the insert are one step,
+  so a first-run window produces exactly one administrator.
+- **Lost the code?** Restart the server *before anyone creates a user*: a new code is minted on
+  every start that finds no users, so `rmm-server restart` (or `systemctl restart
+  HomelabRMMServer`) prints a fresh one. Once the first account exists the code stops being
+  minted and stops being asked for — from then on recovery is `rmm-server user passwd`.
+- **Docker**: read it from the container log —
+  `docker logs homelab-rmm 2>&1 | grep -i "setup code"` (`docker compose logs rmm` with the
+  compose file). The image is distroless, so there is no shell to `docker exec` into; the same
+  code is in `/data/server.log` inside the volume if you need it later, as the `setup_code=`
+  attribute of the `FIRST RUN` warning
+  (`docker run --rm -v rmm-data:/data busybox grep setup_code /data/server.log`). A fresh code
+  needs `docker compose restart rmm` while the user table is still empty.
 
 ### Users from the command line
 
@@ -66,8 +107,10 @@ directly and can run while the service is up (SQLite WAL with a 5 s busy timeout
 
 - **Server**: `server.log` in the data directory and stderr (journal / Event Log / `docker logs`).
   Startup prints `listening addr=… tls=… fingerprint=… data=… version=…`; the fingerprint line is
-  what agents pin. Agent connects/disconnects, enrolments, alerts opened and tasks run are logged
-  at info.
+  what agents pin, and on a first run the one-time setup code is printed beside it. Agent
+  connects/disconnects, enrolments, alerts opened and tasks run are logged at info. Two `WARN`
+  lines are worth alerting on: `agent record re-keyed by enrolment` (a device took over an
+  existing, offline device record — see the audit note below) and `first-run setup refused`.
 - **Agent**: `agent.log`. `connected server=… agent_id=…` means all is well; `session ended
   err=… retry_in=…` shows why it is reconnecting.
 - **In the console**: *Settings → System* (`/api/system`) shows version, public URL,
@@ -106,7 +149,8 @@ You may prefer your own TLS termination (Let's Encrypt, an internal CA, one wild
 lab). Run the server on plain HTTP bound to localhost and tell it its public name:
 
 ```
-rmm-server install --insecure --listen 127.0.0.1:8080 --public-url https://rmm.example.lan
+rmm-server install --insecure --listen 127.0.0.1:8080 --public-url https://rmm.example.lan \
+  --trusted-proxies 127.0.0.1
 ```
 
 Ready-made configurations: `deploy/Caddyfile` and `deploy/nginx.conf`. What matters:
@@ -118,12 +162,35 @@ Ready-made configurations: `deploy/Caddyfile` and `deploy/nginx.conf`. What matt
   buffering (`proxy_buffering off`, Caddy `flush_interval -1`).
 - **Host header** must be forwarded unchanged: browser WebSockets are accepted only when the
   `Origin` host matches `Host`.
-- **`X-Forwarded-For`**: the first address is recorded in the audit log and used by the login
-  rate limiter. Because the server trusts it blindly, the HTTP port must not be reachable except
-  through the proxy (bind to `127.0.0.1`, or firewall it).
+- **`X-Forwarded-For`**: ignored unless you say where the proxy is. Pass
+  `--trusted-proxies 127.0.0.1` (or `RMM_TRUSTED_PROXIES=127.0.0.1`) — a comma-separated list of
+  IPs or CIDRs; a bare address means that host alone. Only when the connection *comes from* one
+  of those is the header read at all, and then the server walks the hop list **from the right**,
+  skipping addresses that are themselves trusted proxies, and takes the first one that is not.
+  That is deliberate: `deploy/nginx.conf` uses `$proxy_add_x_forwarded_for` and Caddy appends by
+  default, so what arrives is `<whatever the client sent>, <the address the proxy saw>` — the
+  left-most hop is the client's own invention and only the right-most non-proxy hop is evidence.
+  A hop that will not parse breaks the chain and the peer address is used instead. Without the
+  flag every request behind the proxy is recorded as coming from the proxy and they all share one
+  limiter bucket. Keep the list as narrow as the proxy actually is — anything that can reach the
+  server from a trusted network can claim to be any client — and note that a CIDR with host bits
+  set covers its whole network (`10.0.0.5/8` is all of `10.0.0.0/8`; the server logs a warning
+  when you write one). The HTTP port still must not be reachable except through the proxy (bind
+  to `127.0.0.1`, or firewall it).
+- **Caddy**: `deploy/Caddyfile` shows the proxy side only. Add `--trusted-proxies 127.0.0.1` to
+  the `rmm-server install` line there too, or every request is audited as coming from Caddy.
 - **Body size**: file uploads to devices are raw request bodies; allow at least 32–64 MB.
 - **Cookies**: with `--insecure` the session cookie is set without the `Secure` flag (the server
   cannot see the proxy's TLS). It is still `HttpOnly` and `SameSite=Strict`.
+- **Docker, even without a proxy**: a container with a published port (`ports: - "8443:8443"`)
+  never sees `127.0.0.1`. Requests from the Docker host itself arrive from the bridge gateway
+  (`172.17.0.1`, or the compose network's gateway), so *that* is what the audit log records and
+  what the login limiter buckets them under; requests from other machines normally keep their
+  own address through the NAT rule. Do **not** trust the gateway with `RMM_TRUSTED_PROXIES`
+  unless a reverse proxy really is the only thing that can reach the port — the setting means
+  "believe `X-Forwarded-For` from here", and anything on the host would then be able to write any
+  address into the audit log. When a proxy container does front the server, trust that
+  container's address on the compose network and nothing wider.
 
 **What `--insecure` means for agents.** With no certificate of its own the server has no
 fingerprint; install commands carry an empty pin and agents validate the proxy's certificate
@@ -189,8 +256,23 @@ time (suppresses new alerts and policy-driven patch installs).
 ## 9. Housekeeping checklist
 
 - Watch `rmm.db` size in *Settings → System*; metrics dominate, retention controls it.
-- Keep enrolment tokens short-lived; expired ones disappear from the list automatically.
-- Review *Audit* and *Users* occasionally; remove accounts you no longer use.
+- Keep enrolment tokens short-lived; expired ones disappear from the list automatically. They
+  are also the reason a deleted device can come back: the agent keeps `enroll_token` in
+  `agent.json` and re-enrols with it the moment its key is rejected, as a **new** record with no
+  history. Stop or uninstall the agent (`rmm-agent stop` / `rmm-agent uninstall`, or
+  `deploy/uninstall.ps1` / `deploy/uninstall.sh`) *before* deleting the device, or make sure the
+  token it holds is expired or exhausted.
+- Review *Audit* and *Users* occasionally; remove accounts you no longer use. In *Audit*, an
+  **`agent.rekeyed`** entry means an enrolment adopted an existing offline device record instead
+  of creating a new one. That is what a reinstall looks like — and also what a machine claiming
+  another's hostname looks like, so any you did not cause deserves a look. An
+  **`agent.duplicate_hostname`** entry is the same attempt against a device that was *online*:
+  nothing was adopted, but you now have two rows with one hostname, so make sure you aim scripts
+  at the right one. A plain new device is `agent.enrolled`.
+- Give people who only need dashboards the `viewer` role: on top of being refused every write, a
+  viewer cannot open a terminal (`/ws/shell`), start a remote desktop session (`/ws/desktop`),
+  download a file from a device, or read the enrolment token list (`GET /api/enroll`) — a token
+  is all anyone needs to add a device of their own.
 - After upgrading the server, replace the `agents/` folder too so newly enrolled devices get the
   matching agent.
 - Keep the server itself patched: it is a device like any other and can run the agent.

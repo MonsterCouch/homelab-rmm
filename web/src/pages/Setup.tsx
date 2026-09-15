@@ -6,12 +6,13 @@ import { useAuth } from '../state/auth';
 import { errMsg } from '../state/toast';
 
 export function Setup() {
-  const { refresh } = useAuth();
+  const { refresh, setupCodeRequired: codeRequired } = useAuth();
   const navigate = useNavigate();
   const [username, setUsername] = useState('admin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
+  const [code, setCode] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -22,7 +23,7 @@ export function Setup() {
     if (password !== confirm) return setError('Passwords do not match.');
     setBusy(true);
     try {
-      await api.setup(username.trim(), password, email.trim());
+      await api.setup(username.trim(), password, email.trim(), code.trim());
       await refresh();
       navigate('/', { replace: true });
     } catch (err) {
@@ -55,6 +56,15 @@ export function Setup() {
         <Field label="Confirm password" htmlFor="su-pw2">
           <input id="su-pw2" type="password" value={confirm} autoComplete="new-password" required onChange={(e) => setConfirm(e.target.value)} />
         </Field>
+        {codeRequired && (
+          <Field
+            label="Setup code"
+            htmlFor="su-code"
+            hint="The one-time code the server printed at startup — on the console, and as a WARN line in server.log in the data directory. Lost it? Restart the server before anyone creates a user and it prints a new one."
+          >
+            <input id="su-code" value={code} autoComplete="off" required spellCheck={false} onChange={(e) => setCode(e.target.value)} />
+          </Field>
+        )}
         <Button type="submit" variant="primary" busy={busy} style={{ width: '100%', marginTop: 6 }}>
           Create administrator
         </Button>

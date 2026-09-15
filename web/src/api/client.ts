@@ -149,8 +149,8 @@ function normAgent(a: Agent): Agent {
 export const api = {
   // ---- auth ----
   authState: () => get<AuthState>('/api/auth/state', { noRedirect: true }),
-  setup: (username: string, password: string, email: string) =>
-    post<Ok>('/api/auth/setup', { username, password, email }, { noRedirect: true }),
+  setup: (username: string, password: string, email: string, code: string) =>
+    post<Ok>('/api/auth/setup', { username, password, email, code }, { noRedirect: true }),
   login: (username: string, password: string, code: string) =>
     post<LoginResponse>('/api/auth/login', { username, password, code }, { noRedirect: true }),
   logout: () => post<Ok>('/api/auth/logout', undefined, { noRedirect: true }),

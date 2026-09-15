@@ -2,11 +2,9 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -175,22 +173,12 @@ func (b *browser) mustJSON(method, path string, body any, out any) {
 	}
 }
 
+// newTestServer is a server with an admin created and a signed-in browser.
+// The fixture itself lives in testutil_test.go so tests that need a different
+// Config can share it.
 func newTestServer(t *testing.T) (*Server, *httptest.Server, *browser) {
 	t.Helper()
-	cfg := Config{DataDir: t.TempDir(), Listen: "127.0.0.1:0", Insecure: true, SkipSeed: true}
-	s, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	s.sched.start(ctx)
-	ts := httptest.NewServer(s.routes())
-	t.Cleanup(ts.Close)
-	jar, _ := cookiejar.New(nil)
-	b := &browser{t: t, c: &http.Client{Jar: jar}, base: ts.URL}
-	b.mustJSON("POST", "/api/auth/setup", map[string]string{"username": "admin", "password": "password123"}, nil)
-	return s, ts, b
+	return newTestServerWith(t, Config{})
 }
 
 func wsURL(ts *httptest.Server) string { return "ws" + strings.TrimPrefix(ts.URL, "http") }
@@ -428,8 +416,7 @@ func TestEndToEnd(t *testing.T) {
 
 	// viewer role is read-only
 	b.mustJSON("POST", "/api/users", map[string]string{"username": "ro", "password": "password123", "role": "viewer"}, nil)
-	jar, _ := cookiejar.New(nil)
-	ro := &browser{t: t, c: &http.Client{Jar: jar}, base: ts.URL}
+	ro := newBrowser(t, ts)
 	ro.mustJSON("POST", "/api/auth/login", map[string]string{"username": "ro", "password": "password123"}, nil)
 	if st, _ := ro.do("POST", "/api/groups", map[string]string{"name": "z"}); st != 403 {
 		t.Fatalf("viewer write should be 403, got %d", st)

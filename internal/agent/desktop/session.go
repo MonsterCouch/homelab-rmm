@@ -48,6 +48,18 @@ var (
 	readTimeout  = 60 * time.Second // three missed pongs
 )
 
+// desktopFollower keeps a loop's OS thread on the machine's current input
+// desktop (Windows) and reports when it cannot: a helper locked out of the
+// input desktop would otherwise keep capturing a stale one, freezing the
+// viewer without a word. It is an interface, built through newFollower, so
+// the session tests can reproduce that without a Windows lock screen.
+type desktopFollower interface {
+	follow() error
+	close()
+}
+
+var newFollower = func() desktopFollower { return newThreadDesktop() }
+
 // session is one helper <-> viewer stream.
 type session struct {
 	ws  *websocket.Conn
@@ -134,7 +146,13 @@ func (s *session) run(ctx context.Context) error {
 	case <-ctx.Done():
 		err = <-capErr
 	}
-	if err != nil && ctx.Err() == nil {
+	// Was the session stopped (the caller cancelled, or readLoop did when
+	// the viewer went away), or did the capture loop fail on its own? Only
+	// the second is worth a word to the viewer and an error to the caller.
+	// It has to be read here, before the cancel() below makes ctx.Err()
+	// non-nil unconditionally.
+	stopped := ctx.Err() != nil
+	if err != nil && !stopped {
 		slog.Error("desktop capture stopped", "err", err)
 		s.sendJSON(map[string]string{"t": "error", "message": err.Error()})
 	}
@@ -143,7 +161,10 @@ func (s *session) run(ctx context.Context) error {
 	s.ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
 	s.ws.Close()
 	wg.Wait()
-	if ctx.Err() != nil && err == nil {
+	if stopped {
+		// Whatever the capture loop was doing when the stop arrived - a
+		// send that returned ctx.Err(), a write to a socket the viewer had
+		// already closed - is teardown noise, not a failed session.
 		return nil
 	}
 	return err
@@ -268,7 +289,7 @@ func (s *session) queueInput(ctx context.Context, msg viewerMsg) {
 // ---- input ----
 
 func (s *session) inputLoop(ctx context.Context) {
-	td := newThreadDesktop()
+	td := newFollower()
 	defer td.close()
 	var cur monitor // the monitor viewer coordinates refer to
 	for {
@@ -292,8 +313,13 @@ func (s *session) inputLoop(ctx context.Context) {
 	}
 }
 
-func (s *session) inject(td *threadDesktop, cur monitor, msg viewerMsg) error {
-	td.follow()
+func (s *session) inject(td desktopFollower, cur monitor, msg viewerMsg) error {
+	// A desktop we cannot follow means the event would land on the wrong
+	// desktop (or nowhere); the capture loop sees the same failure and ends
+	// the session, so here it is enough not to inject.
+	if err := td.follow(); err != nil {
+		return err
+	}
 	x, y := clampPoint(msg.X, msg.Y, cur.Bounds)
 	switch msg.T {
 	case msgMouseMove:
@@ -323,7 +349,7 @@ func (s *session) inject(td *threadDesktop, cur monitor, msg viewerMsg) error {
 // respect the viewer's flow control. It never returns while the stream is
 // healthy.
 func (s *session) captureLoop(ctx context.Context) error {
-	td := newThreadDesktop()
+	td := newFollower()
 	defer td.close()
 
 	var (
@@ -456,7 +482,13 @@ func (s *session) captureLoop(ctx context.Context) error {
 			continue
 		}
 
-		td.follow()
+		if err := td.follow(); err != nil {
+			// The input desktop moved somewhere this helper cannot go (the
+			// lock screen, a UAC prompt). Capturing on regardless would
+			// stream a frozen picture of the old desktop, so end the
+			// session with a message the viewer can act on.
+			return err
+		}
 		img, err := s.cap.capture(cur)
 		lastCap = time.Now()
 		if err != nil {

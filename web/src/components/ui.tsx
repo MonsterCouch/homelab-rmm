@@ -522,7 +522,23 @@ export function Tabs<T extends string>({
 
 // ---------- dropdown menu ----------
 
-export function Dropdown({ trigger, children, align = 'right' }: { trigger: ReactNode; children: ReactNode; align?: 'left' | 'right' }) {
+export function Dropdown({
+  trigger,
+  children,
+  align = 'right',
+  menuClassName = '',
+  closeOnClick = true,
+  onOpen,
+}: {
+  trigger: ReactNode;
+  children: ReactNode;
+  align?: 'left' | 'right';
+  /** extra classes on the menu panel (width, padding) */
+  menuClassName?: string;
+  /** false for a panel you interact with (a list, a filter) rather than a menu of verbs */
+  closeOnClick?: boolean;
+  onOpen?: () => void;
+}) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -540,9 +556,22 @@ export function Dropdown({ trigger, children, align = 'right' }: { trigger: Reac
   }, [open]);
   return (
     <div className="dropdown" ref={ref}>
-      <span onClick={() => setOpen((o) => !o)}>{trigger}</span>
+      <span
+        onClick={() =>
+          setOpen((o) => {
+            if (!o) onOpen?.();
+            return !o;
+          })
+        }
+      >
+        {trigger}
+      </span>
       {open && (
-        <div className="menu" style={align === 'left' ? { left: 0, right: 'auto' } : undefined} onClick={() => setOpen(false)}>
+        <div
+          className={`menu ${menuClassName}`.trim()}
+          style={align === 'left' ? { left: 0, right: 'auto' } : undefined}
+          onClick={closeOnClick ? () => setOpen(false) : undefined}
+        >
           {children}
         </div>
       )}

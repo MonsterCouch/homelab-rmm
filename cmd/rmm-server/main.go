@@ -4,11 +4,13 @@ package main
 
 import (
 	"bufio"
-	"context"
+	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,26 +39,48 @@ Usage:
 Flags for run/install:
   --listen ADDR       address to listen on (default :8443)
   --data DIR          data directory (default %s)
-  --public-url URL    URL agents use to reach this server (default https://<hostname>:<port>)
+  --public-url URL    URL agents use to reach this server (default https://<hostname>:<port>).
+                      On first run it seeds the Public URL setting; after that the value
+                      saved in Settings wins and this flag is only the fallback.
   --cert FILE --key FILE   use your own certificate instead of the generated one
   --insecure          plain HTTP (only behind a TLS-terminating reverse proxy)
+  --trusted-proxies   comma-separated IPs/CIDRs whose X-Forwarded-For header is trusted (the reverse proxy)
   --dev-web DIR       serve the UI from a directory instead of the embedded build
 
-Environment: RMM_DATA_DIR, RMM_LISTEN, RMM_PUBLIC_URL, RMM_CERT_FILE, RMM_KEY_FILE, RMM_INSECURE, RMM_DEBUG
+install resolves --data, --cert, --key and --dev-web to absolute paths before storing them
+in the service definition, because the service manager runs from a different directory.
+
+Environment: RMM_DATA_DIR, RMM_LISTEN, RMM_PUBLIC_URL, RMM_CERT_FILE, RMM_KEY_FILE, RMM_INSECURE,
+             RMM_TRUSTED_PROXIES, RMM_DEV_WEB_DIR, RMM_DEBUG
+
+First run: with no users yet the server prints a one-time SETUP CODE to the console and to
+server.log in the data directory. The setup form asks for it unless you open the console from
+a browser on the server itself. Lost it? Restart the server before creating a user: a new code
+is minted on every start that finds no users.
 `, server.Version, server.DefaultDataDir())
 }
 
+func newFlagSet(name string) (*flag.FlagSet, *server.Config, *string) {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	fs.Usage = usage
+	cfg := &server.Config{}
+	fs.StringVar(&cfg.Listen, "listen", ":8443", "address:port to listen on")
+	fs.StringVar(&cfg.DataDir, "data", server.DefaultDataDir(), "data directory (database, certificate, agent binaries)")
+	fs.StringVar(&cfg.PublicURL, "public-url", "", "URL agents use to reach this server, e.g. https://rmm.lan:8443")
+	fs.StringVar(&cfg.CertFile, "cert", "", "your own TLS certificate (PEM) instead of the generated one")
+	fs.StringVar(&cfg.KeyFile, "key", "", "private key for --cert (PEM)")
+	fs.BoolVar(&cfg.Insecure, "insecure", false, "serve plain HTTP (only behind a TLS-terminating reverse proxy)")
+	fs.StringVar(&cfg.DevWebDir, "dev-web", "", "serve the UI from this directory instead of the embedded build")
+	proxies := fs.String("trusted-proxies", "", "comma-separated IPs/CIDRs whose X-Forwarded-For header is trusted")
+	return fs, cfg, proxies
+}
+
 func parseFlags(args []string) server.Config {
-	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	cfg := server.Config{}
-	fs.StringVar(&cfg.Listen, "listen", ":8443", "")
-	fs.StringVar(&cfg.DataDir, "data", server.DefaultDataDir(), "")
-	fs.StringVar(&cfg.PublicURL, "public-url", "", "")
-	fs.StringVar(&cfg.CertFile, "cert", "", "")
-	fs.StringVar(&cfg.KeyFile, "key", "", "")
-	fs.BoolVar(&cfg.Insecure, "insecure", false, "")
-	fs.StringVar(&cfg.DevWebDir, "dev-web", "", "")
+	fs, cfg, proxies := newFlagSet("run")
 	fs.Parse(args)
+	if *proxies != "" {
+		cfg.TrustedProxies = strings.Split(*proxies, ",")
+	}
 	return cfg.FromEnv()
 }
 
@@ -87,6 +111,78 @@ func spec(args []string) svc.Spec {
 	}
 }
 
+// absPaths rewrites every path in cfg to an absolute one. `install` validates
+// the configuration in the operator's current directory and then registers a
+// service the manager starts from somewhere else entirely (/ for systemd), so
+// a relative --data silently became a second, empty database.
+func absPaths(cfg *server.Config) {
+	for _, p := range []*string{&cfg.DataDir, &cfg.CertFile, &cfg.KeyFile, &cfg.DevWebDir} {
+		if *p == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(*p); err == nil {
+			*p = abs
+		}
+	}
+}
+
+// installArgs renders the resolved configuration as the flags the service is
+// started with, so what was checked here is what the service runs - including
+// values that came from the environment, which the service does not inherit.
+func installArgs(cfg server.Config) []string {
+	args := []string{"--listen", cfg.Listen, "--data", cfg.DataDir}
+	if cfg.PublicURL != "" {
+		args = append(args, "--public-url", cfg.PublicURL)
+	}
+	if cfg.CertFile != "" {
+		args = append(args, "--cert", cfg.CertFile, "--key", cfg.KeyFile)
+	}
+	if cfg.Insecure {
+		args = append(args, "--insecure")
+	}
+	if cfg.DevWebDir != "" {
+		args = append(args, "--dev-web", cfg.DevWebDir)
+	}
+	if len(cfg.TrustedProxies) > 0 {
+		args = append(args, "--trusted-proxies", strings.Join(cfg.TrustedProxies, ","))
+	}
+	return args
+}
+
+// validateConfig checks what `install` can check without touching the
+// database. It deliberately does NOT open rmm.db: the service being upgraded
+// is usually running, and opening its database ran migrations, re-seeded and
+// marked every device offline underneath it.
+func validateConfig(cfg server.Config) error {
+	if _, _, err := net.SplitHostPort(cfg.Listen); err != nil {
+		return fmt.Errorf("--listen %q: %w", cfg.Listen, err)
+	}
+	if err := os.MkdirAll(cfg.DataDir, 0o750); err != nil {
+		return fmt.Errorf("data dir %s: %w", cfg.DataDir, err)
+	}
+	probe := filepath.Join(cfg.DataDir, ".write-probe")
+	f, err := os.OpenFile(probe, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("data dir %s is not writable: %w", cfg.DataDir, err)
+	}
+	f.Close()
+	os.Remove(probe)
+	if (cfg.CertFile == "") != (cfg.KeyFile == "") {
+		return errors.New("--cert and --key must be given together")
+	}
+	if cfg.CertFile != "" {
+		if _, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile); err != nil {
+			return fmt.Errorf("certificate: %w", err)
+		}
+	}
+	if cfg.DevWebDir != "" {
+		if st, err := os.Stat(cfg.DevWebDir); err != nil || !st.IsDir() {
+			return fmt.Errorf("--dev-web %s is not a directory", cfg.DevWebDir)
+		}
+	}
+	return nil
+}
+
 func readPassword(prompt string) string {
 	fmt.Fprint(os.Stderr, prompt)
 	if term.IsTerminal(int(syscall.Stdin)) {
@@ -99,14 +195,109 @@ func readPassword(prompt string) string {
 	return strings.TrimSpace(sc.Text())
 }
 
+// runUser is the `user` subcommand. It opens an EXISTING database read-write
+// and never creates one: a mistyped --data used to migrate and seed a brand
+// new database, print nothing and exit 0, which is indistinguishable from a
+// fleet with no users - exactly the situation the lockout instructions send
+// people into.
+func runUser(args []string) int {
+	if len(args) == 0 {
+		usage()
+		return 2
+	}
+	sub := args[0]
+	fs := flag.NewFlagSet("user", flag.ExitOnError)
+	fs.Usage = usage
+	username := fs.String("username", "", "account name")
+	role := fs.String("role", "admin", "admin, tech or viewer")
+	data := fs.String("data", server.DefaultDataDir(), "data directory holding rmm.db")
+	fs.Parse(args[1:])
+	cfg := server.Config{DataDir: *data, Listen: ":8443", Insecure: true}.FromEnv()
+	db, err := server.OpenDatabase(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer db.Close()
+	switch sub {
+	case "add":
+		if *username == "" {
+			fmt.Fprintln(os.Stderr, "--username required")
+			return 2
+		}
+		pw := readPassword("Password: ")
+		if _, err := db.CreateUser(*username, pw, *role, ""); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		fmt.Println("user created")
+	case "passwd":
+		if *username == "" {
+			fmt.Fprintln(os.Stderr, "--username required")
+			return 2
+		}
+		pw := readPassword("New password: ")
+		if err := db.ResetPassword(*username, pw); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		fmt.Println("password updated and sessions cleared")
+	case "list":
+		users, err := db.ListUsers()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if len(users) == 0 {
+			fmt.Println("no users; start the server to get a first-run setup code")
+			return 0
+		}
+		for _, u := range users {
+			fmt.Printf("%-20s %-7s totp=%v\n", u.Username, u.Role, u.TOTPEnabled)
+		}
+	default:
+		usage()
+		return 2
+	}
+	return 0
+}
+
 func main() {
-	args := os.Args[1:]
-	cmd := "run"
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		cmd, args = args[0], args[1:]
+	os.Exit(run(os.Args[1:]))
+}
+
+func run(args []string) int {
+	// No arguments prints usage, the way rmm-agent does and the way
+	// docs/OPERATIONS.md says both binaries behave. It used to default to
+	// "run", so a bare `rmm-server` started a live server on :8443 against
+	// the default data directory - creating it, generating a certificate and
+	// minting a setup code.
+	if len(args) == 0 {
+		usage()
+		return 2
+	}
+	cmd := args[0]
+	if strings.HasPrefix(cmd, "-") {
+		switch cmd {
+		case "-h", "--help", "-help":
+			// intercepted before parseFlags, which would otherwise treat it
+			// as a run flag and dump the flagset instead of the usage block
+			usage()
+			return 0
+		case "-v", "--version":
+			fmt.Println(server.Version)
+			return 0
+		}
+		// any other leading flag is a `run` flag, as before
+		cmd = "run"
+	} else {
+		args = args[1:]
 	}
 	switch cmd {
-	case "version", "-v", "--version":
+	case "help":
+		usage()
+		return 0
+	case "version":
 		fmt.Println(server.Version)
 	case "run":
 		cfg := parseFlags(args)
@@ -114,82 +305,35 @@ func main() {
 		s, err := server.New(cfg)
 		if err != nil {
 			slog.Error("startup failed", "err", err)
-			os.Exit(1)
+			return 1
 		}
 		if err := svc.Run(spec(args), s.Run); err != nil {
 			slog.Error("server stopped", "err", err)
-			os.Exit(1)
+			return 1
 		}
 	case "install":
 		cfg := parseFlags(args)
-		// validate once so a bad flag fails here, not silently in the service
-		if _, err := server.New(cfg); err != nil {
+		absPaths(&cfg)
+		if err := validateConfig(cfg); err != nil {
 			fmt.Fprintln(os.Stderr, "configuration check failed:", err)
-			os.Exit(1)
+			return 1
 		}
-		if err := svc.Control(spec(args), "install"); err != nil {
+		sp := spec(installArgs(cfg))
+		if err := svc.Control(sp, "install"); err != nil {
 			fmt.Fprintln(os.Stderr, "service install failed:", err)
-			os.Exit(1)
+			return 1
 		}
-		fmt.Printf("service installed and started; data in %s\n", cfg.DataDir)
+		fmt.Printf("%s; data in %s\n", svc.Describe(sp), cfg.DataDir)
 	case "uninstall", "start", "stop", "restart", "status":
 		if err := svc.Control(spec(nil), cmd); err != nil {
 			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+			return 1
 		}
 	case "user":
-		if len(args) == 0 {
-			usage()
-			os.Exit(2)
-		}
-		sub := args[0]
-		fs := flag.NewFlagSet("user", flag.ExitOnError)
-		username := fs.String("username", "", "")
-		role := fs.String("role", "admin", "")
-		data := fs.String("data", server.DefaultDataDir(), "")
-		fs.Parse(args[1:])
-		cfg := server.Config{DataDir: *data, Listen: ":8443", Insecure: true}.FromEnv()
-		s, err := server.New(cfg)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		db := s.DB()
-		switch sub {
-		case "add":
-			if *username == "" {
-				fmt.Fprintln(os.Stderr, "--username required")
-				os.Exit(2)
-			}
-			pw := readPassword("Password: ")
-			if _, err := db.CreateUser(*username, pw, *role, ""); err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-			fmt.Println("user created")
-		case "passwd":
-			if *username == "" {
-				fmt.Fprintln(os.Stderr, "--username required")
-				os.Exit(2)
-			}
-			pw := readPassword("New password: ")
-			if err := db.ResetPassword(*username, pw); err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(1)
-			}
-			fmt.Println("password updated and sessions cleared")
-		case "list":
-			users, _ := db.ListUsers()
-			for _, u := range users {
-				fmt.Printf("%-20s %-7s totp=%v\n", u.Username, u.Role, u.TOTPEnabled)
-			}
-		default:
-			usage()
-			os.Exit(2)
-		}
+		return runUser(args)
 	default:
 		usage()
-		os.Exit(2)
+		return 2
 	}
-	_ = context.Background
+	return 0
 }

@@ -81,7 +81,15 @@ make VERSION=v1.2.3 package
 ```
 
 `make server` embeds whatever is in `web/dist` at that moment — run `make web` (or `make all`)
-first for a release build. Binaries are stamped with `git describe --tags --always` unless
+first for a release build, and note that `make package` only archives what `server` and `agents`
+produced; it never builds the UI. An unbuilt `web/dist` used to be silent: the directory is
+gitignored apart from `.gitkeep`, so `go:embed all:dist` succeeded with one empty file, the
+build printed no warning and the archive shipped a server whose console was a directory listing
+of `.gitkeep`. Now `make`, `tools/build.sh` and `tools/build.ps1` all refuse to build
+`rmm-server` when `web/dist/index.html` is missing; `ALLOW_EMPTY_WEB=1` (environment variable,
+or `make ALLOW_EMPTY_WEB=1 server`) builds one deliberately, which is what you want for a binary
+that will run with `--dev-web`. CI additionally greps every packaged server binary for the
+embedded `index.html`, so a console-less archive cannot reach a release. Binaries are stamped with `git describe --tags --always` unless
 `VERSION` is given, via `-ldflags "-s -w -X …/internal/server.Version=… -X …/internal/agent.Version=…"`
 and `-trimpath`. The archive layout (server at the root, `agents/rmm-agent-<os>-<arch>[.exe]`
 beside it) is what `internal/server/install.go` looks up, so a server run from an extracted
@@ -183,7 +191,15 @@ Example: a new `disk.smart` request that returns S.M.A.R.T. health for each disk
 
 ## Releasing
 
-1. Update `CHANGELOG.md`.
-2. `git tag v1.2.3 && git push --tags`.
-3. CI builds, tests and attaches `homelab-rmm-<os>-<arch>.zip`, the linux `.tar.gz` files and
+Nothing is released yet: the repository has no `v*` tag, so the download URLs in `README.md`
+resolve to nothing, and it has no `LICENSE`, so `tools/build.sh` puts a placeholder in every
+archive. Both are blockers for the first release rather than steps that can be skipped.
+
+1. Add a `LICENSE` file (the packagers copy it into every archive as soon as it exists; until
+   then they write "No LICENSE file is present in this build").
+2. Update `CHANGELOG.md` — move `[Unreleased]` to the new version with a date.
+3. `git tag v1.2.3 && git push --tags`.
+4. CI builds, tests and attaches `homelab-rmm-<os>-<arch>.zip`, the linux `.tar.gz` files and
    `SHA256SUMS` to the GitHub Release.
+5. Check that the README download links now resolve, and drop the "no tagged release yet" note
+   at the top of the quick starts.

@@ -76,6 +76,7 @@ export function Services({ agent, reload, canWrite }: TabProps) {
       key: 'mon',
       header: 'Monitored',
       sort: (s) => (monitored.has(s.name.toLowerCase()) ? 0 : 1),
+      csv: (s) => (monitored.has(s.name.toLowerCase()) ? 'yes' : 'no'),
       render: (s) => (
         <button
           type="button"
@@ -129,7 +130,7 @@ export function Services({ agent, reload, canWrite }: TabProps) {
         )}
       </div>
       {svcs.error && <ErrorBox error={svcs.error} onRetry={svcs.reload} />}
-      <DataTable columns={columns} rows={svcs.data ? rows : undefined} loading={svcs.loading} rowKey={(s) => s.name} defaultSort={{ key: 'name', dir: 'asc' }} compact emptyTitle="No services reported" />
+      <DataTable columns={columns} rows={svcs.data ? rows : undefined} loading={svcs.loading} rowKey={(s) => s.name} defaultSort={{ key: 'name', dir: 'asc' }} compact csvName="services" emptyTitle="No services reported" />
     </>
   );
 }

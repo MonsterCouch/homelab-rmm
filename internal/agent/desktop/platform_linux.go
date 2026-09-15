@@ -48,5 +48,5 @@ func platformInit() error {
 type threadDesktop struct{}
 
 func newThreadDesktop() *threadDesktop { return &threadDesktop{} }
-func (*threadDesktop) follow()         {}
+func (*threadDesktop) follow() error   { return nil }
 func (*threadDesktop) close()          {}

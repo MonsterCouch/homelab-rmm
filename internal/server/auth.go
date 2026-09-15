@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -214,14 +215,110 @@ func (d *DB) disableTOTP(userID int64) error {
 
 // ---- middleware ----
 
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return strings.TrimSpace(strings.Split(xff, ",")[0])
+// parseTrustedProxies turns the configured CIDRs (a bare address means a
+// single host) into networks. It is kept per Server rather than in a package
+// variable so two servers in one process - which is what the tests do - cannot
+// overwrite each other's setting.
+//
+// net.ParseCIDR masks the host bits off, so "10.0.0.5/8" is the whole of
+// 10.0.0.0/8 and not one host: that is a much wider grant than the typo
+// suggests, so say so out loud rather than trusting a /8 silently.
+func parseTrustedProxies(cidrs []string) []*net.IPNet {
+	var out []*net.IPNet
+	for _, c := range cidrs {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		bare := !strings.Contains(c, "/")
+		if bare {
+			if strings.Contains(c, ":") {
+				c += "/128"
+			} else {
+				c += "/32"
+			}
+		}
+		ip, n, err := net.ParseCIDR(c)
+		if err != nil {
+			slog.Warn("ignoring unparsable trusted proxy", "value", c, "err", err)
+			continue
+		}
+		if !bare && !ip.Mask(n.Mask).Equal(n.IP) {
+			slog.Warn("trusted proxy has host bits set: the WHOLE network is trusted, not that one address",
+				"value", c, "trusts", n.String())
+		}
+		out = append(out, n)
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+	return out
+}
+
+// isTrustedProxy reports whether ip is one of the configured reverse proxies.
+func (s *Server) isTrustedProxy(ip net.IP) bool {
+	for _, n := range s.trustedProxies {
+		if n.Contains(ip) {
+			return true
+		}
 	}
+	return false
+}
+
+// forwardedHop parses one X-Forwarded-For element. Entries are bare addresses
+// in practice, but a proxy that writes "1.2.3.4:5678" or "[::1]:5678" should
+// not knock the whole chain out.
+func forwardedHop(v string) net.IP {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	if ip := net.ParseIP(strings.Trim(v, "[]")); ip != nil {
+		return ip
+	}
+	if h, _, err := net.SplitHostPort(v); err == nil {
+		return net.ParseIP(strings.Trim(h, "[]"))
+	}
+	return nil
+}
+
+// clientIP is the peer address, or the nearest address in X-Forwarded-For that
+// a trusted proxy did not put there, when the peer is one of the configured
+// reverse proxies. An untrusted peer could otherwise forge the header to dodge
+// the login limiter and falsify the audit log, so the header is ignored unless
+// --trusted-proxies says where the proxy is.
+//
+// The list is walked from the RIGHT, skipping hops that are themselves trusted
+// proxies, because every proxy this project ships a config for APPENDS to the
+// header rather than replacing it (nginx's $proxy_add_x_forwarded_for, and
+// Caddy by default). The left-most entry is therefore whatever the client
+// chose to send - which is exactly the forgery the guard exists to stop - and
+// the right-most non-proxy entry is the address the outermost trusted proxy
+// actually saw.
+func (s *Server) clientIP(r *http.Request) string {
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		host = h
+	}
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" || len(s.trustedProxies) == 0 {
+		return host
+	}
+	peer := net.ParseIP(host)
+	if peer == nil || !s.isTrustedProxy(peer) {
+		return host
+	}
+	hops := strings.Split(xff, ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		ip := forwardedHop(hops[i])
+		if ip == nil {
+			// A hop we cannot parse breaks the chain: everything to its left
+			// is unattributable, so fall back to the peer rather than guess.
+			return host
+		}
+		if s.isTrustedProxy(ip) {
+			continue // another hop of our own proxy chain
+		}
+		return ip.String()
+	}
+	// Every hop was one of our proxies (a health check through the chain, say).
 	return host
 }
 

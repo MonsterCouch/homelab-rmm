@@ -69,7 +69,7 @@ case "$what" in
 			rm -rf "$cfg"
 			echo "removed $cfg"
 		else
-			echo "kept $cfg (agent.json holds this device's identity; --purge removes it)"
+			echo "kept $cfg (agent.json holds this device's identity AND its enrolment token, so a reinstall keeps the device's history - and a token still valid there would re-enrol it; --purge removes it)"
 		fi
 		;;
 	server)

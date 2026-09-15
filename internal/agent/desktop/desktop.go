@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -95,10 +97,43 @@ func Launch(exe, serverURL, token, fingerprint string, quality int) (note string
 	return launch(exe, serverURL, token, fingerprint, quality)
 }
 
+// TokenEnv carries the one-time bridge token to the helper. It is never a
+// command-line argument: /proc/<pid>/cmdline is world-readable on Linux and
+// Process Explorer shows the command line of any process on Windows, so an
+// argument would hand the token (good for one desktop session) to every
+// local user. `--token` still works for a developer running the helper by
+// hand; the launchers use this.
+const TokenEnv = "RMM_DESKTOP_TOKEN"
+
+// envWithToken returns entries with any inherited TokenEnv variable
+// removed and ours appended, so the helper always reads the token this
+// launch minted. Windows environment names are case-insensitive, hence the
+// folded comparison; it lives here (rather than in the Windows launcher)
+// because it is plain string work worth testing on any platform.
+func envWithToken(entries []string, token string) []string {
+	out := make([]string, 0, len(entries)+1)
+	prefix := TokenEnv + "="
+	for _, e := range entries {
+		if len(e) >= len(prefix) && strings.EqualFold(e[:len(prefix)], prefix) {
+			continue
+		}
+		out = append(out, e)
+	}
+	out = append(out, prefix+token)
+	// Windows documents an environment block as sorted case-insensitively,
+	// and CreateEnvironmentBlock hands one over that way; re-sort rather
+	// than appending out of order behind its back.
+	sort.SliceStable(out, func(i, j int) bool {
+		return strings.ToUpper(out[i]) < strings.ToUpper(out[j])
+	})
+	return out
+}
+
 // helperArgs is the command line every launcher builds; keeping it in one
-// place means main.go's flag set and the launchers cannot drift apart.
-func helperArgs(serverURL, token, fingerprint string, quality int) []string {
-	return []string{"desktop-helper", "--server", serverURL, "--token", token, "--fingerprint", fingerprint, "--quality", fmt.Sprint(quality)}
+// place means main.go's flag set and the launchers cannot drift apart. The
+// token is passed in the environment (TokenEnv), not here.
+func helperArgs(serverURL, fingerprint string, quality int) []string {
+	return []string{"desktop-helper", "--server", serverURL, "--fingerprint", fingerprint, "--quality", fmt.Sprint(quality)}
 }
 
 // serveInProcess is the developer-mode path: the agent itself has a

@@ -55,9 +55,17 @@ is what you want with a CA-issued certificate or a TLS-terminating proxy.
 
 **Enrolment → per-agent key.** The first connection carries `X-Enroll-Token`. The server checks
 the token before upgrading the socket (`checkEnrollToken`), waits for the `hello` frame, then
-`enrollAgent` creates the device (or re-keys an offline device with the same hostname + OS),
-decrements the token's uses and answers with a `welcome` frame containing `agent_id` and a
-32-byte random `agent_key`. The agent persists both and from then on sends
+`enrollAgent` creates the device (or re-keys an offline device with the same hostname + OS) and
+consumes one of the token's uses **in a single transaction**: the decrement is a conditional
+`UPDATE ... WHERE uses_left > 0` that must affect exactly one row, so simultaneous enrolments
+cannot stretch a one-use token past one device or drive the count negative (`-1` means unlimited
+and is left alone; every other value `<= 0` reads as exhausted, migration 2 repairs rows an older
+server damaged, and `POST /api/enroll` clamps `uses` on the way in). `enrollAgent` reports back
+what it did: a re-key is audited as `agent.rekeyed` rather than `agent.enrolled`, and an
+enrolment that collides with a hostname a device is currently *using* — which gets its own record,
+since only offline records are adopted — as `agent.duplicate_hostname`. Both add a row to the
+device's event timeline. The server then
+answers with a `welcome` frame containing `agent_id` and a 32-byte random `agent_key`. The agent persists both and from then on sends
 `Authorization: Bearer <key>`; the server stores only `sha256(key)`. A revoked key (device
 deleted) makes the agent drop its identity and re-enrol if it still has a token.
 
@@ -138,10 +146,24 @@ from `tasks` and `patch_policies` on every change. Task kinds: `script`, `patch_
 ids, tags, OS). Automations are evaluated by trigger (`agent_online`, `agent_offline`,
 `alert_opened`, `alert_resolved`, `enrolled`, `reboot_required`, `patch_installed`) with an
 optional target/rule/severity filter and run a script, send an email or POST a JSON webhook.
-(`agent_offline` is accepted by the API and UI but, as of 0.1.0, nothing calls
-`scheduler.automation("agent_offline", …)` when a socket drops: use an `offline` alert rule
-plus an `alert_opened` automation for the same effect.) An
-hourly `purge` enforces retention (metrics 30 d, runs 90 d, events 30 d, audit and resolved
+
+`agent_online` fires from `scheduler.agentOnline` when a device's socket comes up (the same call
+that releases its queued runs); `agent_offline` fires when that device's **current** socket goes
+away, at the end of `Hub.handleAgentWS`.
+A socket that has already been replaced by a reconnect does not fire it — only the connection
+the hub still holds for that id declares the device offline — and `enrolled` fires at enrolment
+rather than when the enrolling socket eventually drops. What none of them have is a grace
+period: a Wi-Fi drop that reconnects produces `agent_offline` and then `agent_online`, a
+half-open socket is only noticed when the 30 s keepalive has missed pongs for 90 s, and a server
+restart looks like every device going offline and coming back. For "offline for N minutes"
+semantics use an `offline` **alert rule** (`Minutes`, default grace 5) with an `alert_opened`
+automation: `sweepOffline` is time-based, runs every 30 s and measures from `last_seen`, so it
+also catches a device that vanished while the server was down. Keep `agent_offline` for things
+that are safe to do on a flap. Each automation is capped at `maxAutomationFiresPerMinute` (60)
+fires a minute by `autoLimit`, and a skipped fire is logged at WARN, so neither a flapping fleet
+nor an `alert_opened` → `run_script` loop can run away.
+
+An hourly `purge` enforces retention (metrics 30 d, runs 90 d, events 30 d, audit and resolved
 alerts 365 d by default), expires tokens and sessions, and fails runs stuck in `running` for over
 six hours after a restart.
 
@@ -167,15 +189,29 @@ reboots per `reboot` (`never`, `if_required`, `always`). A device with no patch 
   way, JSON input the other) without decoding video. `docs/DESKTOP-PROTOCOL.md` has the frame
   formats and how the helper is launched in session 0 / X11.
 
-Both relays check that the WebSocket `Origin` host equals the request `Host`.
+Both relays check that the WebSocket `Origin` host equals the request `Host`, and both **end
+with a Close frame** rather than by dropping the socket, so the browser gets a code instead of
+1006: a peer that closed cleanly has its code forwarded, a peer that vanished without one is
+reported as 1011 with a reason naming it, and the desktop viewer's pre-bridge failures (no
+graphical session, helper never connected, request cancelled) close the same way.
 
 ### Auth (`auth.go`)
 bcrypt passwords, TOTP (`pquerna/otp`), 14-day session tokens in `sessions`, cookie `rmm_session`
-(`HttpOnly`, `SameSite=Strict`, `Secure` unless `--insecure`), `X-Requested-With: fetch` required
-on every non-GET API call, a 10-per-minute login limiter per client IP, roles `admin` / `tech`
-(no users or settings) / `viewer` (read-only). `X-Forwarded-For` is honoured for the audit log
-and the limiter, so the server should only be reachable through a proxy you control when one is
-used.
+(`HttpOnly`, `SameSite=Strict`, `Secure` unless `--insecure`), a non-empty `X-Requested-With`
+header required on every non-GET API call (only its presence is checked — a cross-site form
+cannot set any custom header; the console sends `fetch`), a 10-per-minute login limiter per client IP, roles `admin` / `tech`
+(no users or settings) / `viewer` (read-only — `requireWrite` also covers `/ws/shell/{id}`,
+`/ws/desktop/{id}`, the file download and `GET /api/enroll`, whose body carries token values).
+Changing your own password deletes your other sessions. The three `/api/auth/*` endpoints sit on
+the outer mux, outside `requireUser`, so `authGuard` gives them the same CSRF check plus an
+`Origin`/`Host` match and a JSON `Content-Type` requirement. `clientIP` uses the peer address and
+reads `X-Forwarded-For` only when the peer is inside one of `Server.trustedProxies`
+(`--trusted-proxies`); it then scans the hop list right-to-left past hops that are themselves
+trusted proxies, because the proxies in `deploy/` append to the header rather than replacing it,
+which makes the left-most hop attacker-chosen. While the user table is empty, `Server.setupCode`
+(a random hex value minted in `New`, printed at startup) is required by `POST /api/auth/setup`
+from every source address including loopback, and `Server.setupMu` makes the "no users yet?"
+check and the insert one step so a first-run window cannot create two administrators.
 
 ### Static UI (`static.go`)
 Serves `web/dist` from the embedded filesystem (or `--dev-web DIR`), immutable caching for
@@ -184,8 +220,17 @@ Serves `web/dist` from the embedded filesystem (or `--dev-web DIR`), immutable c
 ### Agent binaries and install scripts (`install.go`)
 `GET /api/agent-download/{file}` serves `rmm-agent-<os>-<arch>[.exe]` from `<data>/agents/`, then
 `<dir of rmm-server>/agents/`, then `<dir of rmm-server>/`, unauthenticated (the binary is not a
-secret; enrolment still needs a token). `GET /install/{token}?os=windows|linux&arch=` renders the
-bootstrap script with the public URL, token and fingerprint baked in.
+secret; enrolment still needs a token — and the install script checks what it downloaded).
+`GET /install/{token}?os=windows|linux&arch=` renders the bootstrap script with the public URL,
+token, certificate fingerprint, public-key pin and `agentBinarySHA256` baked in (one hash per
+architecture for Linux, where `uname -m` decides). The script verifies that hash before it runs
+the binary and pins the download connection to the server certificate, so the unauthenticated
+download endpoint is not an unverified one. The script itself is piped into a root shell, so its
+inputs are whitelisted before they reach it: the token must match `^[A-Za-z0-9_-]{16,64}$` and
+still pass `checkEnrollToken` (404 otherwise), `arch` must be one of `amd64|arm64|arm|386` (400
+otherwise), and every interpolated value goes through `psQuote` / `shQuote` for the single-quoted
+literal it lands in (`render` substitutes `@@NAME@@` placeholders in one pass, so a value cannot
+introduce another).
 
 ### Seed data (`seed.go`)
 On a fresh database `seedDefaults` inserts the starter script library (17 scripts across

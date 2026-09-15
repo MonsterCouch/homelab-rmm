@@ -113,8 +113,14 @@ export function DevicePatches({ agent, canWrite }: TabProps) {
     { key: 'sev', header: 'Severity', sort: (p) => p.severity, render: (p) => (p.severity ? <Chip tone={sevTone(p.severity)}>{p.severity}</Chip> : <span className="faint">—</span>) },
     { key: 'size', header: 'Size', align: 'right', sort: (p) => p.size, render: (p) => (p.size ? bytes(p.size) : <span className="faint">—</span>) },
     { key: 'src', header: 'Source', sort: (p) => p.source, render: (p) => <span className="muted">{p.source}</span> },
-    { key: 'reboot', header: 'Reboot', sort: (p) => (p.reboot_required ? 0 : 1), render: (p) => (p.reboot_required ? <Chip tone="warn">yes</Chip> : <span className="faint">no</span>) },
-    { key: 'seen', header: 'First seen', sort: (p) => p.first_seen, render: (p) => <span className="muted">{relTime(p.first_seen)}</span> },
+    { key: 'reboot', header: 'Reboot', sort: (p) => (p.reboot_required ? 0 : 1), csv: (p) => (p.reboot_required ? 'yes' : 'no'), render: (p) => (p.reboot_required ? <Chip tone="warn">yes</Chip> : <span className="faint">no</span>) },
+    {
+      key: 'seen',
+      header: 'First seen',
+      sort: (p) => p.first_seen,
+      csv: (p) => (p.first_seen ? new Date(p.first_seen * 1000).toISOString() : ''),
+      render: (p) => <span className="muted">{relTime(p.first_seen)}</span>,
+    },
   ];
 
   return (
@@ -178,6 +184,7 @@ export function DevicePatches({ agent, canWrite }: TabProps) {
         onSelect={setSelected}
         defaultSort={{ key: 'sev', dir: 'asc' }}
         compact
+        csvName="device-patches"
         emptyTitle={patches.length ? 'No patches in this view' : 'No patch data yet'}
         emptyBody={!patches.length ? 'Run a scan to see available updates.' : undefined}
       />

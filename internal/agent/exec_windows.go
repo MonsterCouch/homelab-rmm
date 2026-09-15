@@ -27,12 +27,13 @@ const winMaxOutput = 32 << 20
 // outputBuffer collects at most limit bytes and remembers that it dropped
 // the rest. It never fails the write, so a chatty child is never killed by
 // a broken pipe before it finishes its real work. Bytes are kept raw and
-// decoded once at String time, because the code page is a property of the
-// whole capture, not of one chunk.
+// decoded once at String time from cp, because the code page is a property
+// of the whole capture, not of one chunk.
 type outputBuffer struct {
 	mu        sync.Mutex
 	b         bytes.Buffer
 	limit     int
+	cp        uint32
 	truncated bool
 }
 
@@ -55,33 +56,48 @@ func (o *outputBuffer) Write(p []byte) (int, error) {
 func (o *outputBuffer) String() string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	s := winDecodeOutput(o.b.Bytes())
+	s := winDecodeOutput(o.b.Bytes(), o.cp)
 	if o.truncated {
 		return s + "\n[output truncated]"
 	}
 	return s
 }
 
-// cpOEM is CP_OEMCP, "the system's current OEM code page": what console
-// tools (wevtutil, query, shutdown, Windows PowerShell 5.1) write when their
-// stdout is a pipe rather than a console.
-const cpOEM = 1
+// The two code pages a redirected console tool can write in. Which one a
+// tool picks is a property of the tool, not of the system:
+//
+//   - cpOEM (CP_OEMCP) is what the C runtime's console output uses, and what
+//     shutdown.exe, taskkill.exe, query.exe and Windows PowerShell 5.1 keep
+//     writing when their stdout is a pipe rather than a console.
+//   - cpACP (CP_ACP, the system ANSI code page, 1252 on a Western install)
+//     is what wevtutil.exe writes once its output is redirected: it renders
+//     the event XML through the ANSI console API, so an event message with
+//     an accented character comes back in ANSI, and decoding it as OEM turns
+//     "ä" into "õ" (and worse for Cyrillic or Greek installs).
+//
+// Passing the wrong one does not fail loudly - it silently mangles exactly
+// the characters an operator is most likely to complain about - so every
+// capture names its code page.
+const (
+	cpACP = 0
+	cpOEM = 1
+)
 
 // winDecodeOutput turns a tool's raw stdout into a Go string. Output that is
 // already valid UTF-8 (pwsh 7, winget, anything ASCII) is used as is; the
-// rest is decoded from the OEM code page so an accented character in an
+// rest is decoded from code page cp so an accented character in an
 // event-log message or an update title reaches the operator instead of
 // turning into U+FFFD in the JSON reply.
-func winDecodeOutput(b []byte) string {
+func winDecodeOutput(b []byte, cp uint32) string {
 	if len(b) == 0 || utf8.Valid(b) {
 		return string(b)
 	}
-	n, err := windows.MultiByteToWideChar(cpOEM, 0, &b[0], int32(len(b)), nil, 0)
+	n, err := windows.MultiByteToWideChar(cp, 0, &b[0], int32(len(b)), nil, 0)
 	if err != nil || n <= 0 {
 		return string(b)
 	}
 	buf := make([]uint16, n)
-	if _, err := windows.MultiByteToWideChar(cpOEM, 0, &b[0], int32(len(b)), &buf[0], n); err != nil {
+	if _, err := windows.MultiByteToWideChar(cp, 0, &b[0], int32(len(b)), &buf[0], n); err != nil {
 		return string(b)
 	}
 	return string(utf16.Decode(buf))
@@ -116,9 +132,17 @@ func systemExe(name string) string {
 // console window, captures stdout and stderr separately and honours ctx by
 // killing the whole process tree. err is non-nil when the command could not
 // run, was killed by ctx, or exited non-zero; stdout and stderr are returned
-// in every case so callers can read a tool's own error text.
+// in every case so callers can read a tool's own error text. Non-UTF-8
+// output is read as OEM; a tool that writes ANSI instead (wevtutil) uses
+// runHiddenCP with cpACP.
 func runHidden(ctx context.Context, name string, args ...string) (stdout, stderr string, err error) {
-	return runHiddenLines(ctx, nil, name, args...)
+	return runHiddenCP(ctx, cpOEM, nil, name, args...)
+}
+
+// runHiddenACP is runHidden for a tool whose redirected output is in the
+// ANSI code page rather than the OEM one.
+func runHiddenACP(ctx context.Context, name string, args ...string) (stdout, stderr string, err error) {
+	return runHiddenCP(ctx, cpACP, nil, name, args...)
 }
 
 // runHiddenLines is runHidden for a long-running child whose stdout is worth
@@ -129,14 +153,21 @@ func runHidden(ctx context.Context, name string, args ...string) (stdout, stderr
 // os.Pipe would leave the reader blocked for as long as that grandchild
 // lives.
 func runHiddenLines(ctx context.Context, onLine func(string), name string, args ...string) (stdout, stderr string, err error) {
+	return runHiddenCP(ctx, cpOEM, onLine, name, args...)
+}
+
+// runHiddenCP is the one implementation behind runHidden, runHiddenACP and
+// runHiddenLines: cp is the code page non-UTF-8 output is decoded from, and
+// onLine (optional) watches stdout line by line as it arrives.
+func runHiddenCP(ctx context.Context, cp uint32, onLine func(string), name string, args ...string) (stdout, stderr string, err error) {
 	cmd := exec.CommandContext(ctx, systemExe(name), args...)
 	prepareCommand(cmd)
 	cmd.Stdin = nil
-	outB := &outputBuffer{limit: winMaxOutput}
-	errB := &outputBuffer{limit: 1 << 20}
+	outB := &outputBuffer{limit: winMaxOutput, cp: cp}
+	errB := &outputBuffer{limit: 1 << 20, cp: cp}
 	var splitter *winLineSplitter
 	if onLine != nil {
-		splitter = &winLineSplitter{sink: outB, decode: winDecodeOutput, onLine: onLine}
+		splitter = &winLineSplitter{sink: outB, decode: func(b []byte) string { return winDecodeOutput(b, cp) }, onLine: onLine}
 		cmd.Stdout = splitter
 	} else {
 		cmd.Stdout = outB

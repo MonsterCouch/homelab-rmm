@@ -1,6 +1,7 @@
 import { useMemo, useState, type ReactNode } from 'react';
 import { compare } from '../lib/format';
-import { Checkbox, Empty, Skeleton } from './ui';
+import { IconDownload } from './Icons';
+import { Button, Checkbox, Empty, Skeleton } from './ui';
 
 export interface Column<T> {
   key: string;
@@ -11,6 +12,12 @@ export interface Column<T> {
   className?: string;
   width?: number | string;
   align?: 'left' | 'right';
+  /**
+   * Value for the CSV export. Without it the export falls back to `sort()`
+   * and then `render()` when either returns text; a column that renders only
+   * markup (an action column, a bar) is left out of the file.
+   */
+  csv?: (row: T) => string | number | boolean | undefined | null;
 }
 
 interface Props<T> {
@@ -29,6 +36,12 @@ interface Props<T> {
   compact?: boolean;
   footer?: ReactNode;
   maxHeight?: number | string;
+  /**
+   * Base name for the "Export CSV" button in the table footer, e.g. "devices".
+   * The file is named `<csvName>-<yyyy-mm-dd>.csv` and contains exactly the
+   * rows on screen, in the order on screen: the caller filters, this sorts.
+   */
+  csvName?: string;
 }
 
 /**
@@ -52,6 +65,7 @@ export function DataTable<T>({
   compact,
   footer,
   maxHeight,
+  csvName,
 }: Props<T>) {
   const [sort, setSort] = useState<{ key: string; dir: 'asc' | 'desc' } | null>(defaultSort ?? null);
 
@@ -184,9 +198,80 @@ export function DataTable<T>({
           )}
         </tbody>
       </table>
-      {footer && <div className="tbl-foot">{footer}</div>}
+      {(footer || csvName) && (
+        <div className="tbl-foot">
+          {footer}
+          <span style={{ marginLeft: 'auto' }} />
+          {csvName && (
+            <Button
+              size="xs"
+              disabled={!sorted.length}
+              title="Download these rows (current filters and sort) as CSV"
+              onClick={() => downloadCsv(`${csvName}-${new Date().toISOString().slice(0, 10)}.csv`, toCsv(columns, sorted))}
+            >
+              <IconDownload /> Export CSV
+            </Button>
+          )}
+        </div>
+      )}
     </div>
   );
+}
+
+// ---------- CSV export ----------
+
+function headerText<T>(c: Column<T>): string {
+  return typeof c.header === 'string' && c.header.trim() ? c.header : c.key;
+}
+
+/** Columns that can be written as text: everything else is markup (bars, buttons). */
+function exportable<T>(columns: Column<T>[], rows: T[]): Column<T>[] {
+  const probe = rows[0];
+  return columns.filter((c) => {
+    if (c.csv) return true;
+    if (!(typeof c.header === 'string' && c.header.trim())) return false; // icon/action column
+    if (probe === undefined) return true;
+    const v = c.sort ? c.sort(probe) : c.render(probe);
+    return typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
+  });
+}
+
+function cell<T>(c: Column<T>, r: T): string {
+  const v = c.csv ? c.csv(r) : c.sort ? c.sort(r) : c.render(r);
+  if (v === undefined || v === null) return '';
+  if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v);
+  return '';
+}
+
+/** RFC 4180 quoting, plus a guard against a spreadsheet reading a value as a formula. */
+export function csvField(value: string): string {
+  // A leading =, +, - or @ makes Excel and Sheets evaluate the cell; a device
+  // name or an audit detail is data, never a formula.
+  const v = /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+  return /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+}
+
+/** The rows as shown, as CSV text (header row first). */
+export function toCsv<T>(columns: Column<T>[], rows: T[]): string {
+  const cols = exportable(columns, rows);
+  const lines = [cols.map((c) => csvField(headerText(c))).join(',')];
+  for (const r of rows) lines.push(cols.map((c) => csvField(cell(c, r))).join(','));
+  return lines.join('\r\n');
+}
+
+/** Hand the browser a file. Same-origin blob: the CSP allows no other source. */
+export function downloadCsv(filename: string, csv: string): void {
+  // The BOM is what makes Excel open a UTF-8 CSV as UTF-8.
+  const blob = new Blob(['\uFEFF', csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
 /** Case-insensitive "every word matches somewhere" text filter. */

@@ -43,6 +43,42 @@ function wsURL(path: string): string {
 const TILE = 0x01;
 const FRAME_END = 0x02;
 
+// ---- wheel normalisation (docs/DESKTOP-PROTOCOL.md) ----
+//
+// One wheel notch is 100 units on the wire. Browsers disagree wildly about
+// what a notch is worth — Chrome on Windows reports 120 px, on Linux 100 or
+// 53, Firefox reports 3 *lines*, and page mode reports 1 *page* — so a raw
+// delta forwarded as pixels makes the helper scroll twice every fifth notch
+// (its carried remainder reaches 100) or swallow every other one. Whole
+// notches are sent instead: a mouse-wheel event is one deliberate click
+// whatever the browser calls it. Sub-notch deltas are trackpad scrolling and
+// go through untouched so the helper can accumulate them into a notch.
+const WHEEL_NOTCH = 100;
+/** Lines per notch in deltaMode 1 (Firefox's default wheel step). */
+const WHEEL_LINES_PER_NOTCH = 3;
+/** Below this many pixels a deltaMode-0 event is trackpad scrolling. */
+const WHEEL_TRACKPAD_MAX = 40;
+
+/** Round to a whole count away from zero, never below one. */
+function notchCount(v: number): number {
+  const n = Math.max(1, Math.round(Math.abs(v)));
+  return v < 0 ? -n : n;
+}
+
+/**
+ * wheelWire converts one axis of a WheelEvent into the wire delta: whole
+ * notches of 100 for anything the user meant as a wheel click, the raw delta
+ * for trackpad-sized pixel scrolling, 0 for nothing.
+ */
+function wheelWire(delta: number, deltaMode: number): number {
+  if (!Number.isFinite(delta) || delta === 0) return 0;
+  if (deltaMode === 1) return notchCount(delta / WHEEL_LINES_PER_NOTCH) * WHEEL_NOTCH; // lines
+  if (deltaMode === 2) return notchCount(delta) * WHEEL_NOTCH; // pages
+  // Pixels: a trackpad flick is left alone, a wheel click is rounded to notches.
+  if (Math.abs(delta) < WHEEL_TRACKPAD_MAX) return delta;
+  return notchCount(delta / WHEEL_NOTCH) * WHEEL_NOTCH;
+}
+
 /** createImageBitmap is fastest; older Safari decodes through an <img>. */
 function decodeImage(blob: Blob): Promise<ImageBitmap | HTMLImageElement> {
   if (typeof createImageBitmap === 'function') return createImageBitmap(blob);
@@ -323,9 +359,10 @@ export function Desktop({ agent, canWrite }: TabProps) {
     if (viewOnly) return;
     const p = toRemote(e);
     if (!p) return;
-    // normalise line/page scrolling to pixels (~100 per notch)
-    const k = e.deltaMode === 1 ? 33 : e.deltaMode === 2 ? 100 : 1;
-    send({ t: 'wheel', dx: Math.round(e.deltaX * k), dy: Math.round(e.deltaY * k), ...p });
+    const dx = wheelWire(e.deltaX, e.deltaMode);
+    const dy = wheelWire(e.deltaY, e.deltaMode);
+    if (!dx && !dy) return; // nothing the helper could act on
+    send({ t: 'wheel', dx, dy, ...p });
   };
 
   useEffect(() => {

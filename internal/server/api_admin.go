@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -51,6 +52,15 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	if in.SMTP.Password == "********" {
 		in.SMTP.Password = cur.SMTP.Password
 	}
+	// Normalise the same way mail.settings() does when reading, so a saved
+	// value reads back identically: without this every save "changed"
+	// smtp.port 587->0 and wrote an audit row for a form nobody edited.
+	if in.SMTP.Port == 0 {
+		in.SMTP.Port = 587
+	}
+	if in.SMTP.TLSMode == "" {
+		in.SMTP.TLSMode = "starttls"
+	}
 	if in.AgentDefaults.MetricsIntervalSec < 5 {
 		in.AgentDefaults.MetricsIntervalSec = 5
 	}
@@ -60,16 +70,90 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	if in.AgentDefaults.PatchScanIntervalSec < 0 {
 		in.AgentDefaults.PatchScanIntervalSec = 0
 	}
-	s.db.SetSetting("public_url", strings.TrimRight(strings.TrimSpace(in.PublicURL), "/"))
+	// A retention of zero (or a field the caller left out) means "keep what is
+	// configured", never "delete everything at the next purge" - which is what
+	// PUT /api/settings with a partial body used to arm.
+	for _, f := range []struct{ in, cur *int }{
+		{&in.Retention.MetricsDays, &cur.Retention.MetricsDays},
+		{&in.Retention.RunsDays, &cur.Retention.RunsDays},
+		{&in.Retention.AuditDays, &cur.Retention.AuditDays},
+		{&in.Retention.EventsDays, &cur.Retention.EventsDays},
+	} {
+		if *f.in <= 0 {
+			*f.in = *f.cur
+		}
+	}
+	in.PublicURL = strings.TrimRight(strings.TrimSpace(in.PublicURL), "/")
+	changes := settingsDiff(cur, in)
+	s.db.SetSetting("public_url", in.PublicURL)
 	s.db.SetSettingJSON("smtp", in.SMTP)
 	s.db.SetSettingJSON("agent_defaults", in.AgentDefaults)
 	s.db.SetSettingJSON("retention", in.Retention)
-	s.audit(r, "settings.update", "", nil)
+	// The audit log is the one place that answers "who changed what", and a
+	// row with an empty Target and empty Details answered neither. A save
+	// that changed nothing writes no row at all, so repeated saves of an
+	// unedited form stop burying the rows that matter.
+	if len(changes) > 0 {
+		s.audit(r, "settings.update", strings.Join(changedKeys(changes), ","), strings.Join(changes, "; "))
+	}
+	// public_url is what install commands and email links embed, and the
+	// certificate's SANs were fixed when it was generated.
+	s.checkCertHost()
 	// push new intervals to every connected agent
 	for _, id := range s.hub.OnlineIDs() {
 		s.pushAgentConfig(id)
 	}
 	s.handleGetSettings(w, r)
+}
+
+// settingsDiff describes what a save changed, as "key old->new" phrases.
+// The SMTP password is never written out, only reported as changed.
+func settingsDiff(before, after Settings) []string {
+	var out []string
+	add := func(key string, b, a any) {
+		bs, as := fmt.Sprint(b), fmt.Sprint(a)
+		if bs != as {
+			out = append(out, fmt.Sprintf("%s %s->%s", key, quoteIfEmpty(bs), quoteIfEmpty(as)))
+		}
+	}
+	add("public_url", before.PublicURL, after.PublicURL)
+	add("smtp.enabled", before.SMTP.Enabled, after.SMTP.Enabled)
+	add("smtp.host", before.SMTP.Host, after.SMTP.Host)
+	add("smtp.port", before.SMTP.Port, after.SMTP.Port)
+	add("smtp.tls", before.SMTP.TLSMode, after.SMTP.TLSMode)
+	add("smtp.username", before.SMTP.Username, after.SMTP.Username)
+	add("smtp.from", before.SMTP.From, after.SMTP.From)
+	add("smtp.to", strings.Join(before.SMTP.To, " "), strings.Join(after.SMTP.To, " "))
+	if before.SMTP.Password != after.SMTP.Password {
+		out = append(out, "smtp.password ***->***")
+	}
+	add("agent_defaults.metrics_interval_sec", before.AgentDefaults.MetricsIntervalSec, after.AgentDefaults.MetricsIntervalSec)
+	add("agent_defaults.inventory_interval_sec", before.AgentDefaults.InventoryIntervalSec, after.AgentDefaults.InventoryIntervalSec)
+	add("agent_defaults.patch_scan_interval_sec", before.AgentDefaults.PatchScanIntervalSec, after.AgentDefaults.PatchScanIntervalSec)
+	add("retention.metrics_days", before.Retention.MetricsDays, after.Retention.MetricsDays)
+	add("retention.runs_days", before.Retention.RunsDays, after.Retention.RunsDays)
+	add("retention.audit_days", before.Retention.AuditDays, after.Retention.AuditDays)
+	add("retention.events_days", before.Retention.EventsDays, after.Retention.EventsDays)
+	return out
+}
+
+func quoteIfEmpty(v string) string {
+	if v == "" {
+		return `""`
+	}
+	return v
+}
+
+// changedKeys is the key half of each diff phrase, for the audit Target
+// column (which is what the console's list shows without opening the row).
+func changedKeys(changes []string) []string {
+	out := make([]string, 0, len(changes))
+	for _, c := range changes {
+		if i := strings.IndexByte(c, ' '); i > 0 {
+			out = append(out, c[:i])
+		}
+	}
+	return out
 }
 
 func (s *Server) handleTestMail(w http.ResponseWriter, r *http.Request) {

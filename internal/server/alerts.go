@@ -309,7 +309,11 @@ func (e *alertEngine) event(agentID string, ev *protocol.Event) {
 		if r.Params.Pattern != "" && !strings.Contains(strings.ToLower(ev.Message), strings.ToLower(r.Params.Pattern)) {
 			continue
 		}
-		e.open(&r, agentID, dedupe(r.ID, agentID, ev.Message), "Event: "+ev.Kind, ev.Message)
+		// Keyed by rule+device+event KIND, not by the whole message: every
+		// distinct log line used to open its own alert that nothing ever
+		// resolved, so a chatty log filled the alerts list forever. The line
+		// itself is in the body.
+		e.open(&r, agentID, dedupe(r.ID, agentID, ev.Kind), "Event: "+ev.Kind, ev.Message)
 	}
 }
 
@@ -322,9 +326,21 @@ func (e *alertEngine) scriptFailed(agentID, runID, status string) {
 	name := runID
 	if run != nil {
 		name = run.ScriptName
+		// A run an automation started must not open an alert: with the
+		// shipped "Script failed" rule and an alert_opened -> run_script
+		// automation, the failure opens the alert that fires the automation
+		// that runs the script that fails - as fast as the device can manage.
+		if run.Trigger == "automation" {
+			slog.Debug("not alerting on an automation-triggered run", "run", runID, "agent", agentID)
+			return
+		}
 	}
 	for _, r := range e.rulesFor("script_failed", a) {
-		e.open(&r, agentID, dedupe(r.ID, agentID, runID), "Script failed: "+name, fmt.Sprintf("Run %s ended with status %s.", runID, status))
+		// Keyed by rule+device, NOT by run id: a nightly job that fails every
+		// night used to leave one permanent alert and one email per night,
+		// none of which anything could ever resolve. Now the first failure
+		// opens it and the rest are deduped until someone resolves it.
+		e.open(&r, agentID, dedupe(r.ID, agentID, ""), "Script failed: "+name, fmt.Sprintf("Run %s ended with status %s.", runID, status))
 	}
 }
 
@@ -335,6 +351,25 @@ func (e *alertEngine) patchFailed(agentID, title, errMsg string) {
 	}
 	for _, r := range e.rulesFor("patch_failed", a) {
 		e.open(&r, agentID, dedupe(r.ID, agentID, title), "Patch failed: "+title, errMsg)
+	}
+}
+
+// patchResolved closes the patch_failed alerts for a patch that has since
+// installed. Without it the alert for a patch that failed once and then went
+// in on the next attempt stayed open for good.
+func (e *alertEngine) patchResolved(agentID, patchID string) {
+	var title string
+	if err := e.s.db.QueryRow(`SELECT title FROM patches WHERE agent_id=? AND patch_id=?`, agentID, patchID).Scan(&title); err != nil || title == "" {
+		return
+	}
+	a, err := e.s.db.GetAgent(agentID)
+	if err != nil {
+		return
+	}
+	for _, r := range e.rulesFor("patch_failed", a) {
+		if r.AutoResolve {
+			e.resolveKey(dedupe(r.ID, agentID, title))
+		}
 	}
 }
 

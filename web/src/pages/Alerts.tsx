@@ -44,10 +44,18 @@ function AlertList() {
   const [status, setStatus] = useState<Status>('open');
   const alerts = useAsync(() => api.alerts(status, '', 500), [status]);
   useLiveReload(['alert', 'hello'], alerts.reload, { debounceMs: 600 });
+  // "Disk" and "Cpu" are kinds, not names: with two CPU rules at different
+  // thresholds the list could not say which one tripped. Rule names come from
+  // the rules endpoint and are joined here (the alert keeps its rule_id).
+  const rules = useAsync(() => api.alertRules(), []);
+  const ruleName = useMemo(() => new Map((rules.data ?? []).map((r) => [r.id, r.name])), [rules.data]);
   const [q, setQ] = useState('');
   const dq = useDebounced(q);
   const [sev, setSev] = useState('');
-  const rows = useMemo(() => (alerts.data ?? []).filter((a) => (!sev || a.severity === sev) && textMatch(dq, a.title, a.message, a.agent_name, a.rule_kind)), [alerts.data, dq, sev]);
+  const rows = useMemo(
+    () => (alerts.data ?? []).filter((a) => (!sev || a.severity === sev) && textMatch(dq, a.title, a.message, a.agent_name, a.rule_kind, a.rule_id ? ruleName.get(a.rule_id) : '')),
+    [alerts.data, dq, sev, ruleName],
+  );
 
   const act = async (fn: () => Promise<unknown>, label: string) => {
     try {
@@ -64,7 +72,13 @@ function AlertList() {
   };
 
   const columns: Column<Alert>[] = [
-    { key: 'sev', header: 'Severity', sort: (a) => ({ critical: 0, warning: 1, info: 2 } as Record<string, number>)[a.severity] ?? 3, render: (a) => <SeverityChip severity={a.severity} /> },
+    {
+      key: 'sev',
+      header: 'Severity',
+      sort: (a) => ({ critical: 0, warning: 1, info: 2 } as Record<string, number>)[a.severity] ?? 3,
+      csv: (a) => a.severity,
+      render: (a) => <SeverityChip severity={a.severity} />,
+    },
     { key: 'status', header: 'Status', sort: (a) => a.status, render: (a) => <AlertStatusChip status={a.status} /> },
     {
       key: 'title',
@@ -85,12 +99,38 @@ function AlertList() {
       sort: (a) => a.agent_name,
       render: (a) => (a.agent_id ? <Link to={`/devices/${a.agent_id}`} onClick={(e) => e.stopPropagation()}>{a.agent_name || a.agent_id}</Link> : <span className="muted">server</span>),
     },
-    { key: 'kind', header: 'Rule', sort: (a) => a.rule_kind, render: (a) => <span className="muted">{titleCase(a.rule_kind || '—')}</span> },
-    { key: 'opened', header: 'Opened', sort: (a) => a.opened_at, render: (a) => <span className="muted">{relTime(a.opened_at)}</span> },
+    {
+      key: 'kind',
+      header: 'Rule',
+      sort: (a) => (a.rule_id ? ruleName.get(a.rule_id) : undefined) ?? a.rule_kind,
+      csv: (a) => {
+        const n = a.rule_id ? ruleName.get(a.rule_id) : undefined;
+        return n ? `${n} (${a.rule_kind})` : titleCase(a.rule_kind || '');
+      },
+      render: (a) => {
+        // A rule that has since been deleted leaves the kind as the only label.
+        const n = a.rule_id ? ruleName.get(a.rule_id) : undefined;
+        return n ? (
+          <span>
+            {n} <span className="muted small">{titleCase(a.rule_kind)}</span>
+          </span>
+        ) : (
+          <span className="muted">{titleCase(a.rule_kind || '—')}</span>
+        );
+      },
+    },
+    {
+      key: 'opened',
+      header: 'Opened',
+      sort: (a) => a.opened_at,
+      csv: (a) => (a.opened_at ? new Date(a.opened_at * 1000).toISOString() : ''),
+      render: (a) => <span className="muted">{relTime(a.opened_at)}</span>,
+    },
     {
       key: 'ack',
       header: 'Acked / resolved',
       sort: (a) => a.resolved_at || a.acked_at,
+      csv: (a) => (a.status === 'resolved' ? `resolved ${new Date(a.resolved_at * 1000).toISOString()}` : a.status === 'acked' ? `${a.acked_by} ${new Date(a.acked_at * 1000).toISOString()}` : ''),
       render: (a) => <span className="muted small">{a.status === 'resolved' ? `resolved ${relTime(a.resolved_at)}` : a.status === 'acked' ? `${a.acked_by} · ${relTime(a.acked_at)}` : ''}</span>,
     },
     {
@@ -138,7 +178,7 @@ function AlertList() {
         )}
       </div>
       {alerts.error && <ErrorBox error={alerts.error} onRetry={alerts.reload} />}
-      <DataTable columns={columns} rows={alerts.data ? rows : undefined} loading={alerts.loading} rowKey={(a) => String(a.id)} defaultSort={{ key: 'opened', dir: 'desc' }} emptyTitle={status === 'open' ? 'No open alerts' : 'No alerts'} emptyBody={status === 'open' ? 'Alert rules fire here when a condition holds.' : undefined} />
+      <DataTable columns={columns} rows={alerts.data ? rows : undefined} loading={alerts.loading} rowKey={(a) => String(a.id)} defaultSort={{ key: 'opened', dir: 'desc' }} csvName="alerts" emptyTitle={status === 'open' ? 'No open alerts' : 'No alerts'} emptyBody={status === 'open' ? 'Alert rules fire here when a condition holds.' : undefined} />
     </>
   );
 }
@@ -251,10 +291,11 @@ function RuleList() {
         )}
       </div>
       {rules.error && <ErrorBox error={rules.error} onRetry={rules.reload} />}
-      <DataTable columns={columns} rows={rules.data} loading={rules.loading} rowKey={(r) => String(r.id)} onRowClick={canWrite ? (r) => setEditing(r) : undefined} defaultSort={{ key: 'name', dir: 'asc' }} emptyTitle="No alert rules" emptyBody="Add rules for CPU, memory, disk, offline devices, services and more." />
+      <DataTable columns={columns} rows={rules.data} loading={rules.loading} rowKey={(r) => String(r.id)} onRowClick={canWrite ? (r) => setEditing(r) : undefined} defaultSort={{ key: 'name', dir: 'asc' }} csvName="alert-rules" emptyTitle="No alert rules" emptyBody="Add rules for CPU, memory, disk, offline devices, services and more." />
       {editing && (
         <RuleEditor
           rule={editing}
+          existing={rules.data ?? []}
           onClose={() => setEditing(null)}
           onSaved={() => {
             setEditing(null);
@@ -266,7 +307,7 @@ function RuleList() {
   );
 }
 
-function RuleEditor({ rule, onClose, onSaved }: { rule: AlertRule; onClose: () => void; onSaved: () => void }) {
+function RuleEditor({ rule, existing, onClose, onSaved }: { rule: AlertRule; existing: AlertRule[]; onClose: () => void; onSaved: () => void }) {
   const toast = useToast();
   const agents = useAsync(() => api.agents(), []);
   const groups = useAsync(() => api.groups(), []);
@@ -277,6 +318,10 @@ function RuleEditor({ rule, onClose, onSaved }: { rule: AlertRule; onClose: () =
   const upd = (patch: Partial<AlertRule>) => setForm((f) => ({ ...f, ...patch }));
   const setP = (patch: Partial<AlertRule['params']>) => upd({ params: { ...form.params, ...patch } });
   const k = form.kind;
+  // Alerts are labelled with their rule's name, so two rules called "High CPU"
+  // make the alert list unreadable. The server still accepts it; this is the
+  // nudge at the point where the name is chosen.
+  const duplicateName = existing.some((r) => r.id !== form.id && r.name.trim().toLowerCase() === form.name.trim().toLowerCase() && form.name.trim() !== '');
   const hasThreshold = k === 'cpu' || k === 'memory' || k === 'disk';
   const hasMinutes = k === 'cpu' || k === 'memory' || k === 'offline';
 
@@ -314,7 +359,7 @@ function RuleEditor({ rule, onClose, onSaved }: { rule: AlertRule; onClose: () =
     >
       {error && <div className="form-error" role="alert">{error}</div>}
       <div className="form-row">
-        <Field label="Name">
+        <Field label="Name" hint={duplicateName ? 'Another rule already has this name — alerts from both will look the same in the list.' : undefined}>
           <input value={form.name} autoFocus onChange={(e) => upd({ name: e.target.value })} />
         </Field>
         <Field label="Condition">

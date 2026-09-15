@@ -108,36 +108,55 @@ func clampInt(v float64, lo, hi int) int {
 	return i
 }
 
-// wheelPixelsPerNotch is the browser deltaY that equals one wheel notch.
-// Chrome reports 100 per notch, Firefox less; accumulating remainders lets
-// trackpads that send tiny deltas still scroll.
-const wheelPixelsPerNotch = 100
+// wheelPixelsPerNotch is the browser deltaY the protocol defines as one
+// wheel notch. Browsers disagree about what a notch is worth: Chrome on
+// Windows sends 120, Chrome on Linux 100 or 53, Firefox in line mode a
+// multiple of the line height. Anything inside [wheelNotchMin,
+// wheelNotchMax] is therefore taken to *mean* one notch whatever its
+// magnitude, and only the smaller deltas a trackpad produces are
+// accumulated. Without that window a 120 px browser double-scrolls every
+// fifth notch (the carried 20 px reach 100) and a 57 px one swallows every
+// other notch.
+const (
+	wheelPixelsPerNotch = 100
+	wheelNotchMin       = 40
+	wheelNotchMax       = 200
+)
 
 // wheelAccumulator turns pixel deltas into whole notches, carrying the
-// remainder between events. Positive results mean right / down, matching
-// the browser's sign convention; the platform code flips as needed.
+// remainder of sub-notch (trackpad) deltas between events. Positive results
+// mean right / down, matching the browser's sign convention; the platform
+// code flips as needed.
 type wheelAccumulator struct {
 	x, y float64
 }
 
 func (a *wheelAccumulator) add(dx, dy float64) (nx, ny int) {
-	if math.IsNaN(dx) || math.IsInf(dx, 0) {
-		dx = 0
-	}
-	if math.IsNaN(dy) || math.IsInf(dy, 0) {
-		dy = 0
+	nx, a.x = notches(dx, a.x)
+	ny, a.y = notches(dy, a.y)
+	return nx, ny
+}
+
+// notches converts one axis of one wheel event into whole notches, given
+// (and returning) the remainder carried from earlier events on that axis.
+func notches(d, carry float64) (n int, rest float64) {
+	if math.IsNaN(d) || math.IsInf(d, 0) {
+		return 0, carry
 	}
 	// A single event never scrolls more than a screenful of notches: a
 	// hostile viewer could otherwise queue thousands of wheel clicks.
-	dx = math.Max(-20*wheelPixelsPerNotch, math.Min(20*wheelPixelsPerNotch, dx))
-	dy = math.Max(-20*wheelPixelsPerNotch, math.Min(20*wheelPixelsPerNotch, dy))
-	a.x += dx
-	a.y += dy
-	nx = int(a.x / wheelPixelsPerNotch)
-	ny = int(a.y / wheelPixelsPerNotch)
-	a.x -= float64(nx) * wheelPixelsPerNotch
-	a.y -= float64(ny) * wheelPixelsPerNotch
-	return nx, ny
+	d = math.Max(-20*wheelPixelsPerNotch, math.Min(20*wheelPixelsPerNotch, d))
+	if abs := math.Abs(d); abs >= wheelNotchMin && abs <= wheelNotchMax {
+		// One deliberate notch from a mouse wheel. It is authoritative, so
+		// any trackpad remainder is dropped rather than added to it.
+		if d < 0 {
+			return -1, 0
+		}
+		return 1, 0
+	}
+	carry += d
+	n = int(carry / wheelPixelsPerNotch)
+	return n, carry - float64(n)*wheelPixelsPerNotch
 }
 
 // reset drops any carried remainder (used when the pointer changes

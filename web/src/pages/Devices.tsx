@@ -5,12 +5,12 @@ import type { Agent, Group, Metrics, PowerAction } from '../api/types';
 import { DataTable, textMatch, type Column } from '../components/DataTable';
 import { EnrollDrawer } from '../components/EnrollDrawer';
 import { GroupsDialog } from '../components/GroupsDialog';
-import { IconLinux, IconPlus, IconRefresh, IconWindows } from '../components/Icons';
-import { Modal } from '../components/Modal';
+import { IconChevronDown, IconLinux, IconPlus, IconRefresh, IconTable, IconWindows } from '../components/Icons';
+import { Modal, PromptDialog, useConfirm } from '../components/Modal';
 import { PowerDialog } from '../components/PowerDialog';
 import { RunDialog } from '../components/RunDialog';
-import { Button, Chip, ErrorBox, Field, MiniBar, OnlineDot, TagInput } from '../components/ui';
-import { useAsync, useDebounced } from '../hooks/useAsync';
+import { Button, Chip, Dropdown, ErrorBox, Field, MiniBar, OnlineDot, TagInput } from '../components/ui';
+import { useAsync, useDebounced, useLocalState } from '../hooks/useAsync';
 import { useEvents, useLiveReload } from '../hooks/useEvents';
 import { memPct, osLabel, relTime } from '../lib/format';
 import { useAuth } from '../state/auth';
@@ -22,6 +22,12 @@ export function OSIcon({ os }: { os: string }) {
   return null;
 }
 
+/** A named device filter: the page's query string, saved in this browser. */
+interface SavedView {
+  name: string;
+  query: string;
+}
+
 function diskMax(m: Metrics | undefined): number | undefined {
   if (!m?.disks?.length) return undefined;
   return Math.max(...m.disks.map((d) => d.used_pct));
@@ -30,6 +36,7 @@ function diskMax(m: Metrics | undefined): number | undefined {
 export function Devices() {
   const { canWrite } = useAuth();
   const toast = useToast();
+  const confirm = useConfirm();
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const agents = useAsync(() => api.agents(), []);
@@ -60,6 +67,13 @@ export function Devices() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [enroll, setEnroll] = useState(params.get('enroll') === '1');
   const [groupsOpen, setGroupsOpen] = useState(false);
+  // Saved views are the current query string under a name. They live in this
+  // browser (no schema, no server round trip) and a view is still just a URL,
+  // so an existing deep link keeps working and a view can be shared as a link.
+  const [views, setViews] = useLocalState<SavedView[]>('rmm.deviceViews', []);
+  const [defaultView, setDefaultView] = useLocalState('rmm.deviceViews.default', '');
+  const [saveView, setSaveView] = useState(false);
+  const [manageViews, setManageViews] = useState(false);
   const [runOpen, setRunOpen] = useState(false);
   const [bulkEdit, setBulkEdit] = useState(false);
   const [power, setPower] = useState<PowerAction | null>(null);
@@ -68,7 +82,11 @@ export function Devices() {
     if (params.get('enroll') === '1') {
       setEnroll(true);
       setParam('enroll', '');
+      return;
     }
+    // A default view applies only to a bare /devices: a link with filters on
+    // it, or "Clear filters", must win over it.
+    if (!params.toString() && defaultView) setParams(new URLSearchParams(defaultView), { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -95,25 +113,81 @@ export function Devices() {
   }, [agents.data]);
 
   const selectedAgents = useMemo(() => (agents.data ?? []).filter((a) => selected.has(a.id)), [agents.data, selected]);
+  const filtersActive = !!(q || fGroup || fOS || fOnline || fTag);
 
-  const bulkScan = async () => {
-    const online = selectedAgents.filter((a) => a.online);
-    if (!online.length) return toast.warning('No online devices selected');
-    toast.info(`Scanning ${online.length} device(s) for patches…`);
-    const res = await Promise.allSettled(online.map((a) => api.patchScan(a.id)));
+  /**
+   * Every bulk verb is the per-device endpoint applied to the selection, with
+   * one summary message instead of one toast per device — a burst of those is
+   * capped at three on screen and the rest are lost. Offline devices are
+   * skipped rather than failed, because "offline" is not an error here.
+   */
+  const bulkApply = async (
+    label: string,
+    fn: (a: Agent) => Promise<unknown>,
+    opts: { onlineOnly?: boolean; offlineOnly?: boolean; reload?: boolean; announce?: boolean } = {},
+  ) => {
+    let list = selectedAgents;
+    const skipped = opts.onlineOnly ? list.filter((a) => !a.online).length : opts.offlineOnly ? list.filter((a) => a.online).length : 0;
+    if (opts.onlineOnly) list = list.filter((a) => a.online);
+    if (opts.offlineOnly) list = list.filter((a) => !a.online);
+    if (!list.length) {
+      toast.warning(`${label}: nothing to do`, opts.onlineOnly ? 'Every selected device is offline.' : opts.offlineOnly ? 'Every selected device is already online.' : undefined);
+      return;
+    }
+    // Only the slow verbs announce themselves; for a one-round-trip action the
+    // "started" toast would be pushed off the stack by its own result.
+    if (opts.announce) toast.info(`${label}…`, `${list.length} device(s)`);
+    const res = await Promise.allSettled(list.map(fn));
     const failed = res.filter((r) => r.status === 'rejected').length;
-    if (failed) toast.warning('Patch scan finished', `${failed} of ${online.length} failed`);
-    else toast.success('Patch scan finished', `${online.length} device(s)`);
-    void agents.reload();
+    const detail = [`${res.length - failed} ok`, failed ? `${failed} failed` : '', skipped ? `${skipped} skipped (offline)` : ''].filter(Boolean).join(' · ');
+    if (failed) toast.warning(label, detail);
+    else toast.success(label, detail);
+    if (opts.reload !== false) void agents.reload();
+  };
+
+  const bulkScan = () => bulkApply('Patch scan', (a) => api.patchScan(a.id), { onlineOnly: true, announce: true });
+
+  /**
+   * Install what has already been approved, per device. The approved set is
+   * per (device, patch), so it is read first and devices with nothing approved
+   * are reported as skipped rather than counted as a successful install.
+   */
+  const bulkInstallApproved = async () => {
+    const online = selectedAgents.filter((a) => a.online);
+    if (!online.length) return toast.warning('Install approved patches: nothing to do', 'Every selected device is offline.');
+    toast.info('Collecting approved patches…', `${online.length} device(s)`);
+    const lists = await Promise.allSettled(
+      online.map(async (a) => ({ agent: a, ids: (await api.agentPatches(a.id)).patches.filter((p) => p.status === 'approved').map((p) => p.patch_id) })),
+    );
+    const targets = lists.flatMap((r) => (r.status === 'fulfilled' && r.value.ids.length ? [r.value] : []));
+    if (!targets.length) return toast.warning('No approved patches', 'Approve patches on the Patches page first.');
+    const res = await Promise.allSettled(targets.map((t) => api.patchInstall(t.agent.id, { ids: t.ids, reboot_if_required: false })));
+    const failed = res.filter((r) => r.status === 'rejected').length;
+    const detail = [`${res.length - failed} started`, failed ? `${failed} failed` : '', online.length - targets.length ? `${online.length - targets.length} with nothing approved` : ''].filter(Boolean).join(' · ');
+    if (failed) toast.warning('Install approved patches', detail);
+    else toast.success('Install approved patches', detail);
+  };
+
+  const bulkMaintenance = (hours: number) =>
+    bulkApply(hours ? `Maintenance for ${hours}h` : 'Maintenance cleared', (a) =>
+      api.updateAgent(a.id, { maintenance_until: hours ? Math.floor(Date.now() / 1000) + hours * 3600 : 0 }),
+    );
+
+  const bulkDelete = async () => {
+    const ok = await confirm({
+      title: `Delete ${selectedAgents.length} device(s)`,
+      message: 'Their history, metrics and patch data go with them. Agents keep running until uninstalled and will be rejected.',
+      danger: true,
+      confirmLabel: 'Delete devices',
+    });
+    if (!ok) return;
+    await bulkApply('Devices deleted', (a) => api.deleteAgent(a.id));
+    setSelected(new Set());
   };
 
   const bulkPower = async (delay: number, message: string) => {
     if (!power) return;
-    const online = selectedAgents.filter((a) => a.online);
-    const res = await Promise.allSettled(online.map((a) => api.power(a.id, power, delay, message)));
-    const failed = res.filter((r) => r.status === 'rejected').length;
-    if (failed) toast.warning(`${power} sent`, `${online.length - failed} ok, ${failed} failed`);
-    else toast.success(`${power} sent to ${online.length} device(s)`);
+    await bulkApply(`${power} sent`, (a) => api.power(a.id, power, delay, message), { onlineOnly: true, reload: false });
   };
 
   const columns: Column<Agent>[] = [
@@ -122,12 +196,14 @@ export function Devices() {
       header: '',
       width: 28,
       sort: (a) => (a.online ? 0 : 1),
+      csv: (a) => (a.online ? 'online' : 'offline'),
       render: (a) => <OnlineDot online={a.online} title={a.online ? 'Online' : `Offline · last seen ${relTime(a.last_seen)}`} />,
     },
     {
       key: 'name',
       header: 'Name',
       sort: (a) => a.display_name,
+      csv: (a) => (a.display_name === a.hostname ? a.display_name : `${a.display_name} (${a.hostname})`),
       render: (a) => (
         <div>
           <Link to={`/devices/${a.id}`} style={{ fontWeight: 500 }} onClick={(e) => e.stopPropagation()}>
@@ -151,6 +227,7 @@ export function Devices() {
       key: 'os',
       header: 'OS',
       sort: (a) => `${a.os} ${a.platform}`,
+      csv: (a) => a.platform || osLabel(a.os),
       render: (a) => (
         <span className="row" style={{ gap: 6, flexWrap: 'nowrap' }}>
           <OSIcon os={a.os} />
@@ -184,14 +261,27 @@ export function Devices() {
         </span>
       ),
     },
-    { key: 'cpu', header: 'CPU', sort: (a) => a.last_metrics?.cpu ?? -1, render: (a) => <MiniBar value={a.online ? a.last_metrics?.cpu : undefined} /> },
+    {
+      key: 'cpu',
+      header: 'CPU',
+      sort: (a) => a.last_metrics?.cpu ?? -1,
+      csv: (a) => (a.online && a.last_metrics ? Math.round(a.last_metrics.cpu) : ''),
+      render: (a) => <MiniBar value={a.online ? a.last_metrics?.cpu : undefined} />,
+    },
     {
       key: 'mem',
       header: 'Memory',
       sort: (a) => memPct(a.last_metrics?.mem_used, a.last_metrics?.mem_total) ?? -1,
+      csv: (a) => (a.online ? Math.round(memPct(a.last_metrics?.mem_used, a.last_metrics?.mem_total) ?? 0) || '' : ''),
       render: (a) => <MiniBar value={a.online ? memPct(a.last_metrics?.mem_used, a.last_metrics?.mem_total) : undefined} />,
     },
-    { key: 'disk', header: 'Disk', sort: (a) => diskMax(a.last_metrics) ?? -1, render: (a) => <MiniBar value={diskMax(a.last_metrics)} title="Fullest volume" /> },
+    {
+      key: 'disk',
+      header: 'Disk',
+      sort: (a) => diskMax(a.last_metrics) ?? -1,
+      csv: (a) => (diskMax(a.last_metrics) === undefined ? '' : Math.round(diskMax(a.last_metrics)!)),
+      render: (a) => <MiniBar value={diskMax(a.last_metrics)} title="Fullest volume" />,
+    },
     {
       key: 'alerts',
       header: 'Alerts',
@@ -206,7 +296,13 @@ export function Devices() {
       sort: (a) => a.patches_available,
       render: (a) => (a.patches_available ? <span className="badge muted">{a.patches_available}</span> : <span className="faint">0</span>),
     },
-    { key: 'seen', header: 'Last seen', sort: (a) => a.last_seen, render: (a) => <span className="muted">{a.online ? 'now' : relTime(a.last_seen)}</span> },
+    {
+      key: 'seen',
+      header: 'Last seen',
+      sort: (a) => a.last_seen,
+      csv: (a) => (a.online ? 'online' : a.last_seen ? new Date(a.last_seen * 1000).toISOString() : 'never'),
+      render: (a) => <span className="muted">{a.online ? 'now' : relTime(a.last_seen)}</span>,
+    },
   ];
 
   return (
@@ -217,6 +313,34 @@ export function Devices() {
           <IconRefresh />
         </Button>
         <Button onClick={() => setGroupsOpen(true)}>Groups</Button>
+        <Dropdown
+          trigger={
+            <button className="btn" aria-label="Saved views">
+              <IconTable /> Views <IconChevronDown />
+            </button>
+          }
+        >
+          {views.map((v) => (
+            <button key={v.name} onClick={() => setParams(new URLSearchParams(v.query), { replace: true })}>
+              {v.name}
+              {v.query === defaultView && <span className="muted small"> default</span>}
+            </button>
+          ))}
+          {!views.length && <button disabled>No saved views yet</button>}
+          <hr />
+          <button onClick={() => setSaveView(true)} disabled={!filtersActive}>
+            Save current filters…
+          </button>
+          <button onClick={() => setDefaultView(params.toString())} disabled={!filtersActive || params.toString() === defaultView}>
+            Use current filters as my default
+          </button>
+          <button onClick={() => setDefaultView('')} disabled={!defaultView}>
+            Clear my default
+          </button>
+          <button onClick={() => setManageViews(true)} disabled={!views.length}>
+            Manage views…
+          </button>
+        </Dropdown>
         {canWrite && (
           <Button variant="primary" onClick={() => setEnroll(true)}>
             <IconPlus /> Enrol device
@@ -262,18 +386,33 @@ export function Devices() {
         {selected.size > 0 && canWrite && (
           <div className="row">
             <span className="muted small">{selected.size} selected</span>
-            <Button size="sm" onClick={() => setRunOpen(true)}>
+            <Button size="sm" variant="primary" onClick={() => setRunOpen(true)}>
               Run script
             </Button>
-            <Button size="sm" onClick={bulkScan}>
-              Patch scan
-            </Button>
-            <Button size="sm" onClick={() => setPower('reboot')}>
-              Reboot
-            </Button>
-            <Button size="sm" onClick={() => setBulkEdit(true)}>
-              Set group / tags
-            </Button>
+            {/* One menu rather than a row of buttons that grows into the filters. */}
+            <Dropdown
+              trigger={
+                <button className="btn sm">
+                  Actions <IconChevronDown />
+                </button>
+              }
+            >
+              <button onClick={bulkScan}>Patch scan</button>
+              <button onClick={bulkInstallApproved}>Install approved patches</button>
+              <button onClick={() => bulkApply('Inventory refresh requested', (a) => api.refreshAgent(a.id), { onlineOnly: true, reload: false })}>Refresh inventory</button>
+              <hr />
+              <button onClick={() => setPower('reboot')}>Reboot…</button>
+              <button onClick={() => setPower('shutdown')}>Shut down…</button>
+              <button onClick={() => bulkApply('Magic packet sent', (a) => api.wol(a.id), { offlineOnly: true, reload: false })}>Wake-on-LAN</button>
+              <hr />
+              <button onClick={() => setBulkEdit(true)}>Set group / tags…</button>
+              <button onClick={() => bulkMaintenance(4)}>Maintenance for 4 hours</button>
+              <button onClick={() => bulkMaintenance(0)}>Clear maintenance</button>
+              <hr />
+              <button className="danger" onClick={bulkDelete}>
+                Delete devices…
+              </button>
+            </Dropdown>
             <Button size="sm" variant="ghost" onClick={() => setSelected(new Set())}>
               Clear
             </Button>
@@ -290,6 +429,7 @@ export function Devices() {
         selected={selected}
         onSelect={setSelected}
         defaultSort={{ key: 'status', dir: 'asc' }}
+        csvName="devices"
         emptyTitle={agents.data?.length ? 'No devices match these filters' : 'No devices enrolled yet'}
         emptyBody={
           !agents.data?.length && canWrite ? (
@@ -310,6 +450,45 @@ export function Devices() {
         }
       />
 
+      {saveView && (
+        <PromptDialog
+          title="Save this view"
+          label="Name"
+          placeholder="Windows servers needing patches"
+          confirmLabel="Save"
+          onClose={() => setSaveView(false)}
+          onSubmit={(name) => {
+            const query = params.toString();
+            setViews([...views.filter((v) => v.name !== name), { name, query }].sort((a, b) => a.name.localeCompare(b.name)));
+            setSaveView(false);
+            toast.success('View saved', name);
+          }}
+        />
+      )}
+      {manageViews && (
+        <Modal title="Saved views" onClose={() => setManageViews(false)} size="sm" footer={<Button onClick={() => setManageViews(false)}>Done</Button>}>
+          <div className="card list">
+            {views.map((v) => (
+              <div key={v.name} className="list-item">
+                <div className="grow">
+                  <div className="title">{v.name}</div>
+                  <div className="sub mono truncate">?{v.query}</div>
+                </div>
+                <Button size="sm" variant="ghost" onClick={() => setDefaultView(v.query)} disabled={v.query === defaultView}>
+                  {v.query === defaultView ? 'Default' : 'Make default'}
+                </Button>
+                <Button size="sm" variant="ghost" aria-label={`Delete ${v.name}`} onClick={() => setViews(views.filter((x) => x.name !== v.name))}>
+                  ×
+                </Button>
+              </div>
+            ))}
+            {!views.length && <div className="empty">No saved views.</div>}
+          </div>
+          <p className="muted small" style={{ marginTop: 10 }}>
+            Views are stored in this browser. A view is just the query string, so you can also share the address bar.
+          </p>
+        </Modal>
+      )}
       {enroll && <EnrollDrawer onClose={() => setEnroll(false)} groups={groups.data ?? []} />}
       {groupsOpen && (
         <GroupsDialog

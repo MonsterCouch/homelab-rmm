@@ -852,8 +852,16 @@ table.tbl {
   opacity: 0;
 }
 .tbl tr:hover .cell-actions,
+.tbl tr:focus-within .cell-actions,
 .tbl tr.selected .cell-actions {
   opacity: 1;
+}
+/* There is no hover on a touch screen: row actions that only appear on hover
+   are invisible buttons on a phone or a tablet. */
+@media (hover: none) {
+  .tbl .cell-actions {
+    opacity: 1;
+  }
 }
 .tbl.compact th,
 .tbl.compact td {
@@ -1061,7 +1069,7 @@ table.tbl {
   justify-content: center;
   padding: 60px 16px;
   overflow: auto;
-  animation: fade 0.12s ease-out;
+  animation: fade 0.12s ease-out both;
 }
 .overlay.center {
   align-items: center;
@@ -1078,7 +1086,7 @@ table.tbl {
   box-shadow: var(--shadow);
   width: 100%;
   max-width: 560px;
-  animation: pop 0.14s ease-out;
+  animation: pop 0.14s ease-out both;
 }
 .modal.lg {
   max-width: 860px;
@@ -1121,8 +1129,15 @@ table.tbl {
   position: fixed;
   inset: 0;
   z-index: 100;
+}
+/* The scrim fades on its own element: fading the host would fade the panel
+   with it, which is exactly the translucent double exposure this replaces. */
+.drawer-host::before {
+  content: '';
+  position: absolute;
+  inset: 0;
   background: rgba(0, 0, 0, 0.45);
-  animation: fade 0.12s ease-out;
+  animation: fade 0.12s ease-out both;
 }
 .drawer {
   position: absolute;
@@ -1135,10 +1150,21 @@ table.tbl {
   box-shadow: var(--shadow);
   display: flex;
   flex-direction: column;
-  animation: slide 0.16s ease-out;
+  /* `both` keeps the panel at its first keyframe until the animation starts:
+     without it the drawer paints once at its final position while the host's
+     scrim is still transparent, which reads as a translucent double exposure.
+     The panel slides only - fading it as well is what made the text below it
+     show through. */
+  animation: drawer-in 0.16s ease-out both;
+  will-change: transform;
 }
 .drawer.wide {
   width: min(900px, 94vw);
+}
+@keyframes drawer-in {
+  from {
+    transform: translateX(30px);
+  }
 }
 @keyframes slide {
   from {
@@ -1629,12 +1655,18 @@ table.tbl {
 .toast-host {
   position: fixed;
   right: 16px;
-  bottom: 16px;
+  /* A page that fills the viewport puts its own read-out along the bottom (the
+     terminal and the remote desktop status lines carry "fps · B/s"), so the
+     stack starts above it rather than on top of it. */
+  bottom: calc(16px + var(--statusline-h, 0px));
   display: flex;
   flex-direction: column;
   gap: 8px;
   z-index: 200;
   max-width: 380px;
+  /* The host is a tall empty column; only the toasts in it may take a click
+     that was meant for the table row underneath. */
+  pointer-events: none;
 }
 .toast {
   display: flex;
@@ -1646,7 +1678,8 @@ table.tbl {
   border-radius: var(--radius);
   padding: 10px 12px;
   box-shadow: var(--shadow);
-  animation: slide 0.16s ease-out;
+  animation: slide 0.16s ease-out both;
+  pointer-events: auto;
 }
 .toast-success {
   border-left-color: var(--ok);
@@ -1708,4 +1741,222 @@ table.tbl {
   display: grid;
   place-items: center;
   color: #fff;
+}
+
+/* ---------- activity log (toast history) ---------- */
+.notif-btn {
+  position: relative;
+}
+.notif-btn .unread {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--danger);
+  border: 1px solid var(--bg-elev);
+}
+.notif-menu {
+  width: 380px;
+  max-width: calc(100vw - 24px);
+  padding: 0;
+}
+.notif-menu .notif-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+}
+.notif-list {
+  max-height: 60vh;
+  overflow: auto;
+}
+.notif-item {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid transparent;
+}
+.notif-item:last-child {
+  border-bottom: 0;
+}
+.notif-item.kind-success {
+  border-left-color: var(--ok);
+}
+.notif-item.kind-error {
+  border-left-color: var(--danger);
+}
+.notif-item.kind-warning {
+  border-left-color: var(--warn);
+}
+.notif-item.kind-info {
+  border-left-color: var(--accent);
+}
+.notif-item .when {
+  color: var(--text-faint);
+  font-size: 11px;
+  white-space: nowrap;
+  margin-left: auto;
+}
+
+/* ---------- keyboard shortcut sheet ---------- */
+.shortcuts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 8px 14px;
+  align-items: center;
+}
+.shortcuts .keys {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+}
+
+/* ---------- getting started checklist ---------- */
+.checklist .list-item {
+  gap: 10px;
+}
+.checklist .tick {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  flex: none;
+  border: 1px solid var(--border-strong);
+  color: var(--text-faint);
+}
+.checklist .tick.done {
+  background: var(--ok-soft);
+  border-color: transparent;
+  color: var(--ok);
+}
+
+/* ---------- responsive: phone ---------- */
+.nav-toggle {
+  display: none;
+}
+.nav-scrim {
+  display: none;
+}
+@media (max-width: 700px) {
+  :root {
+    --nav-w: 0px;
+  }
+  .app {
+    grid-template-columns: 0 1fr;
+  }
+  /* The rail becomes an off-canvas drawer the topbar's hamburger opens. */
+  .nav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 232px;
+    z-index: 120;
+    transform: translateX(-100%);
+    transition: transform 0.16s ease-out;
+    box-shadow: var(--shadow);
+  }
+  .nav.open {
+    transform: none;
+  }
+  .nav-brand span,
+  .nav-item span {
+    display: inline;
+  }
+  .nav-section,
+  .nav-foot {
+    display: block;
+  }
+  .nav a.nav-item {
+    justify-content: flex-start;
+    padding: 9px 12px;
+  }
+  .nav-item .badge {
+    position: static;
+    transform: none;
+    margin-left: auto;
+  }
+  .nav-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 110;
+    background: rgba(0, 0, 0, 0.45);
+  }
+  .nav-toggle {
+    display: inline-flex;
+  }
+  .topbar {
+    padding: 0 10px;
+    gap: 4px;
+  }
+  /* A phone topbar fits the menu, the search, the bell and an avatar. */
+  .user-btn span:not(.avatar),
+  .topbar .btn[aria-label='Keyboard shortcuts'] {
+    display: none;
+  }
+  .topbar .search {
+    min-width: 0;
+  }
+  .main {
+    padding: 12px 12px 32px;
+  }
+  .grid.cols-2,
+  .grid.cols-3,
+  .grid.cols-4,
+  .grid.auto {
+    grid-template-columns: 1fr;
+  }
+  /* Five fixed-width selects in a row do not fit a phone: let every control
+     take a share of the line and wrap. The inline max-widths the pages set are
+     what has to be overridden here. */
+  .toolbar > input,
+  .toolbar > select,
+  .toolbar > .btn-group {
+    flex: 1 1 140px;
+    min-width: 0;
+    max-width: none !important;
+    width: auto !important;
+  }
+  .page-head h1 {
+    font-size: 17px;
+  }
+  .toast-host {
+    left: 8px;
+    right: 8px;
+    max-width: none;
+  }
+  .modal-body {
+    max-height: calc(100vh - 170px);
+  }
+  .fill-page {
+    height: calc(100vh - var(--topbar-h) - 120px);
+  }
+  .notif-menu {
+    width: calc(100vw - 20px);
+  }
+}
+
+/* ---------- reduced motion ---------- */
+@media (prefers-reduced-motion: reduce) {
+  .overlay,
+  .modal,
+  .drawer-host::before,
+  .drawer,
+  .toast,
+  .nav {
+    animation-duration: 0.01ms;
+    transition-duration: 0.01ms;
+  }
+  .skeleton {
+    animation: none;
+  }
 }

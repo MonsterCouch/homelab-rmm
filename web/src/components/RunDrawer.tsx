@@ -14,7 +14,18 @@ import { Button, ErrorBox, Loading, RunStatusChip, Tabs } from './ui';
 const ACTIVE = new Set(['running', 'queued', 'pending']);
 
 /** Run detail with live-streamed output; used from the Runs page and the device Runs tab. */
-export function RunDrawer({ runId, onClose, onChanged }: { runId: string; onClose: () => void; onChanged?: () => void }) {
+export function RunDrawer({
+  runId,
+  onClose,
+  onChanged,
+  onOpenRun,
+}: {
+  runId: string;
+  onClose: () => void;
+  onChanged?: () => void;
+  /** follow a re-run into its own drawer when the caller owns which run is open */
+  onOpenRun?: (id: string) => void;
+}) {
   const toast = useToast();
   const { canWrite } = useAuth();
   const run = useAsync(() => api.run(runId), [runId]);
@@ -56,6 +67,33 @@ export function RunDrawer({ runId, onClose, onChanged }: { runId: string; onClos
     }
   };
 
+  const [rerunning, setRerunning] = useState(false);
+  /**
+   * Repeat this run: same script, same arguments, same device. An ad hoc run
+   * cannot be repeated — the body was never stored — so the button says so
+   * instead of failing.
+   */
+  const rerun = async () => {
+    if (!r?.script_id) return;
+    setRerunning(true);
+    try {
+      const res = await api.runScript({ script_id: r.script_id, args: r.args, targets: { all: false, agents: [r.agent_id] } });
+      const next = Object.values(res.runs).find((v) => !v.startsWith('error: ') && !v.startsWith('skipped: '));
+      const problem = Object.values(res.runs).find((v) => v.startsWith('error: ') || v.startsWith('skipped: '));
+      if (!next) {
+        toast.error('Could not start', problem ?? 'the device did not accept the run');
+        return;
+      }
+      toast.success('Re-run started', r.script_name);
+      onChanged?.();
+      onOpenRun?.(next);
+    } catch (err) {
+      toast.error('Re-run failed', errMsg(err));
+    } finally {
+      setRerunning(false);
+    }
+  };
+
   return (
     <Drawer
       title={
@@ -66,10 +104,16 @@ export function RunDrawer({ runId, onClose, onChanged }: { runId: string; onClos
       onClose={onClose}
       wide
       actions={
-        active && canWrite ? (
-          <Button size="sm" variant="danger" onClick={cancel}>
-            Cancel run
-          </Button>
+        canWrite ? (
+          active ? (
+            <Button size="sm" variant="danger" onClick={cancel}>
+              Cancel run
+            </Button>
+          ) : r ? (
+            <Button size="sm" busy={rerunning} disabled={!r.script_id} onClick={rerun} title={r.script_id ? 'Run this script again on this device' : 'Ad hoc runs are not stored and cannot be repeated'}>
+              Re-run
+            </Button>
+          ) : undefined
         ) : undefined
       }
     >

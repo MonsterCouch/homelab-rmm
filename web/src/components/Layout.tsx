@@ -1,20 +1,25 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
 import type { Agent } from '../api/types';
 import { useAsync } from '../hooks/useAsync';
 import { useEventBus, useLiveReload } from '../hooks/useEvents';
 import { useTheme } from '../hooks/useTheme';
-import { osLabel } from '../lib/format';
+import { osLabel, relTime } from '../lib/format';
+import { useActivity } from '../state/toast';
 import { useAuth } from '../state/auth';
 import { textMatch } from './DataTable';
+import { Modal } from './Modal';
 import {
   IconAlert,
   IconAudit,
   IconAutomation,
+  IconBell,
   IconDashboard,
   IconDevices,
+  IconKeyboard,
   IconLogout,
+  IconMenu,
   IconMoon,
   IconPatch,
   IconRuns,
@@ -51,6 +56,14 @@ export function Layout() {
   const { user, isAdmin, logout, version } = useAuth();
   const [theme, toggleTheme] = useTheme();
   const navigate = useNavigate();
+  const loc = useLocation();
+  // Below 700px the rail is an off-canvas drawer; above it the class does nothing.
+  const [navOpen, setNavOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  useShortcuts(() => setHelpOpen((o) => !o));
+
+  // A tap that navigates must also put the drawer away.
+  useEffect(() => setNavOpen(false), [loc.pathname]);
 
   // Open-alert badge: cheap dashboard call, refreshed on alert events.
   const dash = useAsync(() => api.dashboard(), []);
@@ -62,7 +75,8 @@ export function Layout() {
       <a className="skip-link" href="#main">
         Skip to content
       </a>
-      <nav className="nav" aria-label="Main">
+      {navOpen && <div className="nav-scrim" onClick={() => setNavOpen(false)} />}
+      <nav className={`nav ${navOpen ? 'open' : ''}`} aria-label="Main">
         <div className="nav-brand">
           <span className="logo">R</span>
           <span>Homelab RMM</span>
@@ -99,14 +113,21 @@ export function Layout() {
         </div>
       </nav>
       <header className="topbar">
+        <Button variant="ghost" icon className="nav-toggle" onClick={() => setNavOpen((o) => !o)} aria-label="Menu" aria-expanded={navOpen}>
+          <IconMenu />
+        </Button>
         <GlobalSearch />
         <span className="spacer" />
+        <ActivityMenu />
+        <Button variant="ghost" icon onClick={() => setHelpOpen(true)} title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">
+          <IconKeyboard />
+        </Button>
         <Button variant="ghost" icon onClick={toggleTheme} title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'} aria-label="Toggle theme">
           {theme === 'dark' ? <IconSun /> : <IconMoon />}
         </Button>
         <Dropdown
           trigger={
-            <button className="btn ghost" style={{ gap: 8 }} aria-label="User menu">
+            <button className="btn ghost user-btn" style={{ gap: 8 }} aria-label="User menu">
               <span className="avatar">{(user?.username ?? '?').slice(0, 2).toUpperCase()}</span>
               <span>{user?.username}</span>
               <span className="chip outline">{user?.role}</span>
@@ -132,6 +153,7 @@ export function Layout() {
           <Outlet />
         </ErrorBoundary>
       </main>
+      {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
     </div>
   );
 }
@@ -245,5 +267,167 @@ function GlobalSearch() {
         </div>
       )}
     </div>
+  );
+}
+
+// ---------- keyboard shortcuts ----------
+
+/** "g" then one of these goes to that page. */
+const GOTO: Record<string, string> = {
+  h: '/',
+  d: '/devices',
+  s: '/scripts',
+  r: '/runs',
+  t: '/tasks',
+  a: '/alerts',
+  p: '/patches',
+  m: '/automations',
+};
+
+const SHORTCUTS: { keys: string[]; what: string }[] = [
+  { keys: ['/'], what: 'Focus the device search' },
+  { keys: ['g', 'h'], what: 'Go to the dashboard' },
+  { keys: ['g', 'd'], what: 'Go to devices' },
+  { keys: ['g', 's'], what: 'Go to scripts' },
+  { keys: ['g', 'r'], what: 'Go to runs' },
+  { keys: ['g', 't'], what: 'Go to tasks' },
+  { keys: ['g', 'm'], what: 'Go to automations' },
+  { keys: ['g', 'a'], what: 'Go to alerts' },
+  { keys: ['g', 'p'], what: 'Go to patches' },
+  { keys: ['n'], what: 'New — the primary action on this page' },
+  { keys: ['r'], what: 'Refresh this page' },
+  { keys: ['?'], what: 'This list' },
+  { keys: ['Esc'], what: 'Close the dialog on top' },
+];
+
+/** True while a text field, a select, the terminal or the remote desktop has the keyboard. */
+function isEditing(t: EventTarget | null): boolean {
+  const el = t as HTMLElement | null;
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return true;
+  // The desktop viewer forwards every key to the remote session; it stops
+  // propagation while connected, and this covers the rest of the time.
+  return !!el?.isContentEditable || !!el?.closest?.('[role="application"]');
+}
+
+/**
+ * Document-level bindings. A dialog owns the keyboard while it is open (its
+ * own Escape handling would otherwise fight these), and anything typed into a
+ * field is left alone — including the terminal, whose xterm helper is a
+ * textarea.
+ */
+function useShortcuts(toggleHelp: () => void): void {
+  const navigate = useNavigate();
+  const help = useRef(toggleHelp);
+  help.current = toggleHelp;
+  useEffect(() => {
+    let prefixAt = 0;
+    const click = (sel: string) => (document.querySelector(sel) as HTMLElement | null)?.click();
+    const onKey = (e: KeyboardEvent) => {
+      if (isEditing(e.target) || e.ctrlKey || e.metaKey || e.altKey || e.defaultPrevented) return;
+      if (document.querySelector('.overlay, .drawer-host')) return;
+      const now = Date.now();
+      const chord = prefixAt && now - prefixAt < 1500;
+      prefixAt = 0;
+      if (chord) {
+        const to = GOTO[e.key.toLowerCase()];
+        if (to) {
+          e.preventDefault();
+          navigate(to);
+        }
+        return;
+      }
+      switch (e.key) {
+        case 'g':
+          prefixAt = now;
+          return;
+        case '?':
+          e.preventDefault();
+          help.current();
+          return;
+        case 'n':
+          // Every page puts its create action first in the header.
+          e.preventDefault();
+          click('.page-head .btn.primary');
+          return;
+        case 'r':
+          e.preventDefault();
+          click('button[aria-label="Refresh"]');
+          return;
+        default:
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [navigate]);
+}
+
+function ShortcutHelp({ onClose }: { onClose: () => void }) {
+  return (
+    <Modal title="Keyboard shortcuts" onClose={onClose} size="sm" center footer={<Button onClick={onClose}>Close</Button>}>
+      <div className="shortcuts">
+        {SHORTCUTS.map((s) => (
+          <Fragment key={s.keys.join('+')}>
+            <span className="keys">
+              {s.keys.map((k) => (
+                <kbd className="kbd" key={k}>
+                  {k}
+                </kbd>
+              ))}
+            </span>
+            <span>{s.what}</span>
+          </Fragment>
+        ))}
+      </div>
+      <p className="muted small" style={{ marginTop: 12 }}>
+        Shortcuts are off while you are typing in a field or a dialog is open.
+      </p>
+    </Modal>
+  );
+}
+
+// ---------- activity log ----------
+
+/**
+ * The last messages the console raised. Toasts are capped at three on screen
+ * and expire in seconds, so a burst (one line per device in a bulk action)
+ * would otherwise be unreadable a minute later; this keeps them.
+ */
+function ActivityMenu() {
+  const { items, unread, markRead, clear } = useActivity();
+  const onOpen = useCallback(() => markRead(), [markRead]);
+  return (
+    <Dropdown
+      menuClassName="notif-menu"
+      closeOnClick={false}
+      onOpen={onOpen}
+      trigger={
+        <button className="btn ghost icon notif-btn" aria-label={unread ? `Activity (${unread} new)` : 'Activity'} title="Activity">
+          <IconBell />
+          {unread > 0 && <span className="unread" />}
+        </button>
+      }
+    >
+      <div className="notif-head">
+        <span>Activity</span>
+        <span className="muted small">{items.length ? `last ${items.length}` : ''}</span>
+        <span style={{ marginLeft: 'auto' }}>
+          <Button size="xs" variant="ghost" onClick={clear} disabled={!items.length}>
+            Clear
+          </Button>
+        </span>
+      </div>
+      <div className="notif-list">
+        {items.map((a) => (
+          <div key={a.id} className={`notif-item kind-${a.kind}`}>
+            <div className="grow" style={{ minWidth: 0 }}>
+              <div className="title">{a.title}</div>
+              {a.detail && <div className="sub">{a.detail}</div>}
+            </div>
+            <span className="when">{relTime(Math.floor(a.at / 1000))}</span>
+          </div>
+        ))}
+        {!items.length && <div className="muted small" style={{ padding: '14px 12px' }}>Nothing yet. Messages the console raises are kept here.</div>}
+      </div>
+    </Dropdown>
   );
 }

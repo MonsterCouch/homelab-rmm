@@ -28,6 +28,10 @@ type fakeCapturer struct {
 	failNext int
 	n        int
 	captures int
+	// hook runs at the end of every capture, on the capture goroutine and
+	// with mu held, so it must not call back into the capturer. It exists
+	// to land an event (a cancellation) at a precise point of the loop.
+	hook func()
 }
 
 func (f *fakeCapturer) monitors() ([]monitor, error) {
@@ -60,6 +64,9 @@ func (f *fakeCapturer) capture(m monitor) (*image.RGBA, error) {
 		f.n++
 	}
 	img := solid(cur.Bounds.Dx(), cur.Bounds.Dy(), color.RGBA{uint8(f.n * 7), uint8(m.Index * 50), 40, 255})
+	if f.hook != nil {
+		f.hook()
+	}
 	return img, nil
 }
 
@@ -67,6 +74,12 @@ func (f *fakeCapturer) setMonitors(mons []monitor) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.mons = mons
+}
+
+func (f *fakeCapturer) setHook(h func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hook = h
 }
 
 func (f *fakeCapturer) setChanging(v bool) {
@@ -588,6 +601,26 @@ func TestSessionEndsOnContextCancel(t *testing.T) {
 	}
 }
 
+// Cancelling mid-frame is still just a stop. The capture loop learns about
+// cancellation from the error sendFrame returns once the frame is on the
+// wire, so a viewer that disappears while tiles are being written used to
+// make run report "context canceled" - and the helper process exit with an
+// error - for what is the ordinary end of every session. The hook lands the
+// cancellation inside the capture that precedes a send, which is the window
+// TestSessionEndsWhenViewerCloses only hits under load.
+func TestSessionCancelledMidFrameReportsNoError(t *testing.T) {
+	cap := &fakeCapturer{mons: twoMonitors()[:1], changing: true}
+	h := startHarness(t, cap, &fakeInjector{}, 60)
+	if _, ok := h.readFrame(3 * time.Second); !ok {
+		t.Fatal("no first frame")
+	}
+	var once sync.Once
+	cap.setHook(func() { once.Do(h.cancel) })
+	if err := h.wait(5 * time.Second); err != nil {
+		t.Fatalf("run returned %v when the session was cancelled mid-frame", err)
+	}
+}
+
 func TestSessionKeepalive(t *testing.T) {
 	oldPing, oldRead := pingInterval, readTimeout
 	pingInterval, readTimeout = 40*time.Millisecond, 300*time.Millisecond
@@ -639,5 +672,127 @@ func TestSessionKeepalive(t *testing.T) {
 	}
 	if took := time.Since(start); took < readTimeout/2 {
 		t.Fatalf("session ended after %v, before the read timeout could expire", took)
+	}
+}
+
+// fakeFollower stands in for the platform's input-desktop tracker: it works
+// for failAt calls and then reports the desktop as unreachable, which is
+// what a Windows lock screen or a UAC secure desktop does to a helper that
+// is not SYSTEM.
+type fakeFollower struct {
+	calls  int
+	failAt int
+	err    error
+}
+
+func (f *fakeFollower) follow() error {
+	f.calls++
+	if f.calls > f.failAt {
+		return f.err
+	}
+	return nil
+}
+
+func (f *fakeFollower) close() {}
+
+// A desktop the helper cannot follow must end the session with a message
+// the viewer can act on — never a silently frozen picture of the old
+// desktop.
+func TestSessionEndsWhenTheInputDesktopIsUnreachable(t *testing.T) {
+	locked := errors.New("session locked or secure desktop active; reconnect to attach as SYSTEM")
+	old := newFollower
+	newFollower = func() desktopFollower { return &fakeFollower{failAt: 1, err: locked} }
+	t.Cleanup(func() { newFollower = old })
+
+	cap := &fakeCapturer{mons: twoMonitors()[:1], changing: true}
+	h := startHarness(t, cap, &fakeInjector{}, 60)
+
+	deadline := time.After(5 * time.Second)
+	var got string
+	for got == "" {
+		select {
+		case <-deadline:
+			t.Fatal("no error message reached the viewer")
+		case msg, open := <-h.msgs:
+			if !open {
+				t.Fatal("socket closed without an error message")
+			}
+			if msg.mt != websocket.TextMessage {
+				continue
+			}
+			var v map[string]any
+			if err := json.Unmarshal(msg.data, &v); err != nil {
+				t.Fatalf("bad text frame %q", msg.data)
+			}
+			if v["t"] == "error" {
+				got, _ = v["message"].(string)
+			}
+		}
+	}
+	if !strings.Contains(got, "reconnect to attach as SYSTEM") {
+		t.Fatalf("error message = %q", got)
+	}
+	if err := h.wait(5 * time.Second); !errors.Is(err, locked) {
+		t.Fatalf("run returned %v", err)
+	}
+}
+
+// The viewer's messages split in two: control (ack, quality, monitor,
+// refresh) and input (pointer, keys, paste, SAS). Only the second half moves
+// the remote machine, and an observe-only session is exactly the first half
+// — a gate that lets control through and drops input streams a live screen
+// without touching it. This pins that split from the helper's side: the
+// control messages must reach the capture loop and never the injector, so a
+// filter that mirrors this list cannot be defeated by a control message and
+// cannot break a view-only session's picture.
+func TestSessionControlMessagesNeverReachTheInjector(t *testing.T) {
+	cap := &fakeCapturer{mons: twoMonitors()}
+	inj := &fakeInjector{}
+	h := startHarness(t, cap, inj, 60)
+
+	fr, ok := h.readFrame(3 * time.Second)
+	if !ok {
+		t.Fatal("no first frame")
+	}
+	h.ack(fr.id)
+
+	// Every control message the protocol defines, plus one the helper does
+	// not know: none of them is input.
+	h.send(map[string]any{"t": "quality", "q": 40})
+	h.send(map[string]any{"t": "monitor", "index": 1})
+	if fr, ok = h.readFrame(3 * time.Second); !ok {
+		t.Fatal("no frame after the monitor switch")
+	}
+	if sc := fr.screen(t); sc == nil || sc["monitor"] != 1.0 {
+		t.Fatalf("screen after switch = %v", sc)
+	}
+	h.ack(fr.id)
+	h.send(map[string]any{"t": "refresh"})
+	if fr, ok = h.readFrame(3 * time.Second); !ok {
+		t.Fatal("no frame after refresh")
+	}
+	h.ack(fr.id)
+	h.send(map[string]any{"t": "bogus", "x": 5, "y": 5})
+
+	// A round trip after the last control message: the input loop has had
+	// its turn by the time this frame arrives.
+	h.send(map[string]any{"t": "refresh"})
+	if fr, ok = h.readFrame(3 * time.Second); !ok {
+		t.Fatal("no frame after the final refresh")
+	}
+	h.ack(fr.id)
+
+	inj.mu.Lock()
+	events := append([]injected(nil), inj.events...)
+	inj.mu.Unlock()
+	if len(events) != 0 {
+		t.Fatalf("control messages injected %d event(s): %+v", len(events), events)
+	}
+
+	// ... and the session is still healthy: input after the control run is
+	// injected as usual, so the split is a split and not a dead injector.
+	h.send(map[string]any{"t": "mousemove", "x": 10, "y": 20})
+	if ev := inj.waitFor(t, "move", 2*time.Second); ev.x != 10 || ev.y != 20 {
+		t.Fatalf("move = %+v", ev)
 	}
 }

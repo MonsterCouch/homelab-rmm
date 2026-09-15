@@ -1,14 +1,12 @@
 package server
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
 )
@@ -186,10 +184,32 @@ type runTracker struct {
 	live map[string]*liveRun
 }
 
+// liveRun is the buffered output of a run in flight. The agent read loop
+// appends to it while GET /api/runs/{id} reads it, so every access takes mu:
+// strings.Builder.String() aliases the backing array, and an unsynchronised
+// append that reallocates handed the HTTP response a torn string.
 type liveRun struct {
+	mu             sync.Mutex
 	stdout, stderr strings.Builder
 	agentID        string
-	cancel         func()
+}
+
+func (lr *liveRun) write(stream, data string) {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	b := &lr.stdout
+	if stream == "stderr" {
+		b = &lr.stderr
+	}
+	if b.Len() < maxOutput {
+		b.WriteString(data)
+	}
+}
+
+func (lr *liveRun) snapshot() (stdout, stderr string) {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	return lr.stdout.String(), lr.stderr.String()
 }
 
 func newRunTracker(s *Server) *runTracker { return &runTracker{s: s, live: map[string]*liveRun{}} }
@@ -250,13 +270,22 @@ func (t *runTracker) Start(agentID string, req RunRequest) (string, error) {
 	if status == "queued" {
 		return id, nil
 	}
-	t.launch(id, agentID, protocol.ScriptRun{RunID: id, Language: lang, Body: body, Args: req.Args, Env: req.Env, Timeout: timeout})
+	env := t.deviceEnv(agentID, req.Trigger, req.RunBy)
+	for k, v := range req.Env {
+		env[k] = v
+	}
+	t.launch(id, agentID, protocol.ScriptRun{RunID: id, Language: lang, Body: body, Args: req.Args, Env: env, Timeout: timeout})
 	return id, nil
 }
 
 func (t *runTracker) launch(id, agentID string, sr protocol.ScriptRun) {
 	lr := &liveRun{agentID: agentID}
 	t.mu.Lock()
+	if _, already := t.live[id]; already {
+		t.mu.Unlock()
+		slog.Warn("refusing to launch a run that is already live", "id", id, "agent", agentID)
+		return
+	}
 	t.live[id] = lr
 	t.mu.Unlock()
 	t.s.hub.broadcast(hubEvent{Kind: "run", AgentID: agentID, Data: map[string]any{"run_id": id, "status": "running"}})
@@ -268,13 +297,7 @@ func (t *runTracker) launch(id, agentID string, sr protocol.ScriptRun) {
 			if json.Unmarshal(env.D, &c) != nil {
 				return
 			}
-			b := &lr.stdout
-			if c.Stream == "stderr" {
-				b = &lr.stderr
-			}
-			if b.Len() < maxOutput {
-				b.WriteString(c.Data)
-			}
+			lr.write(c.Stream, c.Data)
 			t.s.hub.broadcast(hubEvent{Kind: "run", AgentID: agentID, Data: map[string]any{"run_id": id, "stream": c.Stream, "data": c.Data}})
 		case protocol.TypeReply:
 			var res protocol.ScriptResult
@@ -298,19 +321,20 @@ func (t *runTracker) launch(id, agentID string, sr protocol.ScriptRun) {
 		t.finish(id, agentID, "failed", protocol.ScriptResult{Error: err.Error(), ExitCode: -1}, lr)
 		return
 	}
-	lr.cancel = cancel
+	_ = cancel // the sink detaches itself on the final reply
 }
 
 func (t *runTracker) finish(id, agentID, status string, res protocol.ScriptResult, lr *liveRun) {
 	t.mu.Lock()
 	delete(t.live, id)
 	t.mu.Unlock()
+	liveOut, liveErr := lr.snapshot()
 	stdout, stderr := res.Stdout, res.Stderr
 	if stdout == "" {
-		stdout = lr.stdout.String()
+		stdout = liveOut
 	}
 	if stderr == "" {
-		stderr = lr.stderr.String()
+		stderr = liveErr
 	}
 	if res.Error != "" {
 		stderr = strings.TrimSpace(stderr + "\n[agent] " + res.Error)
@@ -333,12 +357,13 @@ func (t *runTracker) finish(id, agentID, status string, res protocol.ScriptResul
 // Live returns the buffered output of a running job (nil when not live).
 func (t *runTracker) Live(id string) (stdout, stderr string, ok bool) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	lr := t.live[id]
+	t.mu.Unlock()
 	if lr == nil {
 		return "", "", false
 	}
-	return lr.stdout.String(), lr.stderr.String(), true
+	so, se := lr.snapshot()
+	return so, se, true
 }
 
 func (t *runTracker) Cancel(id string) error {
@@ -390,25 +415,70 @@ func (t *runTracker) releaseQueued(agentID string) {
 		}
 		var args []string
 		json.Unmarshal([]byte(x.args), &args)
-		t.s.db.Exec(`UPDATE script_runs SET status='running', started_at=? WHERE id=?`, now(), x.id)
-		t.launch(x.id, agentID, protocol.ScriptRun{RunID: x.id, Language: sc.Language, Body: sc.Body, Args: args, Timeout: sc.TimeoutSec})
+		// Claim the row: two connects for the same device can overlap (the
+		// socket-replacement path, or a flapping link) and both goroutines
+		// could otherwise read the same queued row and run the script twice.
+		res, err := t.s.db.Exec(`UPDATE script_runs SET status='running', started_at=? WHERE id=? AND status='queued'`, now(), x.id)
+		if err != nil {
+			continue
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			continue
+		}
+		t.launch(x.id, agentID, protocol.ScriptRun{RunID: x.id, Language: sc.Language, Body: sc.Body, Args: args, Env: t.deviceEnv(agentID, "task", "queue"), Timeout: sc.TimeoutSec})
 	}
 }
 
-// WaitDone blocks until the run leaves the live set or ctx ends (used by
-// automations that chain on a result).
-func (t *runTracker) WaitDone(ctx context.Context, id string) {
-	for {
-		t.mu.Lock()
-		_, live := t.live[id]
-		t.mu.Unlock()
-		if !live {
-			return
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(500 * time.Millisecond):
+// deviceEnv is the device context every script gets in its environment:
+// which machine it is on, how it was started and the device's custom fields.
+// Explicit env from the caller is merged over the top, so an API caller can
+// still override any of it.
+func (t *runTracker) deviceEnv(agentID, trigger, runBy string) map[string]string {
+	env := map[string]string{
+		"RMM_DEVICE_ID":  agentID,
+		"RMM_SERVER_URL": t.s.PublicURL(),
+		"RMM_TRIGGER":    trigger,
+		"RMM_RUN_BY":     runBy,
+	}
+	a, err := t.s.db.GetAgent(agentID)
+	if err != nil {
+		return env
+	}
+	env["RMM_DEVICE_NAME"] = a.DisplayName
+	env["RMM_HOSTNAME"] = a.Hostname
+	env["RMM_OS"] = a.OS
+	env["RMM_PLATFORM"] = a.Platform
+	env["RMM_GROUP"] = a.GroupName
+	env["RMM_TAGS"] = strings.Join(a.Tags, ",")
+	for k, v := range a.CustomFields {
+		if name := customFieldEnv(k); name != "" {
+			env[name] = v
 		}
 	}
+	return env
+}
+
+// customFieldEnv turns a custom field key into RMM_CF_<KEY>: upper-cased with
+// every non-alphanumeric character replaced by an underscore. A key that has
+// no usable characters at all is skipped rather than collapsing into
+// RMM_CF___ alongside another one.
+func customFieldEnv(key string) string {
+	var b strings.Builder
+	any := false
+	for _, r := range key {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r - 32)
+			any = true
+		case (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			any = true
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if !any {
+		return ""
+	}
+	return "RMM_CF_" + b.String()
 }

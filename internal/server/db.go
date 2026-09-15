@@ -6,10 +6,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// OpenDatabase opens an EXISTING database for a command-line tool: it
+// migrates, and does nothing else. server.New is not usable here - it creates
+// the data directory, seeds the starter scripts and rules, mints a setup code
+// and marks every device offline, so pointing a CLI command at a typo created
+// a plausible-looking empty fleet, and pointing it at a RUNNING server wrote
+// "every device is offline" into the live database.
+func OpenDatabase(cfg Config) (*DB, error) {
+	path := cfg.path("rmm.db")
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("no database at %s (wrong --data?)", path)
+	}
+	return openDB(path)
+}
 
 // DB wraps the SQLite handle. modernc.org/sqlite is pure Go, so the server
 // cross-compiles for Windows without a C toolchain. One writer at a time is
@@ -265,6 +281,39 @@ CREATE TABLE agent_events (
 );
 CREATE INDEX idx_agent_events ON agent_events(agent_id, ts DESC);
 `,
+	// 2: repair enrolment tokens an older server drove below -1.
+	//
+	// Before the enrolment race was closed, concurrent agents each decremented
+	// uses_left without a guard, so a one-use token could end up at -10. Any
+	// negative value read as "unlimited", which turned a spent single-use
+	// token into a permanent one. -1 is the operator's own "unlimited"; every
+	// other negative is damage, and a damaged token is spent.
+	`
+UPDATE enroll_tokens SET uses_left = 0 WHERE uses_left < -1;
+`,
+	// 3: indexes for the three queries that were full table scans.
+	//
+	// metrics is PRIMARY KEY (agent_id, ts) WITHOUT ROWID, so the retention
+	// delete "WHERE ts < ?" could use no index at all: at the documented
+	// steady state (30 days of 30 s samples) that is ~86k rows per device,
+	// scanned every hour on the single connection. agent_events is the same
+	// shape. agents.key_hash is looked up on EVERY agent connect, so a
+	// reconnect storm after a network blip was a full scan per attempt.
+	`
+CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts);
+CREATE INDEX IF NOT EXISTS idx_agent_events_ts ON agent_events(ts);
+CREATE INDEX IF NOT EXISTS idx_agents_key_hash ON agents(key_hash);
+CREATE INDEX IF NOT EXISTS idx_patches_agent_status ON patches(agent_id, status);
+`,
+}
+
+// Close checkpoints the write-ahead log before closing, so a short-lived
+// command does not leave the whole database sitting in rmm.db-wal beside a
+// 4 KB rmm.db - which the backup and restore instructions treat as a file
+// that only exists while the server is running.
+func (d *DB) Close() error {
+	d.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	return d.DB.Close()
 }
 
 func (d *DB) migrate() error {
@@ -343,6 +392,40 @@ func (d *DB) Audit(user, ip, action, target string, details any) {
 }
 
 func now() int64 { return time.Now().Unix() }
+
+// placeholders renders "?, ?, ?" for an IN clause. n == 0 renders NULL, which
+// matches nothing, so a caller that passes an empty set gets an empty result
+// rather than a syntax error.
+func placeholders(n int) string {
+	if n <= 0 {
+		return "NULL"
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+// purgeByTS deletes rows older than cutoff in bounded time slices. A single
+// unqualified DELETE over months of metrics holds the one and only SQLite
+// connection for as long as it takes, blocking every HTTP request, every
+// agent write and every alert evaluation behind it.
+func (d *DB) purgeByTS(table, tsCol string, cutoff int64) {
+	const window = int64(6 * 3600)
+	for i := 0; i < 2000; i++ { // bounded so a clock jump cannot spin here
+		var oldest sql.NullInt64
+		if err := d.QueryRow(`SELECT MIN(` + tsCol + `) FROM ` + table).Scan(&oldest); err != nil {
+			return
+		}
+		if !oldest.Valid || oldest.Int64 >= cutoff {
+			return
+		}
+		step := oldest.Int64 + window
+		if step > cutoff {
+			step = cutoff
+		}
+		if _, err := d.Exec(`DELETE FROM `+table+` WHERE `+tsCol+` < ?`, step); err != nil {
+			return
+		}
+	}
+}
 
 // jsonText marshals for storage in a TEXT column, never failing.
 func jsonText(v any) string {

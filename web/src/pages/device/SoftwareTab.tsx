@@ -25,7 +25,16 @@ export function SoftwareTab({ agent }: TabProps) {
           {rows.length} of {all.length} packages · inventory {relTime(agent.inventory?.collected_at)}
         </span>
       </div>
-      <DataTable columns={columns} rows={rows} rowKey={(s, ) => `${s.name}|${s.version}|${s.publisher ?? ''}`} defaultSort={{ key: 'name', dir: 'asc' }} compact emptyTitle="No software inventory" emptyBody="Refresh the inventory while the device is online." />
+      <DataTable
+        columns={columns}
+        rows={rows}
+        rowKey={(s) => `${s.name}|${s.version}|${s.publisher ?? ''}`}
+        defaultSort={{ key: 'name', dir: 'asc' }}
+        compact
+        csvName="software"
+        emptyTitle="No software inventory"
+        emptyBody="Refresh the inventory while the device is online."
+      />
     </>
   );
 }

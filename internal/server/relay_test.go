@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -120,4 +121,93 @@ func TestDesktopBridge(t *testing.T) {
 		defer s.desktops.mu.Unlock()
 		return len(s.desktops.pending) == 0
 	})
+}
+
+// TestBridgeForwardsCloseCode pins rd-03: when one side of the desktop bridge
+// goes away the server used to just drop the other socket, so the browser saw
+// 1006 (abnormal closure) and could not tell a finished session from a network
+// fault. The bridge now forwards a Close frame, carrying the peer's code.
+func TestBridgeForwardsCloseCode(t *testing.T) {
+	s, ts, b := newTestServer(t)
+	var tok struct{ Token string }
+	b.mustJSON("POST", "/api/enroll", map[string]any{"name": "lab"}, &tok)
+
+	helperConnected := make(chan *websocket.Conn, 1)
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL(ts)+"/ws/agent", http.Header{"X-Enroll-Token": []string{tok.Token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+	ws.WriteJSON(protocol.Envelope{T: protocol.TypeHello, D: protocol.Must(protocol.Hello{Hostname: "closebox", OS: "windows"})})
+	var welcome protocol.Envelope
+	if err := ws.ReadJSON(&welcome); err != nil {
+		t.Fatal(err)
+	}
+	var w struct {
+		AgentID string `json:"agent_id"`
+	}
+	json.Unmarshal(welcome.D, &w)
+	go func() {
+		for {
+			var env protocol.Envelope
+			if err := ws.ReadJSON(&env); err != nil {
+				return
+			}
+			switch env.T {
+			case protocol.ReqPing:
+				ws.WriteJSON(protocol.Envelope{T: protocol.TypePong, ID: env.ID})
+			case protocol.ReqDesktopStart:
+				var ds protocol.DesktopStart
+				json.Unmarshal(env.D, &ds)
+				h, _, err := websocket.DefaultDialer.Dial(wsURL(ts)+"/ws/desktop-agent?token="+ds.Token, nil)
+				if err != nil {
+					t.Errorf("helper dial: %v", err)
+					return
+				}
+				helperConnected <- h
+				ws.WriteJSON(protocol.Envelope{T: protocol.TypeReply, ID: env.ID, D: protocol.Must(protocol.DesktopStartResult{Started: true})})
+			}
+		}
+	}()
+	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(w.AgentID) })
+
+	hdr := http.Header{}
+	u, _ := http.NewRequest("GET", ts.URL, nil)
+	for _, c := range b.c.Jar.Cookies(u.URL) {
+		hdr.Add("Cookie", c.Name+"="+c.Value)
+	}
+	hdr.Set("Origin", ts.URL)
+	viewer, _, err := websocket.DefaultDialer.Dial(wsURL(ts)+"/ws/desktop/"+w.AgentID, hdr)
+	if err != nil {
+		t.Fatalf("viewer dial: %v", err)
+	}
+	defer viewer.Close()
+
+	var helper *websocket.Conn
+	select {
+	case helper = <-helperConnected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper never connected")
+	}
+	// drain the viewer's "connected" marker so the next read is the close
+	viewer.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, _, err := viewer.ReadMessage(); err != nil {
+		t.Fatalf("viewer first read: %v", err)
+	}
+
+	// The helper shuts down cleanly, the way the real one does at the end of a
+	// session, and the viewer must be told the same thing.
+	helper.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "bye"),
+		time.Now().Add(2*time.Second))
+	helper.Close()
+
+	viewer.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, err = viewer.ReadMessage()
+	var ce *websocket.CloseError
+	if !errors.As(err, &ce) {
+		t.Fatalf("viewer should see a websocket close, got %T %v", err, err)
+	}
+	if ce.Code != websocket.CloseNormalClosure {
+		t.Fatalf("viewer close code = %d, want %d (1006 means the close frame was never forwarded)", ce.Code, websocket.CloseNormalClosure)
+	}
 }

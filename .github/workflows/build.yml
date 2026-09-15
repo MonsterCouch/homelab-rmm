@@ -52,6 +52,21 @@ jobs:
         # web/dist was just built, so `make server` embeds the fresh UI
         run: make server agents package
 
+      - name: Console is really embedded
+        # web/dist is gitignored apart from .gitkeep, so a server built without
+        # the UI step embeds one empty file and compiles without a warning - the
+        # archive would then ship a console that is a directory listing. The
+        # Makefile refuses to build such a binary; this checks the artefact
+        # itself, which is the thing that reaches an operator.
+        run: |
+          for f in dist/rmm-server-*; do
+            grep -qa '<div id="root">' "$f" || {
+              echo "::error::$f has no embedded web console (build the UI before packaging)"
+              exit 1
+            }
+          done
+          echo "all server binaries carry the console"
+
       - name: Show what was built
         run: |
           ls -l dist

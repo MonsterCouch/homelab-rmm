@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
@@ -45,6 +46,19 @@ func loadOrCreateCert(cfg Config, hosts []string) (tls.Certificate, string, erro
 func Fingerprint(der []byte) string {
 	sum := sha256.Sum256(der)
 	return hex.EncodeToString(sum[:])
+}
+
+// PublicKeyPin is base64(sha256(SubjectPublicKeyInfo)) - the shape curl's
+// --pinnedpubkey wants, so the install script can pin the download connection
+// to the same key the agent pins for every connection afterwards. It survives
+// a certificate renewal that keeps the key, unlike the fingerprint.
+func PublicKeyPin(der []byte) string {
+	c, err := x509.ParseCertificate(der)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(c.RawSubjectPublicKeyInfo)
+	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
 func generateSelfSigned(certFile, keyFile string, hosts []string) error {

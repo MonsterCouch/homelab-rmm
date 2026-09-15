@@ -2,10 +2,29 @@
 #
 #   docker compose up -d --build
 #   open https://<host>:8443 and accept the self-signed certificate
+#   docker compose logs rmm | grep -i "setup code"     <- the first-run setup code
 #
-# Set RMM_PUBLIC_URL to the address agents will use to reach this container:
-# it is embedded in every install command and is the name agents pin the
-# certificate under. Change it later in Settings if needed.
+# FIRST RUN. The setup form always asks for the one-time code the server prints
+# at startup, and in a container the only way to read it is the log above (the
+# image is distroless: there is no shell to `docker exec` into). It is also in
+# /data/server.log inside the volume, as the setup_code= attribute of the
+# "FIRST RUN" warning. Restart the container before anyone creates a user to
+# mint a new one.
+#
+# RMM_PUBLIC_URL is the address agents will use to reach this container: it is
+# embedded in every install command and is the name agents pin the certificate
+# under. It SEEDS the Settings -> Public URL field on the first start only;
+# after that the saved setting wins and this variable is ignored (the server
+# logs a warning when the two disagree, and clearing the Settings field hands
+# control back to this value).
+#
+# CLIENT ADDRESSES. With a published port the container never sees 127.0.0.1:
+# requests from the Docker host itself arrive from the bridge gateway
+# (172.17.0.1, or this network's gateway), which is what the audit log records
+# and what the 10/min login limiter buckets them under; requests from other
+# machines normally keep their own address. RMM_TRUSTED_PROXIES below is only
+# for a real reverse proxy in front of this container - see docs/OPERATIONS.md
+# section 5 before turning it on.
 
 services:
   rmm:
@@ -22,6 +41,13 @@ services:
       RMM_PUBLIC_URL: https://rmm.example.lan:8443
       # RMM_INSECURE: "1"          # plain HTTP, only behind a TLS-terminating proxy (docs/OPERATIONS.md)
       # RMM_DEBUG: "1"             # verbose logging
+      # Believe X-Forwarded-For from these addresses/CIDRs, and from nowhere else.
+      # Set it to the address of the proxy container on this network (docker
+      # inspect, or the service's address on a user-defined network) ONLY when a
+      # reverse proxy is the sole route to this port. Trusting the bridge gateway
+      # wholesale would let anything on the host forge the client address in the
+      # audit log and dodge the login limiter.
+      # RMM_TRUSTED_PROXIES: "172.18.0.2"
     volumes:
       # database, certificate, server.log and optional agents/ overrides live here
       - rmm-data:/data

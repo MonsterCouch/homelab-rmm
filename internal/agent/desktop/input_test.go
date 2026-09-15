@@ -14,19 +14,60 @@ func TestWheelAccumulator(t *testing.T) {
 	if nx, ny := a.add(0, -100); nx != 0 || ny != -1 {
 		t.Fatalf("-100px: %d,%d", nx, ny)
 	}
-	// Firefox-style 57 px deltas: the first yields nothing, the second one notch.
-	if _, ny := a.add(0, 57); ny != 0 {
+	// Chrome on Windows sends 120 per notch: five notches must scroll five
+	// times, not six (the old remainder carry fired a bonus notch).
+	a.reset()
+	for i := 0; i < 5; i++ {
+		if _, ny := a.add(0, 120); ny != 1 {
+			t.Fatalf("120px notch %d fired %d", i, ny)
+		}
+	}
+	// Firefox line mode scaled to ~57 px: one event is still one notch, and
+	// none is swallowed.
+	a.reset()
+	if _, ny := a.add(0, 57); ny != 1 {
 		t.Fatalf("57px fired %d", ny)
 	}
-	if _, ny := a.add(0, 57); ny != 1 {
-		t.Fatalf("114px fired %d", ny)
+	if _, ny := a.add(0, -57); ny != -1 {
+		t.Fatalf("-57px fired %d", ny)
 	}
+	// Trackpad deltas below the window still accumulate.
+	a.reset()
+	if _, ny := a.add(0, 20); ny != 0 {
+		t.Fatalf("20px fired %d", ny)
+	}
+	for i := 0; i < 3; i++ {
+		a.add(0, 20)
+	}
+	if _, ny := a.add(0, 20); ny != 1 {
+		t.Fatalf("5x20px fired %d", ny)
+	}
+	// A real notch discards a pending trackpad remainder instead of
+	// riding on it.
+	a.reset()
+	a.add(0, 30)
+	if _, ny := a.add(0, 100); ny != 1 {
+		t.Fatalf("notch after remainder fired %d", ny)
+	}
+	if _, ny := a.add(0, 80); ny != 1 {
+		t.Fatalf("remainder was carried: %d", ny)
+	}
+	// Above the window (page-mode deltas) the old arithmetic applies.
 	a.reset()
 	if nx, _ := a.add(250, 0); nx != 2 {
 		t.Fatalf("250px horizontal: %d", nx)
 	}
 	if nx, _ := a.add(50, 0); nx != 1 {
 		t.Fatalf("carry: %d", nx)
+	}
+	// The axes carry independently.
+	a.reset()
+	a.add(30, 0)
+	if nx, ny := a.add(0, 100); nx != 0 || ny != 1 {
+		t.Fatalf("cross-axis: %d,%d", nx, ny)
+	}
+	if nx, _ := a.add(80, 0); nx != 1 {
+		t.Fatalf("x remainder lost: %d", nx)
 	}
 	// Hostile values neither panic nor scroll forever.
 	a.reset()

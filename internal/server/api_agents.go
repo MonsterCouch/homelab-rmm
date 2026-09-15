@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,14 +21,10 @@ const (
 )
 
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
-	agents, err := s.db.ListAgents()
+	agents, err := s.agentsWithLiveness()
 	if err != nil {
 		fail(w, err)
 		return
-	}
-	// online flag from the hub is authoritative over the column
-	for _, a := range agents {
-		a.Online = s.hub.IsOnline(a.ID)
 	}
 	writeJSON(w, 200, agents)
 }
@@ -335,19 +332,46 @@ func (s *Server) handleFsRename(w http.ResponseWriter, r *http.Request) {
 
 // ---- power / WoL ----
 
+// validPowerActions mirrors the agent's own switch. Validating here keeps 400
+// for "you sent a bad action" and leaves 502 to mean "the device refused",
+// which the console could not tell apart when both came back as 400.
+var validPowerActions = map[string]bool{
+	"reboot": true, "shutdown": true, "poweroff": true, "halt": true,
+	"lock": true, "logoff": true, "logout": true,
+}
+
 func (s *Server) handlePower(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
 	var in protocol.Power
 	if err := readJSON(r, &in); err != nil {
 		fail(w, err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
-	defer cancel()
-	if err := s.hub.Request(ctx, r.PathValue("id"), protocol.ReqPower, in, nil); err != nil {
-		fail(w, err)
+	in.Action = strings.ToLower(strings.TrimSpace(in.Action))
+	if !validPowerActions[in.Action] {
+		writeErr(w, http.StatusBadRequest, "unknown power action "+strconv.Quote(in.Action)+" (reboot, shutdown, lock or logoff)")
 		return
 	}
-	s.audit(r, "power."+in.Action, r.PathValue("id"), in)
+	if in.Delay < 0 {
+		in.Delay = 0
+	}
+	// Audited BEFORE dispatch: a destructive request must be on record
+	// whatever happens next, and a delay_sec=0 reboot can take the device down
+	// before it answers, which used to be recorded as nothing at all.
+	s.audit(r, "power.requested", id, in)
+	ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
+	defer cancel()
+	if err := s.hub.Request(ctx, id, protocol.ReqPower, in, nil); err != nil {
+		s.audit(r, "power.failed", id, map[string]any{"action": in.Action, "error": err.Error()})
+		if errors.Is(err, ErrAgentOffline) {
+			fail(w, err)
+			return
+		}
+		// the request was well formed; the device could not carry it out
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	s.audit(r, "power."+in.Action, id, in)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -381,9 +405,12 @@ func (s *Server) handleWakeOnLan(w http.ResponseWriter, r *http.Request) {
 	}
 	via := r.URL.Query().Get("via")
 	if via == "" {
-		agents, _ := s.db.ListAgents()
+		agents, _ := s.agentsWithLiveness()
 		for _, a := range agents {
-			if a.ID == target.ID || !s.hub.IsOnline(a.ID) || a.Inventory == nil {
+			// No Inventory check here: ListAgents scans without the inventory
+			// column, so a.Inventory is nil for EVERY row and this loop used
+			// to skip every candidate. GetAgent below is what loads it.
+			if a.ID == target.ID || !s.hub.IsOnline(a.ID) {
 				continue
 			}
 			full, err := s.db.GetAgent(a.ID)
@@ -490,8 +517,14 @@ func (s *Server) handleCreateEnroll(w http.ResponseWriter, r *http.Request) {
 		TTLHours int    `json:"ttl_hours"`
 	}
 	readJSON(r, &in)
-	if in.Uses == 0 {
+	// uses_left is {-1} + [1..]: -1 is unlimited and anything else non-positive
+	// is exhausted. Storing a caller's -7 verbatim used to mint a token that
+	// never ran out by count, which is a far bigger grant than the form offers.
+	switch {
+	case in.Uses == 0:
 		in.Uses = 1
+	case in.Uses < 0:
+		in.Uses = -1
 	}
 	if in.TTLHours <= 0 {
 		in.TTLHours = 24

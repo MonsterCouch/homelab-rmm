@@ -3,10 +3,12 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
@@ -95,16 +97,58 @@ func (d *DB) ListPatchPolicies() ([]PatchPolicy, error) {
 	return out, rows.Err()
 }
 
+// errPatchBusy is returned when a device already has a patch job running.
+// Patch work is serialised per device: two overlapping installs used to mark
+// each other's in-flight patches failed, and a scan that overlapped an install
+// could flip 'installing' rows to 'installed' before the result arrived.
+var errPatchBusy = errors.New("a patch scan or installation is already running on this device")
+
+// claimPatchJob reserves a device for one patch job. The returned release must
+// be called when the job ends; ok is false when another job holds it.
+func (s *Server) claimPatchJob(agentID string) (release func(), ok bool) {
+	s.patchMu.Lock()
+	defer s.patchMu.Unlock()
+	if s.patchJobs[agentID] {
+		return nil, false
+	}
+	s.patchJobs[agentID] = true
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.patchMu.Lock()
+			delete(s.patchJobs, agentID)
+			s.patchMu.Unlock()
+		})
+	}, true
+}
+
 // patchScan asks the agent for its update list and reconciles the table:
 // new ids are inserted as available, known ones refreshed, and ids no longer
 // reported (installed out of band) are marked installed.
 func (s *Server) patchScan(agentID string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	release, ok := s.claimPatchJob(agentID)
+	if !ok {
+		return errPatchBusy
+	}
+	defer release()
+	return s.patchScanLocked(agentID)
+}
+
+func (s *Server) patchScanLocked(agentID string) error {
+	ctx, cancel := context.WithTimeout(s.jobContext(), 15*time.Minute)
 	defer cancel()
 	var res protocol.UpdatesScanResult
 	if err := s.hub.Request(ctx, agentID, protocol.ReqUpdatesScan, nil, &res); err != nil {
 		slog.Warn("patch scan failed", "agent", agentID, "err", err)
 		return err
+	}
+	// The agent reports a partial result rather than nothing when its package
+	// index could not be refreshed. Dropping res.Error made a failed refresh
+	// look like a clean scan: a fresh "scanned just now" timestamp beside a
+	// stale package list, with nothing anywhere saying why.
+	s.db.SetSetting("last_patch_scan_error:"+agentID, res.Error)
+	if res.Error != "" {
+		slog.Warn("patch scan reported a problem", "agent", agentID, "err", res.Error)
 	}
 	seen := map[string]bool{}
 	ts := now()
@@ -122,20 +166,26 @@ func (s *Server) patchScan(agentID string) error {
 				installed_at = CASE WHEN excluded.status='installed' AND patches.installed_at=0 THEN excluded.last_seen ELSE patches.installed_at END`,
 			agentID, u.ID, u.Title, u.KB, u.Severity, jsonText(u.Categories), u.SizeBytes, u.Source, u.Version, status, u.RebootReq, ts, ts, map[bool]int64{true: ts, false: 0}[u.Installed])
 	}
-	// anything previously pending that the agent no longer lists was installed elsewhere
-	rows, err := s.db.Query(`SELECT patch_id FROM patches WHERE agent_id = ? AND status IN ('available','approved','installing')`, agentID)
-	if err == nil {
-		var gone []string
-		for rows.Next() {
-			var id string
-			rows.Scan(&id)
-			if !seen[id] {
-				gone = append(gone, id)
+	// Anything previously pending that the agent no longer lists was installed
+	// elsewhere - but only believe that when the scan itself was clean:
+	// a scan whose index refresh failed lists from a stale cache, and
+	// 'installing' rows belong to an install that has not reported yet.
+	if res.Error == "" {
+		rows, err := s.db.Query(`SELECT patch_id FROM patches WHERE agent_id = ? AND status IN ('available','approved')`, agentID)
+		if err == nil {
+			var gone []string
+			for rows.Next() {
+				var id string
+				rows.Scan(&id)
+				if !seen[id] {
+					gone = append(gone, id)
+				}
 			}
-		}
-		rows.Close()
-		for _, id := range gone {
-			s.db.Exec(`UPDATE patches SET status='installed', installed_at=? WHERE agent_id=? AND patch_id=?`, ts, agentID, id)
+			rows.Close()
+			for _, id := range gone {
+				s.db.Exec(`UPDATE patches SET status='installed', installed_at=? WHERE agent_id=? AND patch_id=?`, ts, agentID, id)
+				s.alerts.patchResolved(agentID, id)
+			}
 		}
 	}
 	s.db.Exec(`UPDATE agents SET pending_reboot = ? WHERE id = ?`, res.RebootPending, agentID)
@@ -146,6 +196,15 @@ func (s *Server) patchScan(agentID string) error {
 
 // patchInstall installs the given ids (nil = every approved patch) and records the outcome.
 func (s *Server) patchInstall(agentID string, ids []string, reboot bool, by string) (*protocol.UpdatesInstallResult, error) {
+	release, ok := s.claimPatchJob(agentID)
+	if !ok {
+		return nil, errPatchBusy
+	}
+	defer release()
+	return s.patchInstallLocked(agentID, ids, reboot, by)
+}
+
+func (s *Server) patchInstallLocked(agentID string, ids []string, reboot bool, by string) (*protocol.UpdatesInstallResult, error) {
 	if ids == nil {
 		rows, err := s.db.Query(`SELECT patch_id FROM patches WHERE agent_id = ? AND status = 'approved'`, agentID)
 		if err != nil {
@@ -165,7 +224,7 @@ func (s *Server) patchInstall(agentID string, ids []string, reboot bool, by stri
 		s.db.Exec(`UPDATE patches SET status='installing', error='' WHERE agent_id=? AND patch_id=?`, agentID, id)
 	}
 	s.hub.broadcast(hubEvent{Kind: "patches", AgentID: agentID})
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Hour)
+	ctx, cancel := context.WithTimeout(s.jobContext(), 3*time.Hour)
 	defer cancel()
 	var res protocol.UpdatesInstallResult
 	err := s.hub.Request(ctx, agentID, protocol.ReqUpdatesInstall, protocol.UpdatesInstall{IDs: ids, Reboot: reboot}, &res)
@@ -182,6 +241,7 @@ func (s *Server) patchInstall(agentID string, ids []string, reboot bool, by stri
 		s.db.Exec(`UPDATE patches SET status='installed', installed_at=?, error='' WHERE agent_id=? AND patch_id=?`, ts, agentID, id)
 		var title string
 		s.db.QueryRow(`SELECT title FROM patches WHERE agent_id=? AND patch_id=?`, agentID, id).Scan(&title)
+		s.alerts.patchResolved(agentID, id)
 		s.sched.automation("patch_installed", agentID, map[string]any{"patch_id": id, "title": title})
 	}
 	for id, msg := range res.Failed {
@@ -190,8 +250,15 @@ func (s *Server) patchInstall(agentID string, ids []string, reboot bool, by stri
 		s.db.QueryRow(`SELECT title FROM patches WHERE agent_id=? AND patch_id=?`, agentID, id).Scan(&title)
 		s.alerts.patchFailed(agentID, title, msg)
 	}
-	// anything still 'installing' got no verdict
-	s.db.Exec(`UPDATE patches SET status='failed', error='no result reported' WHERE agent_id=? AND status='installing'`, agentID)
+	// Anything still 'installing' got no verdict - scoped to the ids THIS call
+	// sent, never to the whole device: an unqualified sweep marked a parallel
+	// install's in-flight patches failed and mailed an alert about them.
+	sweep := make([]any, 0, len(ids)+1)
+	sweep = append(sweep, agentID)
+	for _, id := range ids {
+		sweep = append(sweep, id)
+	}
+	s.db.Exec(`UPDATE patches SET status='failed', error='no result reported' WHERE agent_id=? AND status='installing' AND patch_id IN (`+placeholders(len(ids))+`)`, sweep...)
 	s.db.Exec(`UPDATE agents SET pending_reboot = ? WHERE id = ?`, res.RebootReq, agentID)
 	s.db.Audit(by, "", "patch.install", agentID, map[string]any{"installed": res.Installed, "failed": res.Failed})
 	s.hub.broadcast(hubEvent{Kind: "patches", AgentID: agentID})
@@ -200,7 +267,13 @@ func (s *Server) patchInstall(agentID string, ids []string, reboot bool, by stri
 
 // patchInstallPolicy applies a policy's mode: approve the matching set, then install it.
 func (s *Server) patchInstallPolicy(agentID string, p *PatchPolicy) {
-	if err := s.patchScan(agentID); err != nil {
+	release, ok := s.claimPatchJob(agentID)
+	if !ok {
+		slog.Info("patch policy skipped: a patch job is already running", "agent", agentID, "policy", p.Name)
+		return
+	}
+	defer release()
+	if err := s.patchScanLocked(agentID); err != nil {
 		return
 	}
 	switch p.Mode {
@@ -209,7 +282,7 @@ func (s *Server) patchInstallPolicy(agentID string, p *PatchPolicy) {
 	case "security":
 		s.db.Exec(`UPDATE patches SET status='approved' WHERE agent_id=? AND status='available' AND (severity IN ('Critical','Important') OR categories LIKE '%Security%' OR source IN ('apt','dnf','pacman'))`, agentID)
 	}
-	res, err := s.patchInstall(agentID, nil, p.Reboot == "if_required", "policy:"+p.Name)
+	res, err := s.patchInstallLocked(agentID, nil, p.Reboot == "if_required", "policy:"+p.Name)
 	if err != nil {
 		return
 	}
@@ -238,7 +311,13 @@ func (s *Server) handleAgentPatches(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	last, _ := strconv.ParseInt(s.db.Setting("last_patch_scan:"+r.PathValue("id"), "0"), 10, 64)
-	writeJSON(w, 200, map[string]any{"patches": p, "last_scan": last})
+	writeJSON(w, 200, map[string]any{
+		"patches": p, "last_scan": last,
+		// What the agent said went wrong during the scan ("" when it was
+		// clean): an unreachable repository leaves a fresh timestamp beside a
+		// stale list, and this is the only place that says so.
+		"scan_error": s.db.Setting("last_patch_scan_error:"+r.PathValue("id"), ""),
+	})
 }
 
 func (s *Server) handlePatchScan(w http.ResponseWriter, r *http.Request) {
@@ -249,6 +328,10 @@ func (s *Server) handlePatchScan(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, "patch.scan", id, nil)
 	if err := s.patchScan(id); err != nil {
+		if errors.Is(err, errPatchBusy) {
+			writeErr(w, http.StatusConflict, err.Error())
+			return
+		}
 		fail(w, err)
 		return
 	}
@@ -274,9 +357,18 @@ func (s *Server) handlePatchInstall(w http.ResponseWriter, r *http.Request) {
 		fail(w, ErrAgentOffline)
 		return
 	}
-	// long-running: run in the background and let the UI follow via events
-	go s.patchInstall(id, in.IDs, in.Reboot, actor(r))
+	release, ok := s.claimPatchJob(id)
+	if !ok {
+		writeErr(w, http.StatusConflict, errPatchBusy.Error())
+		return
+	}
 	s.audit(r, "patch.install.request", id, in)
+	// long-running: run in the background and let the UI follow via events
+	by, ids, reboot := actor(r), in.IDs, in.Reboot
+	s.goJob(func() {
+		defer release()
+		s.patchInstallLocked(id, ids, reboot, by)
+	})
 	writeJSON(w, 202, map[string]any{"ok": true})
 }
 

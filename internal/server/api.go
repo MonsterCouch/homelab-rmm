@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -23,11 +24,12 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/agent-download/{file}", s.handleAgentDownload)
 	mux.HandleFunc("GET /install/{token}", s.handleInstallScript)
 
-	// auth
+	// auth. These hang off the OUTER mux - there is no session yet - so
+	// requireUser's CSRF check never runs on them and authGuard applies it.
 	mux.HandleFunc("GET /api/auth/state", s.handleAuthState)
-	mux.HandleFunc("POST /api/auth/setup", s.handleSetup)
-	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
-	mux.HandleFunc("POST /api/auth/logout", s.handleLogout)
+	mux.HandleFunc("POST /api/auth/setup", s.authGuard(s.handleSetup))
+	mux.HandleFunc("POST /api/auth/login", s.authGuard(s.handleLogin))
+	mux.HandleFunc("POST /api/auth/logout", s.authGuard(s.handleLogout))
 
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/me", s.handleMe)
@@ -51,7 +53,7 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("POST /api/agents/{id}/services/action", s.requireWrite(s.handleServiceAction))
 	api.HandleFunc("GET /api/agents/{id}/eventlog", s.handleEventLog)
 	api.HandleFunc("GET /api/agents/{id}/fs", s.handleFsList)
-	api.HandleFunc("GET /api/agents/{id}/fs/download", s.handleFsDownload)
+	api.HandleFunc("GET /api/agents/{id}/fs/download", s.requireWrite(s.handleFsDownload))
 	api.HandleFunc("POST /api/agents/{id}/fs/upload", s.requireWrite(s.handleFsUpload))
 	api.HandleFunc("POST /api/agents/{id}/fs/delete", s.requireWrite(s.handleFsDelete))
 	api.HandleFunc("POST /api/agents/{id}/fs/mkdir", s.requireWrite(s.handleFsMkdir))
@@ -62,15 +64,17 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("GET /api/agents/{id}/patches", s.handleAgentPatches)
 	api.HandleFunc("POST /api/agents/{id}/patches/scan", s.requireWrite(s.handlePatchScan))
 	api.HandleFunc("POST /api/agents/{id}/patches/install", s.requireWrite(s.handlePatchInstall))
-	api.HandleFunc("GET /ws/shell/{id}", s.handleShellWS)
-	api.HandleFunc("GET /ws/desktop/{id}", s.handleDesktopViewerWS)
+	api.HandleFunc("GET /ws/shell/{id}", s.requireWrite(s.handleShellWS))
+	api.HandleFunc("GET /ws/desktop/{id}", s.requireWrite(s.handleDesktopViewerWS))
 
 	api.HandleFunc("GET /api/groups", s.handleListGroups)
 	api.HandleFunc("POST /api/groups", s.requireWrite(s.handleCreateGroup))
 	api.HandleFunc("PUT /api/groups/{id}", s.requireWrite(s.handleUpdateGroup))
 	api.HandleFunc("DELETE /api/groups/{id}", s.requireWrite(s.handleDeleteGroup))
 
-	api.HandleFunc("GET /api/enroll", s.handleListEnroll)
+	// The listing carries the token VALUES, which are bearer credentials for
+	// enrolling a device - a write. A viewer must not read them.
+	api.HandleFunc("GET /api/enroll", s.requireWrite(s.handleListEnroll))
 	api.HandleFunc("POST /api/enroll", s.requireWrite(s.handleCreateEnroll))
 	api.HandleFunc("DELETE /api/enroll/{id}", s.requireWrite(s.handleDeleteEnroll))
 
@@ -135,6 +139,7 @@ func secureHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "same-origin")
+		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self' data:; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -205,7 +210,7 @@ func actor(r *http.Request) string {
 }
 
 func (s *Server) audit(r *http.Request, action, target string, details any) {
-	s.db.Audit(actor(r), clientIP(r), action, target, details)
+	s.db.Audit(actor(r), s.clientIP(r), action, target, details)
 }
 
 // ---- auth handlers ----
@@ -216,21 +221,103 @@ func (s *Server) handleAuthState(w http.ResponseWriter, r *http.Request) {
 	if c != nil {
 		u = s.db.userBySession(c.Value)
 	}
+	needs := s.db.UserCount() == 0
 	writeJSON(w, 200, map[string]any{
-		"needs_setup": s.db.UserCount() == 0,
-		"user":        u,
-		"version":     Version,
+		"needs_setup": needs,
+		// There is no exemption: whoever completes first-run setup proves they
+		// can read the server's console or log. See handleSetup.
+		"setup_code_required": needs,
+		"user":                u,
+		"version":             Version,
 	})
 }
 
+// authGuard is the CSRF defence for the endpoints that cannot use requireUser
+// because they run before a session exists. Without it a cross-origin page can
+// post a "simple request" (Content-Type: text/plain, no custom header, which
+// needs no preflight) to /api/auth/setup and claim the first administrator
+// account, or to /api/auth/login and sign a victim's browser into an account
+// the attacker controls.
+func (s *Server) authGuard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if r.Header.Get("X-Requested-With") == "" {
+				writeErr(w, http.StatusForbidden, "missing X-Requested-With header")
+				return
+			}
+			// A browser always sends Origin on a cross-site POST; a same-origin
+			// fetch from the console sends its own origin, which matches Host.
+			if !sameOrigin(r) {
+				writeErr(w, http.StatusForbidden, "cross-origin request refused")
+				return
+			}
+			// text/plain and the other CORS-safelisted types are exactly what a
+			// no-preflight cross-origin post can carry.
+			if ct := r.Header.Get("Content-Type"); ct != "" {
+				if mt, _, err := mime.ParseMediaType(ct); err != nil || mt != "application/json" {
+					writeErr(w, http.StatusUnsupportedMediaType, "expected application/json")
+					return
+				}
+			}
+		}
+		next(w, r)
+	}
+}
+
+// SetupCode is the one-time first-run code, or "" once an administrator
+// exists (or if this process started with users and therefore minted none).
+func (s *Server) SetupCode() string {
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
+	return s.setupCode
+}
+
+// handleSetup creates the first administrator.
+//
+// Two things make it dangerous. It is unauthenticated by definition, so
+// between the server starting and the operator reaching the form, anyone who
+// can open a socket to the port - a machine on the LAN, a browser behind a
+// reverse proxy, any local process, or a hostile page via CSRF - could claim
+// the account that is root on every enrolled device. And the check "is there a
+// user yet?" is separated from the insert by a ~250 ms bcrypt hash, so
+// concurrent requests all passed it and each created an administrator.
+//
+// So: the one-time code printed at startup is ALWAYS required (there is no
+// loopback exemption - a peer address of 127.0.0.1 proves nothing about who is
+// at the other end of a same-host proxy, and says nothing about which local
+// user is asking), and the check and the insert happen under setupMu so first
+// run really is once.
 func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
+	ip := s.clientIP(r)
 	if s.db.UserCount() > 0 {
 		writeErr(w, http.StatusForbidden, "already set up")
 		return
 	}
-	var in struct{ Username, Password, Email string }
+	if !loginLimiter.allow(ip) {
+		writeErr(w, http.StatusTooManyRequests, "too many attempts, try again in a minute")
+		return
+	}
+	var in struct{ Username, Password, Email, Code string }
 	if err := readJSON(r, &in); err != nil {
 		fail(w, err)
+		return
+	}
+
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
+	// Re-checked under the lock: without this, every request that got past the
+	// check above while the first one was hashing created its own admin.
+	if s.db.UserCount() > 0 {
+		writeErr(w, http.StatusForbidden, "already set up")
+		return
+	}
+	// An empty s.setupCode means this process did not mint one (it started
+	// with users that have since gone): refuse rather than accept an empty
+	// code, and say how to get a new one.
+	if s.setupCode == "" || !constantTimeEqual(strings.ToLower(strings.TrimSpace(in.Code)), s.setupCode) {
+		s.db.Audit(in.Username, ip, "setup.refused", "", "wrong setup code")
+		slog.Warn("first-run setup refused: wrong setup code", "ip", ip, "username", in.Username)
+		writeErr(w, http.StatusForbidden, "wrong setup code: use the one-time code the server printed at startup (console, or server.log in the data directory). Restart the server before anyone creates a user to mint a new one")
 		return
 	}
 	if strings.TrimSpace(in.Username) == "" {
@@ -242,8 +329,9 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	s.db.Audit(in.Username, clientIP(r), "setup", "", nil)
-	tok, err := s.db.createSession(id, clientIP(r), r.UserAgent())
+	s.setupCode = "" // spent
+	s.db.Audit(in.Username, ip, "setup", "", nil)
+	tok, err := s.db.createSession(id, ip, r.UserAgent())
 	if err != nil {
 		fail(w, err)
 		return
@@ -255,7 +343,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 var loginLimiter = newRateLimiter(10, time.Minute)
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
+	ip := s.clientIP(r)
 	if !loginLimiter.allow(ip) {
 		writeErr(w, http.StatusTooManyRequests, "too many attempts, try again in a minute")
 		return
@@ -319,6 +407,12 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.db.Exec(`UPDATE users SET password_hash = ? WHERE id = ?`, h, u.ID)
+	// every other session (a stolen cookie included) stops working now
+	if c, _ := r.Cookie(sessionCookie); c != nil {
+		s.db.Exec(`DELETE FROM sessions WHERE user_id = ? AND token != ?`, u.ID, c.Value)
+	} else {
+		s.db.Exec(`DELETE FROM sessions WHERE user_id = ?`, u.ID)
+	}
 	s.audit(r, "password.changed", u.Username, nil)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
@@ -391,7 +485,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 // ---- dashboard ----
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	agents, err := s.db.ListAgents()
+	// The hub, not the agents.online column: the column is wiped at every
+	// startup, so the dashboard used to report "0 online" beside a device
+	// list on the same screen that showed them all up.
+	agents, err := s.agentsWithLiveness()
 	if err != nil {
 		fail(w, err)
 		return
@@ -414,10 +511,19 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var openAlerts, critical, patches, runsToday, runsFailed int
-	s.db.QueryRow(`SELECT COUNT(*), SUM(severity = 'critical') FROM alerts WHERE status != 'resolved'`).Scan(&openAlerts, &critical)
-	s.db.QueryRow(`SELECT COUNT(DISTINCT agent_id) FROM patches WHERE status IN ('available','approved')`).Scan(&patches)
+	// COALESCE: SUM() over no rows is NULL, which fails the Scan halfway
+	// through. The counts happened to survive because database/sql assigns
+	// left to right, which is not something to rely on.
+	if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(severity = 'critical'), 0) FROM alerts WHERE status != 'resolved'`).Scan(&openAlerts, &critical); err != nil {
+		slog.Warn("dashboard alert counts", "err", err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(DISTINCT agent_id) FROM patches WHERE status IN ('available','approved')`).Scan(&patches); err != nil {
+		slog.Warn("dashboard patch count", "err", err)
+	}
 	dayAgo := now() - 86400
-	s.db.QueryRow(`SELECT COUNT(*), SUM(status IN ('failed','timeout')) FROM script_runs WHERE started_at > ?`, dayAgo).Scan(&runsToday, &runsFailed)
+	if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(status IN ('failed','timeout')), 0) FROM script_runs WHERE started_at > ?`, dayAgo).Scan(&runsToday, &runsFailed); err != nil {
+		slog.Warn("dashboard run counts", "err", err)
+	}
 	alerts, err := s.db.ListAlerts("open", "", 10)
 	if err != nil {
 		fail(w, err)
@@ -445,6 +551,12 @@ func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 		"version": Version, "public_url": s.PublicURL(), "fingerprint": s.fingerprint,
 		"data_dir": s.cfg.DataDir, "db_bytes": dbSize, "uptime": int64(time.Since(s.startedAt).Seconds()),
 		"agents_connected": len(s.hub.OnlineIDs()),
+		// "" unless the certificate does not cover public_url, in which case
+		// this says so and how to fix it.
+		"cert_warning": s.CertWarning(),
+		// true when --public-url/RMM_PUBLIC_URL is set on the command line.
+		// It seeded public_url on first run; the setting is what takes effect.
+		"public_url_flag": s.cfg.PublicURL,
 	})
 }
 

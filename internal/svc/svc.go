@@ -6,7 +6,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
+	"strings"
+	"time"
 
 	"github.com/kardianos/service"
 )
@@ -101,6 +104,16 @@ func Control(spec Spec, action string) error {
 	case "status":
 		st, err := s.Status()
 		if err != nil {
+			// A SysV init script reports a stopped service by printing
+			// "Stopped" and exiting 1. kardianos turns that non-zero exit into
+			// an error and throws the output away, so `status` printed
+			// "exit status 1" and exited 1 for a service that is merely
+			// stopped. Ask the script itself.
+			if st2, ok := initScriptStatus(spec.Name, s.Platform()); ok {
+				st, err = st2, nil
+			}
+		}
+		if err != nil {
 			return err
 		}
 		switch st {
@@ -113,7 +126,15 @@ func Control(spec Spec, action string) error {
 		}
 		return nil
 	case "install":
-		_ = s.Uninstall() // idempotent reinstall
+		// Idempotent reinstall. DeleteService on a running service only marks
+		// it for deletion and the following CreateService fails with
+		// ERROR_SERVICE_MARKED_FOR_DELETE, so stop it and wait first.
+		if st, err := s.Status(); err == nil && st != service.StatusStopped {
+			_ = s.Stop()
+			waitForStatus(s, service.StatusStopped, 60*time.Second)
+		}
+		_ = s.Uninstall()
+		waitGone(s, 15*time.Second)
 		if err := s.Install(); err != nil {
 			return err
 		}
@@ -123,6 +144,69 @@ func Control(spec Spec, action string) error {
 		return s.Uninstall()
 	default:
 		return service.Control(s, action)
+	}
+}
+
+// initScriptStatus re-runs a SysV init script and reads its own verdict.
+// Only meaningful on the SysV fallback; every other platform returns false.
+func initScriptStatus(name, platform string) (service.Status, bool) {
+	if !strings.Contains(platform, "systemv") {
+		return service.StatusUnknown, false
+	}
+	script := "/etc/init.d/" + name
+	if _, err := os.Stat(script); err != nil {
+		return service.StatusUnknown, false
+	}
+	out, _ := exec.Command(script, "status").CombinedOutput() // exit code is the thing we are working around
+	switch text := strings.TrimSpace(string(out)); {
+	case strings.HasPrefix(text, "Running"):
+		return service.StatusRunning, true
+	case strings.HasPrefix(text, "Stopped"):
+		return service.StatusStopped, true
+	}
+	return service.StatusUnknown, false
+}
+
+// Describe says, in one line, what `install` actually registered. On a host
+// without systemd kardianos silently falls back to a SysV init script, which
+// no document mentions and whose output goes somewhere else entirely - and
+// the documented `systemctl status <name>` then fails.
+func Describe(spec Spec) string {
+	s, err := service.New(&program{run: func(context.Context) error { return nil }}, config(spec))
+	if err != nil {
+		return "service installed and started"
+	}
+	switch p := s.Platform(); {
+	case strings.Contains(p, "systemd"):
+		return "registered systemd unit " + spec.Name + " and started it (systemctl status " + spec.Name + ")"
+	case strings.Contains(p, "systemv"):
+		return "no systemd on this host: registered SysV init script /etc/init.d/" + spec.Name +
+			" and started it (service " + spec.Name + " status; its output goes to /var/log/" + spec.Name + ".log and .err)"
+	case strings.Contains(p, "windows"):
+		return "registered Windows service " + spec.Name + " and started it (sc query " + spec.Name + ")"
+	default:
+		return "registered " + p + " service " + spec.Name + " and started it"
+	}
+}
+
+func waitForStatus(s service.Service, want service.Status, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if st, err := s.Status(); err != nil || st == want {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// waitGone returns once Status reports the service no longer exists.
+func waitGone(s service.Service, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := s.Status(); err != nil {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 

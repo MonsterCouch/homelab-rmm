@@ -1,13 +1,15 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { api, ApiError } from '../api/client';
-import type { Script, Task, TaskKind, Targets } from '../api/types';
+import type { Run, Script, Task, TaskKind, Targets } from '../api/types';
 import { CronEditor } from '../components/CronEditor';
 import { DataTable, type Column } from '../components/DataTable';
 import { IconPlus, IconRuns } from '../components/Icons';
 import { Modal, useConfirm } from '../components/Modal';
 import { EMPTY_TARGETS, TargetPicker, targetsSummary } from '../components/TargetPicker';
-import { Button, Chip, ErrorBox, Field, Switch, TagInput } from '../components/ui';
+import { Button, Chip, ErrorBox, Field, RunStatusChip, Switch, TagInput } from '../components/ui';
 import { useAsync } from '../hooks/useAsync';
+import { useLiveReload } from '../hooks/useEvents';
 import { describeCron } from '../lib/cron';
 import { relTime } from '../lib/format';
 import { useAuth } from '../state/auth';
@@ -47,7 +49,14 @@ export function Tasks() {
   const scripts = useAsync(() => api.scripts(), []);
   const agents = useAsync(() => api.agents(), []);
   const groups = useAsync(() => api.groups(), []);
+  // A schedule that has been failing for a week looked exactly like a healthy
+  // one: the table showed when it last ran, never how it went. Runs carry the
+  // task they came from, so the outcome of the last batch is derived here.
+  const runs = useAsync(() => api.runs('', 500), []);
+  useLiveReload(['run'], runs.reload, { debounceMs: 1500 });
   const [editing, setEditing] = useState<Task | null>(null);
+
+  const results = useMemo(() => byTask(runs.data ?? []), [runs.data]);
 
   const runNow = async (t: Task) => {
     try {
@@ -113,6 +122,26 @@ export function Tasks() {
     { key: 'targets', header: 'Targets', render: (t) => <span className="muted">{targetsSummary(t.targets, agents.data, groups.data)}</span> },
     { key: 'enabled', header: 'Enabled', sort: (t) => (t.enabled ? 0 : 1), render: (t) => <Switch checked={t.enabled} disabled={!canWrite} ariaLabel={`Enable task ${t.name}`} onChange={(v) => toggle(t, v)} /> },
     { key: 'last', header: 'Last run', sort: (t) => t.last_run, render: (t) => <span className="muted">{relTime(t.last_run)}</span> },
+    {
+      key: 'result',
+      header: 'Last result',
+      sort: (t) => results.get(t.id)?.last?.status ?? '',
+      render: (t) => {
+        const r = results.get(t.id);
+        if (!r?.last) return <span className="faint">{runs.loading ? '' : '—'}</span>;
+        return (
+          <span className="row" style={{ gap: 6, flexWrap: 'nowrap' }}>
+            <RunStatusChip status={r.last.status} />
+            {r.failed > 0 && (
+              <Link to={`/runs?task=${t.id}&status=failed`} className="small" style={{ color: 'var(--danger)' }} onClick={(e) => e.stopPropagation()} title="Runs of this task that failed">
+                {r.failed} failed
+              </Link>
+            )}
+            {r.failed === 0 && r.batch > 1 && <span className="muted small">{r.batch} devices</span>}
+          </span>
+        );
+      },
+    },
     {
       key: 'actions',
       header: '',
@@ -291,6 +320,39 @@ function TaskEditor({ task, scripts, onClose, onSaved }: { task: Task; scripts: 
       </Field>
     </Modal>
   );
+}
+
+interface TaskResult {
+  /** most recent run of the task */
+  last?: Run;
+  /** failed/timed-out runs in the most recent batch */
+  failed: number;
+  /** runs in the most recent batch (one per device) */
+  batch: number;
+}
+
+/**
+ * Outcome per task from the recent-runs window. A scheduled task fans out to
+ * one run per device within a second or two, so "the last batch" is every run
+ * of that task started within a minute of its newest one.
+ */
+function byTask(runs: Run[]): Map<number, TaskResult> {
+  const newest = new Map<number, number>();
+  for (const r of runs) {
+    if (!r.task_id) continue;
+    newest.set(r.task_id, Math.max(newest.get(r.task_id) ?? 0, r.started_at));
+  }
+  const out = new Map<number, TaskResult>();
+  for (const r of runs) {
+    if (!r.task_id) continue;
+    if (r.started_at < (newest.get(r.task_id) ?? 0) - 60) continue;
+    const e = out.get(r.task_id) ?? { failed: 0, batch: 0 };
+    if (!e.last || r.started_at > e.last.started_at) e.last = r;
+    if (r.status === 'failed' || r.status === 'timeout') e.failed++;
+    e.batch++;
+    out.set(r.task_id, e);
+  }
+  return out;
 }
 
 /** Drop empty arrays so the stored JSON stays tidy. */

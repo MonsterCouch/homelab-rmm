@@ -7,10 +7,15 @@
 #   tools/build.sh all        web, server, agents
 #   tools/build.sh test       go vet, go test, UI type-check + build
 #   tools/build.sh package    dist/homelab-rmm-<os>-<arch>.zip (+ .tar.gz on linux) and SHA256SUMS
+#                             (archives what `server` and `agents` built; it does NOT build the UI)
 #   tools/build.sh checksums  regenerate dist/SHA256SUMS
 #   tools/build.sh clean
 #
-# Environment: VERSION (default: git describe), GO, NPM, DIST (default dist).
+# `server` and `package` refuse to run without a built UI in web/dist, because the
+# server binary embeds it; ALLOW_EMPTY_WEB=1 overrides that for a --dev-web binary.
+#
+# Environment: VERSION (default: git describe), GO, NPM, DIST (default dist),
+# ALLOW_EMPTY_WEB.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -30,6 +35,21 @@ AGENT_PLATFORMS="windows/amd64 windows/arm64 linux/amd64 linux/arm64 linux/arm"
 
 log() { printf '  %s\n' "$*"; }
 die() { printf 'build.sh: %s\n' "$*" >&2; exit 1; }
+
+# rmm-server embeds web/dist (web/embed.go, `go:embed all:dist`). That directory
+# is gitignored apart from .gitkeep, so on a fresh clone the embed succeeds with
+# ONE EMPTY FILE and the Go build says nothing at all - the archive then ships a
+# server whose console is a directory listing of .gitkeep. Nothing downstream
+# can notice, so the check lives here, before a single server binary is built.
+# ALLOW_EMPTY_WEB=1 is the deliberate escape hatch (a binary that will run with
+# --dev-web, or a UI-less smoke build).
+require_web() {
+	if [ -n "${ALLOW_EMPTY_WEB:-}" ]; then
+		log "ALLOW_EMPTY_WEB is set: building rmm-server without a built UI"
+		return 0
+	fi
+	[ -f web/dist/index.html ] || die "web/dist/index.html is missing: run 'tools/build.sh web' (or 'make web') first. rmm-server embeds web/dist, so this build would ship a server with no console. Set ALLOW_EMPTY_WEB=1 to build one on purpose."
+}
 
 # binname rmm-agent linux amd64 -> dist/rmm-agent-linux-amd64 (.exe on windows)
 binname() {
@@ -111,6 +131,7 @@ do_checksums() {
 
 do_package() {
 	local p os arch name stage srv ap a
+	require_web
 	mkdir -p "$DIST"
 	rm -f "$DIST"/homelab-rmm-*.zip "$DIST"/homelab-rmm-*.tar.gz
 	for p in $SERVER_PLATFORMS; do
@@ -160,14 +181,14 @@ do_clean() {
 for target in "$@"; do
 	case "$target" in
 		web)       do_web ;;
-		server)    build_platforms rmm-server "$SERVER_PLATFORMS" ;;
+		server)    require_web; build_platforms rmm-server "$SERVER_PLATFORMS" ;;
 		agents)    build_platforms rmm-agent "$AGENT_PLATFORMS" ;;
-		all)       do_web; build_platforms rmm-server "$SERVER_PLATFORMS"; build_platforms rmm-agent "$AGENT_PLATFORMS" ;;
+		all)       do_web; require_web; build_platforms rmm-server "$SERVER_PLATFORMS"; build_platforms rmm-agent "$AGENT_PLATFORMS" ;;
 		test)      do_test ;;
 		package)   do_package ;;
 		checksums) do_checksums ;;
 		clean)     do_clean ;;
-		-h|--help|help) sed -n '2,13p' "$0" ;;
+		-h|--help|help) sed -n '2,18p' "$0" ;;
 		*) die "unknown target '$target' (web|server|agents|all|test|package|checksums|clean)" ;;
 	esac
 done

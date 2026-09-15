@@ -62,17 +62,23 @@ func sendMail(ms MailSettings, subject, body string) error {
 	)
 	dialer := net.Dialer{Timeout: 15 * time.Second}
 	tlsCfg := &tls.Config{ServerName: ms.Host, MinVersion: tls.VersionTLS12}
+	// Every failure path below closes the transport it opened. Alert
+	// notifications call this once per opened alert with no backoff, so a
+	// relay that is down, has an expired certificate or has stopped
+	// advertising STARTTLS used to leak one socket per alert until the
+	// process ran out of file descriptors - taking the agent listener with it.
+	var conn net.Conn
 	switch ms.TLSMode {
 	case "tls":
-		conn, derr := tls.DialWithDialer(&dialer, "tcp", addr, tlsCfg)
-		if derr != nil {
-			return derr
+		conn, err = tls.DialWithDialer(&dialer, "tcp", addr, tlsCfg)
+		if err != nil {
+			return err
 		}
 		c, err = smtp.NewClient(conn, ms.Host)
 	default:
-		conn, derr := dialer.Dial("tcp", addr)
-		if derr != nil {
-			return derr
+		conn, err = dialer.Dial("tcp", addr)
+		if err != nil {
+			return err
 		}
 		c, err = smtp.NewClient(conn, ms.Host)
 		if err == nil && ms.TLSMode == "starttls" {
@@ -84,6 +90,11 @@ func sendMail(ms MailSettings, subject, body string) error {
 		}
 	}
 	if err != nil {
+		if c != nil {
+			c.Close()
+		} else {
+			conn.Close()
+		}
 		return err
 	}
 	defer c.Close()

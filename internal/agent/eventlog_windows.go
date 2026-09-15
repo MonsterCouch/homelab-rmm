@@ -55,7 +55,10 @@ func queryEventLog(q protocol.EventLogQuery) ([]protocol.EventLogEntry, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), eventLogTimeout)
 	defer cancel()
-	out, _, err := runHidden(ctx, "wevtutil.exe", wevtutilArgs(logName, fetch, winEventLogXPath(q.Level, q.SinceTS))...)
+	// wevtutil writes the ANSI code page, not the OEM one, once its stdout
+	// is a pipe: an event message with an accented character is mangled if
+	// it is decoded like shutdown.exe's output.
+	out, _, err := runHiddenACP(ctx, "wevtutil.exe", wevtutilArgs(logName, fetch, winEventLogXPath(q.Level, q.SinceTS))...)
 	if err != nil {
 		return nil, fmt.Errorf("query event log %s: %w", logName, err)
 	}

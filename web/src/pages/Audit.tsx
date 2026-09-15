@@ -33,12 +33,12 @@ export function Audit() {
   const filtered = useMemo(() => (rows.data ?? []).filter((r) => (!user || r.user === user) && textMatch(dq, r.action, r.target, r.details, r.ip, r.user)), [rows.data, dq, user]);
 
   const columns: Column<AuditRow>[] = [
-    { key: 'ts', header: 'Time', sort: (r) => r.ts, render: (r) => <span className="muted nowrap">{dateTime(r.ts)}</span>, width: 170 },
+    { key: 'ts', header: 'Time', sort: (r) => r.ts, csv: (r) => (r.ts ? new Date(r.ts * 1000).toISOString() : ''), render: (r) => <span className="muted nowrap">{dateTime(r.ts)}</span>, width: 170 },
     { key: 'user', header: 'User', sort: (r) => r.user, render: (r) => <b>{r.user}</b> },
     { key: 'ip', header: 'IP', sort: (r) => r.ip, render: (r) => <span className="mono muted">{r.ip}</span> },
     { key: 'action', header: 'Action', sort: (r) => r.action, render: (r) => <span className="chip outline mono" style={{ fontWeight: 400 }}>{r.action}</span> },
     { key: 'target', header: 'Target', sort: (r) => r.target, render: (r) => <span className="mono small truncate" style={{ maxWidth: 240, display: 'inline-block' }} title={r.target}>{r.target}</span> },
-    { key: 'details', header: 'Details', render: (r) => <span className="muted small mono truncate" style={{ maxWidth: 420, display: 'inline-block' }} title={r.details}>{prettyDetails(r.details)}</span> },
+    { key: 'details', header: 'Details', csv: (r) => prettyDetails(r.details), render: (r) => <span className="muted small mono truncate" style={{ maxWidth: 420, display: 'inline-block' }} title={r.details}>{prettyDetails(r.details)}</span> },
   ];
 
   return (
@@ -70,7 +70,7 @@ export function Audit() {
         {rows.data && <span className="muted small">{filtered.length} entries</span>}
       </div>
       {rows.error && <ErrorBox error={rows.error} onRetry={rows.reload} />}
-      <DataTable columns={columns} rows={rows.data ? filtered : undefined} loading={rows.loading} rowKey={(r) => String(r.id)} defaultSort={{ key: 'ts', dir: 'desc' }} compact emptyTitle="No audit entries" />
+      <DataTable columns={columns} rows={rows.data ? filtered : undefined} loading={rows.loading} rowKey={(r) => String(r.id)} defaultSort={{ key: 'ts', dir: 'desc' }} compact csvName="audit" emptyTitle="No audit entries" />
     </>
   );
 }

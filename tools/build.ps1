@@ -10,10 +10,15 @@
       all       web, server, agents (default)
       test      go vet, go test, UI type-check + build
       package   dist\homelab-rmm-<os>-<arch>.zip per server platform (+ .tar.gz for linux
-                when tar.exe is available) and dist\SHA256SUMS
+                when tar.exe is available) and dist\SHA256SUMS. It archives what
+                server/agents built and does NOT build the UI.
       clean     remove dist\ and the built UI
 
     Needs go, node and npm on PATH.
+
+    server and package refuse to run when web\dist\index.html is missing: rmm-server
+    embeds web\dist, so such a build would ship with no console. Set the environment
+    variable ALLOW_EMPTY_WEB=1 to build one on purpose (for use with --dev-web).
 
 .EXAMPLE
     tools\build.ps1                       # everything
@@ -94,7 +99,21 @@ function Build-Web {
     Invoke-Native 'npm' @('run', 'build') 'web'
 }
 
-function Build-Server { foreach ($p in $serverPlatforms) { Invoke-GoBuild 'rmm-server' $p } }
+function Assert-WebBuilt {
+    # rmm-server embeds web\dist (web\embed.go, `go:embed all:dist`), and web\dist is
+    # gitignored apart from .gitkeep: on a fresh clone the embed quietly succeeds with one
+    # empty file, the Go build says nothing, and the archive ships a server whose console
+    # is a directory listing. Check before any server binary is built.
+    if ($env:ALLOW_EMPTY_WEB) {
+        Write-Host '  ALLOW_EMPTY_WEB is set: building rmm-server without a built UI'
+        return
+    }
+    if (-not (Test-Path -LiteralPath 'web\dist\index.html')) {
+        throw "web\dist\index.html is missing: run 'tools\build.ps1 -Target web' first. rmm-server embeds web\dist, so this build would ship a server with no console. Set ALLOW_EMPTY_WEB=1 to build one on purpose."
+    }
+}
+
+function Build-Server { Assert-WebBuilt; foreach ($p in $serverPlatforms) { Invoke-GoBuild 'rmm-server' $p } }
 function Build-Agents { foreach ($p in $agentPlatforms) { Invoke-GoBuild 'rmm-agent' $p } }
 
 function Invoke-Tests {
@@ -140,6 +159,7 @@ function Write-Checksums {
 }
 
 function New-Packages {
+    Assert-WebBuilt
     New-Item -ItemType Directory -Force -Path $Dist | Out-Null
     Get-ChildItem -Path $Dist -Filter 'homelab-rmm-*' -File -ErrorAction SilentlyContinue | Remove-Item -Force
     $tar = Get-Command tar.exe -ErrorAction SilentlyContinue

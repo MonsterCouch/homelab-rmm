@@ -35,18 +35,29 @@ self-signed setup is safe.
   event log and journald viewer, file browser with upload/download/rename/delete, reboot,
   shutdown, lock, log off, and **Wake-on-LAN** relayed through another agent on the same subnet.
 - **Organisation** — groups, tags, custom fields, notes, display names.
-- **Users** — admin / tech / viewer roles, TOTP two-factor authentication, session management,
-  password reset from the CLI.
+- **Users** — admin / tech / viewer roles (a viewer looks at everything and changes nothing: no
+  writes, and no terminal, remote desktop, file download or enrolment token either), TOTP
+  two-factor authentication, session management, password reset from the CLI.
 - **Audit log** of every action with user and source address.
 
 ## Screenshots
 
 _Coming soon: dashboard, device overview, remote desktop, script run with live output._
 
+> **There is no tagged release yet.** The repository carries no `v*` tag, so the download links
+> in the two quick starts below have nothing to resolve to. Until the first release is cut,
+> produce the archives yourself — see [Building from source](#building-from-source):
+> `make all && make package` writes exactly the `dist/homelab-rmm-<os>-<arch>.zip` /
+> `.tar.gz` the quick starts unpack (server, `agents/`, docs, `deploy/`, `SHA256SUMS`) — or take
+> the `dist` artefact from the newest green run of the
+> [Build workflow](https://github.com/MonsterCouch/homelab-rmm/actions/workflows/build.yml).
+> Everything after the download step is exactly as written.
+
 ## Quick start (Windows server)
 
 1. Download `homelab-rmm-windows-amd64.zip` (or `-arm64`) from the
-   [releases](https://github.com/MonsterCouch/homelab-rmm/releases) page.
+   [releases](https://github.com/MonsterCouch/homelab-rmm/releases) page (see the note above:
+   none published yet — build it or take the CI artefact).
 2. Extract it to `C:\Program Files\HomelabRMM`. You get `rmm-server.exe` and an `agents\` folder
    with the agent binaries for every platform; the server serves those to devices you enrol.
 3. From an **elevated** PowerShell:
@@ -62,7 +73,9 @@ _Coming soon: dashboard, device overview, remote desktop, script run with live o
    (`rmm.db`, `server.crt`, `server.key`, `server.log`). `--public-url` is the address agents will
    use; it goes into every install command and into the certificate's names. Omit it and the
    server uses `https://<hostname>:8443`. Other flags: `--listen :8443`, `--data DIR`,
-   `--cert/--key` for your own certificate, `--insecure` for plain HTTP behind a reverse proxy.
+   `--cert/--key` for your own certificate, `--insecure` for plain HTTP behind a reverse proxy,
+   `--trusted-proxies IP,CIDR,...` to name that proxy so its `X-Forwarded-For` is believed (it is
+   ignored otherwise, and every request is then audited as coming from the proxy).
 4. Open `https://rmm.lan:8443` (or `https://<hostname>:8443`). The certificate is self-signed and
    generated on first run, so the browser warns once. Either accept the exception or trust it:
    the certificate covers the machine's hostname, its LAN IPs at generation time, `localhost` and
@@ -73,6 +86,21 @@ _Coming soon: dashboard, device overview, remote desktop, script run with live o
    → Servers → Add Exception*).
 5. The first visit shows the setup form: create the admin account (add an email if you want
    alert mail later). Turn on two-factor under *Account*.
+
+   Because nobody is signed in yet, a server with no users mints a **one-time setup code** and
+   prints it at startup — to the console and as a `WARN` line in `server.log` in the data
+   directory:
+
+   ```
+   ==== FIRST-RUN SETUP CODE: 3f9a1c07 ====
+   ```
+
+   The form **always** asks for it, including from a browser on the server itself: that account
+   is root on every device you go on to enrol, and a connection from `127.0.0.1` could equally be
+   a reverse proxy relaying the LAN, another program on the box, or a web page you happen to have
+   open. Reading the code is the thing that proves it is you. Lost it? Restart the server before
+   anyone creates a user and it prints a new one; once the admin exists the code is neither
+   minted nor asked for again.
 6. **Devices → Enrol**: create an enrolment token (name, optional group, number of uses, expiry),
    copy the Windows or Linux one-liner and run it on each machine you want to manage:
    - Windows, elevated PowerShell:
@@ -91,7 +119,8 @@ Managing the service later: `rmm-server.exe start | stop | restart | status | un
 
 ## Quick start (Linux server)
 
-**Binary + systemd**
+**Binary + systemd** (the `curl` line works once a release is tagged; until then unpack the
+archive `make package` built, or the CI `dist` artefact, into `/opt/homelab-rmm`)
 
 ```bash
 curl -LO https://github.com/MonsterCouch/homelab-rmm/releases/latest/download/homelab-rmm-linux-amd64.tar.gz   # or -arm64
@@ -129,21 +158,48 @@ group. The console prints two commands per token:
   which downloads `rmm-agent-windows-<arch>.exe` from `/api/agent-download/`, places it at
   `C:\Program Files\HomelabRMM\rmm-agent.exe` and runs `rmm-agent.exe install --server <url>
   --token <token> --fingerprint <sha256>`. That writes `%ProgramData%\HomelabRMM\agent.json` and
-  registers the Windows service **HomelabRMMAgent**.
+  registers the Windows service **HomelabRMMAgent**. Re-running it **over a running agent** is
+  supported: the script stops the service and waits for it to report `Stopped`, waits for
+  `rmm-agent.exe` to actually exit, then retries the file swap for a few seconds, because Windows
+  will not let you overwrite an executable that is still mapped. `install` itself stops the old
+  service and waits for it to disappear before registering the new one, rather than tripping over
+  `ERROR_SERVICE_MARKED_FOR_DELETE`.
 - The **Linux** one-liner does the same with `curl` and `bash`: binary at
   `/opt/homelab-rmm/rmm-agent`, config at `/etc/homelab-rmm/agent.json`, systemd unit
   **HomelabRMMAgent**. The architecture (amd64, arm64, armv7) is detected from `uname -m`.
 
-Both commands skip certificate validation for the download because the device has never seen
-the server's self-signed certificate. What they pass on to the agent is the certificate's
-SHA-256 **fingerprint**, and from then on the agent refuses to talk to anything else. See
-[docs/SECURITY.md](docs/SECURITY.md) for why that is acceptable on a LAN and what to do if it is
-not for you.
+The script is served only for a **live enrolment token** — anything else is a 404 — and only for
+an architecture this project ships, so the URL cannot be used to push arbitrary text into the
+root shell it is piped to.
+
+Both commands skip certificate validation for the **one fetch of the install script**, because
+the device has never seen the server's self-signed certificate. Everything after that is pinned:
+the script downloads the agent over a connection pinned to the server's certificate (its public
+key, on Linux), checks the binary's **SHA-256** against the hash the server rendered into the
+script and refuses to install on a mismatch, and passes the certificate's SHA-256 **fingerprint**
+to the agent, which from then on refuses to talk to anything else. See
+[docs/SECURITY.md](docs/SECURITY.md) for why the first fetch is acceptable on a LAN and what to
+do if it is not for you.
 
 On first connection the agent presents the token, the server creates the device record and
-issues a per-device key; the agent stores it in `agent.json` (mode 0600) and never uses the
-token again. A reinstall on a host with the same name and OS replaces the old record instead
-of creating a duplicate.
+issues a per-device key; the agent stores the key in `agent.json` (mode 0600) and authenticates
+with it from then on. A reinstall on a host with the same name and OS replaces the old record
+instead of creating a duplicate.
+
+**The token stays in `agent.json` too** (`enroll_token`), and it is used again whenever the key
+stops working: that is what makes the self-healing in
+[Troubleshooting](#troubleshooting) — `unknown agent key` — work, and it has two consequences
+worth knowing before you choose the token's *Uses* and expiry.
+
+- A token created with more than one use (the console offers "unlimited") sits on the disk of
+  **every** device it enrolled, readable by root/SYSTEM there, until it expires (24 h by
+  default). Prefer a single-use token per machine; keep the expiry short.
+- **Deleting a device in the console does not keep it away.** The agent notices its key was
+  rejected and re-enrols with the stored token within seconds — as a *new* record, with a new
+  id and no history. To remove a device for good, uninstall or stop the agent first (see
+  *Agent install, uninstall, update*), then delete it; or wait for the token to expire, or
+  exhaust its uses, before deleting. The re-enrolment is visible in the audit log as
+  `agent.enrolled` / `agent.rekeyed`.
 
 **Manual install** (no download step): copy `agents/rmm-agent-<os>-<arch>[.exe]` from the
 release archive to the device and run, elevated:
@@ -245,11 +301,14 @@ stopping the service, putting the files back and starting it. More in
   hashed on the server.
 - Operators sign in with bcrypt-hashed passwords, optional TOTP, `HttpOnly` + `SameSite=Strict`
   session cookies (14 days), an `X-Requested-With` header on every state-changing request
-  (CSRF), same-origin checks on WebSockets, login rate limiting (10/min per IP) and roles.
+  including sign-in and first-run setup (CSRF), same-origin checks on WebSockets, login rate
+  limiting (10/min per IP) and roles. First-run setup always requires the one-time code the
+  server prints at startup.
 - The **console is root/SYSTEM on every enrolled device**. Keep it on the LAN or behind a VPN,
   turn on 2FA for every account and give day-to-day accounts the *tech* or *viewer* role.
-- The install one-liners disable certificate validation for the very first download only, so
-  that a self-signed server can bootstrap; the agent pins the certificate from then on.
+- The install one-liners disable certificate validation for the very first fetch only, so that a
+  self-signed server can bootstrap; the agent binary is then hash-checked and pulled over a
+  pinned connection, and the agent pins the certificate from then on.
 
 The full threat model, what is and is not protected, and recommendations are in
 [docs/SECURITY.md](docs/SECURITY.md).
@@ -278,10 +337,20 @@ The full threat model, what is and is not protected, and recommendations are in
 
 ## Building from source
 
-Go 1.26, Node 22. `make all` builds the UI and every binary into `dist/`; `make package`
-produces the release archives; `tools/build.ps1` does the same on Windows without make. See
-[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+Go 1.26, Node 22. `make all` builds the UI and every binary into `dist/`; `make package` then
+archives what `all` produced.
+
+`make package` does **not** build the UI itself. The server binary embeds `web/dist`
+(`web/embed.go`), and that directory is gitignored apart from a `.gitkeep`, so a server compiled
+before the UI exists embeds one empty file, compiles without a warning and serves no console at
+all. `make`, `tools/build.sh` and `tools/build.ps1` therefore refuse to build `rmm-server` when
+`web/dist/index.html` is missing and tell you to run `make web` first; `ALLOW_EMPTY_WEB=1`
+overrides that for a binary you intend to run with `--dev-web`. `tools/build.ps1` is the Windows
+twin of the Makefile. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## License
 
-See the `LICENSE` file in the repository or release archive.
+**Not settled yet.** The repository carries no `LICENSE` file, so no licence is granted — treat
+the code as all rights reserved until one is added. The release archives ship a placeholder that
+says the same (`tools/build.sh` writes it when `LICENSE` is absent); once the file exists it is
+copied into every archive instead. Adding it is on the list for the first tagged release.

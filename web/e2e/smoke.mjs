@@ -1,15 +1,20 @@
 // End-to-end smoke test for the operator console against a running
 // rmm-server (plain HTTP, fresh data dir). Usage:
 //
-//   RMM_DATA_DIR=/tmp/rmm-ui-test ./rmm-server run --insecure --listen 127.0.0.1:18080 &
+//   export RMM_DATA_DIR=/tmp/rmm-ui-test
+//   ./rmm-server run --insecure --listen 127.0.0.1:18080 &
 //   node web/e2e/smoke.mjs            # PW_BASE overrides the URL
+//
+// First-run setup always asks for the one-time code the server prints at
+// startup (there is no loopback exemption any more), so this needs the code
+// too: RMM_SETUP_CODE, or RMM_DATA_DIR so it can be read out of server.log.
 //
 // It completes first-run setup, walks every page, exercises the main create
 // flows and fails on any console error, page error or failed/4xx+ request.
 
 import { createRequire } from 'node:module';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, openSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +24,21 @@ const here = dirname(fileURLToPath(import.meta.url));
 const BASE = process.env.PW_BASE || 'http://127.0.0.1:18080';
 const SHOTS = join(here, 'shots');
 mkdirSync(SHOTS, { recursive: true });
+
+// The first-run setup code. Whoever completes setup has to prove they can read
+// the server's console or log, which is the whole point of the code: a browser
+// that merely reaches the port - loopback included - cannot claim the account.
+function setupCode() {
+  if (process.env.RMM_SETUP_CODE) return process.env.RMM_SETUP_CODE.trim();
+  const dir = process.env.RMM_DATA_DIR;
+  if (dir && existsSync(join(dir, 'server.log'))) {
+    const log = readFileSync(join(dir, 'server.log'), 'utf8');
+    const hits = [...log.matchAll(/setup_code=([0-9a-f]{8})/g)];
+    if (hits.length) return hits[hits.length - 1][1];
+  }
+  throw new Error('no first-run setup code: set RMM_SETUP_CODE, or RMM_DATA_DIR so server.log can be read');
+}
+const SETUP_CODE = setupCode();
 
 function loadPlaywright() {
   const candidates = ['playwright', 'playwright-core', '/opt/node22/lib/node_modules/playwright', '/usr/lib/node_modules/playwright', '/usr/local/lib/node_modules/playwright'];
@@ -55,6 +75,11 @@ const covered = [];
 let shotN = 0;
 // Set while a step deliberately provokes a 401 (wrong-password login).
 let expectAuthFailure = false;
+// Set while the setup step deliberately submits a wrong one-time code (403).
+let expectSetupFailure = false;
+// Set while the viewer-role step deliberately provokes 403s on the endpoints a
+// read-only account must not reach.
+let expectViewerDenials = false;
 // A real Linux agent is enrolled when a binary is available (AGENT_BIN or the
 // repo-root build) so the device pages, terminal and run streaming are tested
 // against live data instead of an empty table.
@@ -196,8 +221,32 @@ async function desktopViewerWithFakeHelper(page, ctx) {
   await page.mouse.click(p1.x, p1.y, { button: 'right' });
   await waitSent('mousedown', (m) => m.button === 2);
   await page.mouse.wheel(0, 120);
-  await waitSent('wheel', (m) => m.dy === 120 && m.dx === 0);
+  await waitSent('wheel', (m) => m.dy === 100 && m.dx === 0);
   step('desktop viewer: mouse move/click/right-click/wheel forwarded in remote pixel space');
+
+  // Wheel normalisation (docs/DESKTOP-PROTOCOL.md): whatever a browser calls a
+  // notch leaves the viewer as a whole ±100, in pixel, line and page mode
+  // alike; only trackpad-sized pixel deltas go through raw for the helper to
+  // accumulate. Synthetic events because Playwright only produces deltaMode 0.
+  const wheelCase = async (init, want) => {
+    await page.evaluate(() => (window.__fakeSent = []));
+    await page.evaluate(
+      ([i, x, y]) => document.querySelector('.desktop-wrap canvas').dispatchEvent(new WheelEvent('wheel', { ...i, clientX: x, clientY: y, bubbles: true, cancelable: true })),
+      [init, p1.x, p1.y],
+    );
+    await page.waitForFunction(() => (window.__fakeSent ?? []).some((m) => m.t === 'wheel'), null, { timeout: 5000 }).catch(() => {});
+    const got = (await sent()).filter((m) => m.t === 'wheel');
+    if (got.length !== 1 || got[0].dx !== want.dx || got[0].dy !== want.dy) {
+      problems.push(`wheel ${JSON.stringify(init)} should send ${JSON.stringify(want)}, sent ${JSON.stringify(got)}`);
+    }
+  };
+  await wheelCase({ deltaY: 53, deltaMode: 0 }, { dx: 0, dy: 100 }); // Chrome on Linux
+  await wheelCase({ deltaY: -120, deltaMode: 0 }, { dx: 0, dy: -100 }); // Chrome on Windows
+  await wheelCase({ deltaY: 250, deltaMode: 0 }, { dx: 0, dy: 300 }); // a fast flick is whole notches
+  await wheelCase({ deltaY: 8, deltaMode: 0 }, { dx: 0, dy: 8 }); // trackpad: the helper accumulates
+  await wheelCase({ deltaY: 3, deltaMode: 1 }, { dx: 0, dy: 100 }); // Firefox: 3 lines to the notch
+  await wheelCase({ deltaX: -1, deltaMode: 2 }, { dx: -100, dy: 0 }); // page mode, horizontal
+  step('desktop viewer: wheel sent as whole notches in pixel/line/page mode, trackpad deltas untouched');
 
   // A drag released outside the canvas must still release the remote button.
   await page.evaluate(() => (window.__fakeSent = []));
@@ -236,6 +285,22 @@ async function desktopViewerWithFakeHelper(page, ctx) {
   if (!(await page.locator('button:has-text("Remote clipboard")').count())) problems.push('remote clipboard message did not surface a copy button');
   step('desktop viewer: monitor, quality, refresh, Ctrl+Alt+Del and clipboard paste messages match the protocol');
 
+  // ux-05: the toast the paste just raised must clear this page's own read-out.
+  // The "fps · B/s" figure at the right end of the status line is the number you
+  // watch while judging the connection, and it was being covered.
+  await page.waitForSelector('.toast');
+  const overlap = await page.evaluate(() => {
+    const line = document.querySelector('.fill-page .statusline');
+    if (!line) return 'no-statusline';
+    const b = line.getBoundingClientRect();
+    const toasts = [...document.querySelectorAll('.toast')].map((t) => t.getBoundingClientRect());
+    return { toasts: toasts.length, covering: toasts.filter((a) => a.bottom > b.top && a.top < b.bottom && a.right > b.left && a.left < b.right).length };
+  });
+  if (overlap === 'no-statusline') problems.push('the remote desktop lost its status line');
+  else if (!overlap.toasts) skipped.push('toast/status-line overlap not checked (the toast had already expired)');
+  else if (overlap.covering) problems.push(`${overlap.covering} toast(s) cover the remote desktop status line`);
+  step('toasts clear the remote desktop status line instead of covering the fps read-out');
+
   await page.click('button:has-text("Disconnect")');
   await page.waitForSelector('.statusline:has-text("Disconnected")');
   await page.evaluate(() => {
@@ -249,9 +314,33 @@ function step(name) {
   console.log(`- ${name}`);
 }
 
+async function settle(page) {
+  // Never capture a dialog mid-transition: a screenshot taken inside the drawer's
+  // 160 ms slide catches it half-way with the scrim not yet painted, which is what
+  // made shot 30 look like a double exposure. Infinite animations (the spinner,
+  // the skeleton shimmer) never finish, so only bounded ones are awaited.
+  await page
+    .evaluate(() =>
+      Promise.race([
+        Promise.all(
+          document
+            .getAnimations()
+            .filter((a) => {
+              const t = a.effect?.getComputedTiming?.();
+              return t && t.iterations !== Infinity && Number.isFinite(t.endTime ?? Infinity);
+            })
+            .map((a) => a.finished.catch(() => {})),
+        ),
+        new Promise((r) => setTimeout(r, 1500)),
+      ]),
+    )
+    .catch(() => {});
+}
+
 async function shot(page, name) {
   shotN++;
   const file = join(SHOTS, `${String(shotN).padStart(2, '0')}-${name}.png`);
+  await settle(page);
   await page.screenshot({ path: file, fullPage: true });
 }
 
@@ -262,11 +351,34 @@ async function main() {
   const page = await ctx.newPage();
   page.setDefaultTimeout(15000);
 
+  // Every Content-Security-Policy violation is collected in the page as well
+  // as from the console below: the event fires for blocks that Chromium may
+  // log at a level the console filter drops. sessionStorage carries them
+  // across the full page loads this test does (init scripts run again on each).
+  await page.addInitScript(() => {
+    addEventListener('securitypolicyviolation', (e) => {
+      const line = `${e.violatedDirective} blocked ${e.blockedURI || 'inline'} at ${e.sourceFile || 'document'}:${e.lineNumber || 0}`;
+      try {
+        sessionStorage.setItem('__csp', (sessionStorage.getItem('__csp') || '') + line + '\n');
+      } catch {
+        /* storage disabled: the console listener still catches it */
+      }
+    });
+  });
+
   page.on('console', (msg) => {
+    // A Content-Security-Policy violation is reported here and nowhere else, so
+    // it is matched before any filtering and whatever its level.
+    if (/Refused to (load|execute|apply|connect|frame|run)|Content Security Policy/i.test(msg.text())) {
+      problems.push(`CSP violation: ${msg.text()}`);
+      return;
+    }
     if (msg.type() !== 'error') return;
     // Chromium logs every 4xx fetch as "Failed to load resource"; the response
     // handler below already judges each status, so skip the duplicate line.
     if (/Failed to load resource/.test(msg.text())) return;
+    // The viewer-role step expects these handshakes to be refused.
+    if (expectViewerDenials && /WebSocket connection to .*\/ws\/(shell|desktop)\/probe.* 403/.test(msg.text())) return;
     problems.push(`console.error: ${msg.text()}`);
   });
   page.on('pageerror', (err) => problems.push(`pageerror: ${err.message}`));
@@ -279,6 +391,7 @@ async function main() {
   page.on('response', (res) => {
     if (res.status() < 400) return;
     if (expectAuthFailure && res.status() === 401 && res.url().endsWith('/api/auth/login')) return;
+    if (expectSetupFailure && res.status() === 403 && res.url().endsWith('/api/auth/setup')) return;
     // Inside a container without systemd the agent cannot list units or read
     // the journal; the API reports that as 400 and the UI must show it, not crash.
     if (res.status() === 400 && /\/api\/agents\/[^/]+\/(services|eventlog)/.test(res.url())) {
@@ -289,13 +402,30 @@ async function main() {
   });
 
   // ---- setup ----
-  await page.goto(BASE + '/');
+  const firstResponse = await page.goto(BASE + '/');
+  const csp = firstResponse?.headers()['content-security-policy'] ?? '';
+  for (const directive of ["default-src 'self'", "script-src 'self'", "object-src 'none'", "frame-ancestors 'none'"]) {
+    if (!csp.includes(directive)) problems.push(`the document is missing CSP ${directive} (got: ${csp || 'no header'})`);
+  }
+  if (/script-src[^;]*unsafe-(inline|eval)/.test(csp)) problems.push(`CSP allows inline/eval script: ${csp}`);
+  step('Content-Security-Policy served on the console document and the UI renders under it');
   await page.waitForURL(/\/setup$/);
   step('first-run setup page shown for empty database');
+  // sec-06: there is no loopback exemption. Whoever creates the first
+  // administrator presents the one-time code the server printed, wherever they
+  // are connecting from, so the field is always asked for.
+  if (!(await page.locator('#su-code').count())) problems.push('setup did not ask for the one-time code');
   await page.fill('#su-user', 'admin');
   await page.fill('#su-pw', 'password123!');
   await page.fill('#su-pw2', 'password123!');
+  await page.fill('#su-code', 'not-the-code');
   await shot(page, 'setup');
+  expectSetupFailure = true;
+  await page.click('button[type=submit]');
+  await page.waitForSelector('.form-error:has-text("setup code")');
+  expectSetupFailure = false;
+  step('first-run setup refuses a wrong setup code from a loopback browser');
+  await page.fill('#su-code', SETUP_CODE);
   await page.click('button[type=submit]');
   await page.waitForURL(BASE + '/');
   await page.waitForSelector('h1:has-text("Dashboard")');
@@ -322,6 +452,29 @@ async function main() {
   step('devices page renders with empty state');
   await page.click('button:has-text("Enrol device")');
   await page.waitForSelector('.drawer');
+  // ux-02: a drawer must never paint translucent over the page. Nothing in its
+  // ancestor chain may animate opacity (fading the host fades the panel with
+  // it), and the scrim has to be painted while the panel slides in.
+  const drawerPaint = await page.evaluate(() => {
+    const panel = document.querySelector('.drawer');
+    const host = document.querySelector('.drawer-host');
+    const chain = [];
+    for (let el = panel; el; el = el.parentElement) chain.push(el);
+    const fading = document
+      .getAnimations()
+      // A ::before scrim may fade — it is behind the panel, not around it.
+      .filter((a) => !a.effect?.pseudoElement && chain.includes(a.effect?.target) && a.effect.getKeyframes().some((k) => 'opacity' in k))
+      .map((a) => a.effect.target.className);
+    return {
+      fading,
+      opacity: Math.min(...chain.map((el) => Number(getComputedStyle(el).opacity))),
+      scrim: getComputedStyle(host, '::before').backgroundColor,
+    };
+  });
+  if (drawerPaint.fading.length) problems.push(`the drawer or an ancestor animates opacity (${drawerPaint.fading.join(', ')}), so it paints translucent over the page`);
+  if (drawerPaint.opacity < 1) problems.push(`drawer painted at opacity ${drawerPaint.opacity}`);
+  if (!/rgba\(0, 0, 0, 0\.4/.test(drawerPaint.scrim)) problems.push(`the drawer scrim is not painted (got ${drawerPaint.scrim})`);
+  step('drawer opens opaque over a dimmed page (no mid-animation double exposure)');
   await page.fill('.drawer input[placeholder="workshop-pc"]', 'smoke-token');
   await page.click('.drawer button:has-text("Create token")');
   const win = await page.waitForSelector('[data-testid="enroll-windows"]');
@@ -478,6 +631,32 @@ async function main() {
   step('settings page renders system card; public URL saved');
   await shot(page, 'settings');
 
+  // ux-01: a burst of toasts must not bury the page. Six saves in a row leave
+  // three on screen at most, and they clear themselves without a click.
+  let maxToasts = 0;
+  for (let i = 0; i < 6; i++) {
+    // Save is disabled until the form is dirty, so each pass changes the public
+    // URL; the last one puts the value the step above saved back.
+    await page.fill('input[type=url]', i < 5 ? `http://127.0.0.1:1810${i}` : 'http://127.0.0.1:18080');
+    await page.click('button:has-text("Save changes")');
+    maxToasts = Math.max(maxToasts, await page.locator('.toast').count());
+  }
+  maxToasts = Math.max(maxToasts, await page.locator('.toast').count());
+  await shot(page, 'toast-cap');
+  if (maxToasts > 3) problems.push(`${maxToasts} toasts stacked at once (at most 3 may be visible)`);
+  if (maxToasts < 3) problems.push(`the toast burst never stacked (${maxToasts} at most), so the cap is untested`);
+  await page.waitForFunction(() => document.querySelectorAll('.toast').length === 0, null, { timeout: 9000 });
+  step('toasts cap at three on screen and expire on their own');
+
+  // ux-03: the messages the cap dropped are still readable afterwards.
+  await page.click('button[aria-label^="Activity"]');
+  await page.waitForSelector('.notif-menu .notif-item');
+  const logged = await page.locator('.notif-menu .notif-item:has-text("Settings saved")').count();
+  if (logged < 4) problems.push(`the activity log kept ${logged} of the 7 "Settings saved" messages`);
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('.notif-menu', { state: 'detached' });
+  step('activity log keeps the messages the toast cap dropped');
+
   // ---- users ----
   await page.click('nav a[href="/users"]');
   await page.waitForSelector('h1:has-text("Users")');
@@ -498,6 +677,27 @@ async function main() {
   step('audit log lists the actions performed above');
   await shot(page, 'audit');
 
+  // ux-04: every grid can leave the browser. The file is what is on screen.
+  const [csv] = await Promise.all([page.waitForEvent('download'), page.click('.tbl-foot button:has-text("Export CSV")')]);
+  const csvName = csv.suggestedFilename();
+  const csvPath = await csv.path();
+  const csvText = csvPath ? readFileSync(csvPath, 'utf8') : '';
+  if (!/^audit-\d{4}-\d{2}-\d{2}\.csv$/.test(csvName)) problems.push(`unexpected CSV filename: ${csvName}`);
+  const header = csvText.replace(/^\uFEFF/, '').split('\r\n')[0];
+  if (header !== 'Time,User,IP,Action,Target,Details') problems.push(`unexpected CSV header: ${header}`);
+  if (!/script\.create/.test(csvText)) problems.push('the exported audit CSV is missing the rows on screen');
+  // The file must be what is on screen, not the whole table: filter, export again.
+  await page.fill('input[aria-label="Filter audit"]', 'script.create');
+  await page.waitForFunction(() => document.querySelectorAll('table.tbl tbody tr').length < 8);
+  const [csv2] = await Promise.all([page.waitForEvent('download'), page.click('.tbl-foot button:has-text("Export CSV")')]);
+  const csv2Path = await csv2.path();
+  const rows2 = (csv2Path ? readFileSync(csv2Path, 'utf8') : '').replace(/^\uFEFF/, '').split('\r\n').filter(Boolean).slice(1);
+  const rows1 = csvText.replace(/^\uFEFF/, '').split('\r\n').filter(Boolean).slice(1);
+  if (!rows2.length || rows2.length >= rows1.length) problems.push(`the filtered CSV has ${rows2.length} rows against ${rows1.length} unfiltered`);
+  if (rows2.some((l) => !l.includes('script.create'))) problems.push('the filtered CSV contains rows the filter had hidden');
+  await page.fill('input[aria-label="Filter audit"]', '');
+  step('audit grid exports the rows on screen as CSV, filters included');
+
   // ---- account + totp begin ----
   await page.click('nav a[href="/account"]');
   await page.waitForSelector('h1:has-text("Account")');
@@ -506,6 +706,27 @@ async function main() {
   step('account page: TOTP setup shows QR code and secret');
   await shot(page, 'account-totp');
   await page.click('button:has-text("Cancel")');
+
+  // ---- keyboard shortcuts ----
+  await page.click('nav a[href="/"]');
+  await page.waitForSelector('h1:has-text("Dashboard")');
+  await page.keyboard.press('g');
+  await page.keyboard.press('d');
+  await page.waitForURL(/\/devices$/);
+  await page.keyboard.press('g');
+  await page.keyboard.press('r');
+  await page.waitForURL(/\/runs$/);
+  step('g-prefixed shortcuts navigate between pages');
+  await page.keyboard.press('?');
+  await page.waitForSelector('.modal:has-text("Keyboard shortcuts")');
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('.modal', { state: 'detached' });
+  step('? opens the shortcut sheet and Escape closes it');
+  // Typing into a field must not navigate away mid-word.
+  await page.fill('input[aria-label="Search runs"]', 'grd');
+  if (!/\/runs$/.test(new URL(page.url()).pathname)) problems.push('a shortcut fired while typing in a search box');
+  await page.fill('input[aria-label="Search runs"]', '');
+  step('shortcuts stay out of the way while typing');
 
   // ---- global search + device search ----
   await page.fill('input[aria-label="Search devices"]', 'nothing');
@@ -673,6 +894,28 @@ async function main() {
   await page.setViewportSize({ width: 1440, height: 900 });
   step('1000px viewport: nav collapses to labelled icons and nothing overflows horizontally');
 
+  // ---- phone (390px): off-canvas nav, no sideways scrolling ----
+  await page.setViewportSize({ width: 390, height: 780 });
+  await page.goto(BASE + '/devices');
+  await page.waitForSelector('h1:has-text("Devices")');
+  const phone = await page.evaluate(() => ({
+    nav: document.querySelector('nav.nav')?.getBoundingClientRect().right ?? 0,
+    overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+    toggle: !!document.querySelector('.nav-toggle') && getComputedStyle(document.querySelector('.nav-toggle')).display !== 'none',
+  }));
+  if (phone.nav > 1) problems.push(`the nav rail still takes ${phone.nav}px at 390px instead of sliding off-canvas`);
+  if (phone.overflow) problems.push('page scrolls horizontally at 390px');
+  if (!phone.toggle) problems.push('no menu button at 390px, so the nav is unreachable');
+  await shot(page, 'devices-390px');
+  await page.click('.nav-toggle');
+  await page.waitForFunction(() => (document.querySelector('nav.nav')?.getBoundingClientRect().left ?? -1) >= 0);
+  await shot(page, 'devices-390px-nav');
+  await page.click('nav a[href="/scripts"]');
+  await page.waitForSelector('h1:has-text("Scripts")');
+  await page.waitForFunction(() => (document.querySelector('nav.nav')?.getBoundingClientRect().right ?? 1) <= 1);
+  step('390px viewport: nav is an off-canvas drawer that opens, navigates and closes; no horizontal scrolling');
+  await page.setViewportSize({ width: 1440, height: 900 });
+
   // ---- viewer role: read-only UI ----
   await page.click('button[aria-label="User menu"]');
   await page.click('.menu button:has-text("Sign out")');
@@ -699,10 +942,46 @@ async function main() {
   await page.waitForURL(BASE + '/');
   step('viewer is redirected away from /settings');
 
+  // A viewer may look at everything and touch nothing: a terminal, a remote
+  // desktop session and a file download are refused by the server, not just
+  // hidden by the UI.
+  expectViewerDenials = true;
+  const viewerDenied = await page.evaluate(async () => {
+    const out = {};
+    out.download = (await fetch('/api/agents/probe/fs/download?path=/etc/shadow', { headers: { 'X-Requested-With': 'fetch' } })).status;
+    // An enrolment token is a bearer credential for adding a device to the
+    // fleet, so the listing that carries the token values is writer-only too.
+    const enroll = await fetch('/api/enroll', { headers: { 'X-Requested-With': 'fetch' } });
+    out.enroll = enroll.status;
+    out.enrollBody = await enroll.text();
+    const sock = (path) =>
+      new Promise((resolve) => {
+        const ws = new WebSocket(new URL(path, location.href).href.replace(/^http/, 'ws'));
+        ws.onopen = () => { ws.close(); resolve('opened'); };
+        ws.onerror = () => resolve('refused');
+        ws.onclose = (e) => resolve(e.wasClean && e.code === 1000 ? 'opened' : 'refused');
+      });
+    out.shell = await sock('/ws/shell/probe');
+    out.desktop = await sock('/ws/desktop/probe');
+    return out;
+  });
+  expectViewerDenials = false;
+  if (viewerDenied.download !== 403) problems.push(`viewer could request a file download (status ${viewerDenied.download}, want 403)`);
+  if (viewerDenied.enroll !== 403) problems.push(`viewer could list enrolment tokens (status ${viewerDenied.enroll}, want 403)`);
+  if (/"token"\s*:/.test(viewerDenied.enrollBody)) problems.push('enrolment token values were returned to a read-only account');
+  if (viewerDenied.shell !== 'refused') problems.push('viewer opened a terminal WebSocket');
+  if (viewerDenied.desktop !== 'refused') problems.push('viewer opened a remote desktop WebSocket');
+  step('viewer is refused the terminal, the remote desktop, file downloads and enrolment tokens by the server');
+
   // ---- deep link + SPA fallback ----
   await page.goto(BASE + '/tasks');
   await page.waitForSelector('h1:has-text("Scheduled tasks")');
   step('deep link to /tasks served by SPA fallback');
+
+  // csp-01: nothing the console did along the way was refused by the policy.
+  const cspSeen = (await page.evaluate(() => sessionStorage.getItem('__csp') || '')).split('\n').filter(Boolean);
+  for (const v of cspSeen) problems.push(`CSP violation: ${v}`);
+  step('no Content-Security-Policy violation anywhere in the walk');
 
   await browser.close();
   stopAgent();
@@ -711,7 +990,11 @@ async function main() {
 main()
   .then(() => {
     // The viewer is expected to be denied on the settings API; drop those.
-    const real = problems.filter((p) => !/http 403: GET .*\/api\/settings/.test(p));
+    // Deliberate probes: the viewer is expected to be denied on the settings
+    // API and on the three endpoints the viewer-role check above pokes.
+    const real = problems.filter(
+      (p) => !/http 403: GET .*\/api\/settings/.test(p) && !/http 403: GET .*(\/fs\/download|\/api\/enroll|\/ws\/shell\/probe|\/ws\/desktop\/probe)/.test(p),
+    );
     console.log('\nCovered:');
     for (const c of covered) console.log(`  ✓ ${c}`);
     if (skipped.length) {

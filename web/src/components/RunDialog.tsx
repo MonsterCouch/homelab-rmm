@@ -38,6 +38,9 @@ interface Result {
 
 const LANGS: Language[] = ['powershell', 'cmd', 'bash', 'sh', 'python'];
 
+/** localStorage prefix for the last target set used per library script. */
+const TARGETS_KEY = 'rmm.runTargets.';
+
 export function RunDialog({ onClose, script: preset, agentIds, agentId, adHoc }: Props) {
   const toast = useToast();
   const agents = useAsync(() => api.agents(), []);
@@ -58,6 +61,22 @@ export function RunDialog({ onClose, script: preset, agentIds, agentId, adHoc }:
   const [selected, setSelected] = useState<string | null>(null);
 
   const script = useMemo(() => (mode === 'library' ? scripts.data?.find((s) => s.id === scriptId) ?? preset ?? null : null), [mode, scripts.data, scriptId, preset]);
+  /** A device page or a bulk selection dictates the targets; nothing else may. */
+  const lockedTargets = !!agentIds?.length || !!agentId;
+
+  // Whoever ran "Reboot the lab" on the lab group last week almost certainly
+  // means the same devices this time, so the picker starts where it was left.
+  useEffect(() => {
+    if (lockedTargets || !script) return;
+    try {
+      const raw = localStorage.getItem(`${TARGETS_KEY}${script.id}`);
+      if (!raw) return;
+      const v = JSON.parse(raw) as Targets;
+      if (v && typeof v === 'object' && typeof v.all === 'boolean') setTargets(v);
+    } catch {
+      /* a stale or unreadable entry just means the default picker */
+    }
+  }, [script, lockedTargets]);
 
   // Reset parameter values to defaults when the script changes.
   useEffect(() => {
@@ -84,14 +103,20 @@ export function RunDialog({ onClose, script: preset, agentIds, agentId, adHoc }:
   const missingRequired = script?.params.filter((p) => p.required && !(paramValues[p.name] ?? '').trim()).map((p) => p.name) ?? [];
   const canStart = mode === 'library' ? !!script && missingRequired.length === 0 : body.trim().length > 0;
 
-  const start = async () => {
+  /**
+   * `over` re-targets the same script and arguments at a subset of the
+   * devices — "re-run on the ones that failed" is the most common thing to do
+   * after a bad run, and rebuilding it by hand from the results is not it.
+   */
+  const start = async (over?: Targets) => {
     if (!canStart || !agents.data) return;
+    const useTargets = over ?? targets;
     setStarting(true);
     try {
       const input: RunScriptInput =
         mode === 'library'
-          ? { script_id: script!.id, args: script!.params.map((p) => paramValues[p.name] ?? ''), targets }
-          : { language, body, timeout_sec: timeout, targets, args: [] };
+          ? { script_id: script!.id, args: script!.params.map((p) => paramValues[p.name] ?? ''), targets: useTargets }
+          : { language, body, timeout_sec: timeout, targets: useTargets, args: [] };
       const res = await api.runScript(input);
       const list: Result[] = Object.entries(res.runs).map(([id, runId]) => {
         const a = agents.data!.find((x) => x.id === id);
@@ -109,6 +134,13 @@ export function RunDialog({ onClose, script: preset, agentIds, agentId, adHoc }:
         };
       });
       list.sort((a, b) => a.name.localeCompare(b.name));
+      if (mode === 'library' && script && !lockedTargets && !over) {
+        try {
+          localStorage.setItem(`${TARGETS_KEY}${script.id}`, JSON.stringify(useTargets));
+        } catch {
+          /* private mode: the picker just starts empty next time */
+        }
+      }
       setResults(list);
       setSelected(list.find((r) => r.runId)?.agentId ?? list[0]?.agentId ?? null);
       // Load the initial state of each run: the SSE stream may have started
@@ -180,6 +212,7 @@ export function RunDialog({ onClose, script: preset, agentIds, agentId, adHoc }:
   };
 
   const active = results?.filter((r) => r.status === 'running' || r.status === 'queued') ?? [];
+  const failedIds = results?.filter((r) => r.status === 'failed' || r.status === 'timeout').map((r) => r.agentId) ?? [];
   const sel = results?.find((r) => r.agentId === selected) ?? null;
   const lockedAgent: Agent | undefined = agentId ? agents.data?.find((a) => a.id === agentId) : undefined;
 
@@ -197,9 +230,20 @@ export function RunDialog({ onClose, script: preset, agentIds, agentId, adHoc }:
               </Button>
             )}
             <span className="muted small" style={{ marginRight: 'auto', alignSelf: 'center' }}>
-              {results.filter((r) => r.status === 'done').length} done · {results.filter((r) => r.status === 'failed' || r.status === 'timeout').length} failed ·{' '}
-              {active.length} running
+              {results.filter((r) => r.status === 'done').length} done · {failedIds.length} failed · {active.length} running
             </span>
+            {active.length === 0 && (
+              <>
+                <Button onClick={() => start()} busy={starting}>
+                  Re-run
+                </Button>
+                {failedIds.length > 0 && (
+                  <Button variant="danger" busy={starting} onClick={() => start({ all: false, agents: failedIds })}>
+                    Re-run on failed ({failedIds.length})
+                  </Button>
+                )}
+              </>
+            )}
             <Button onClick={onClose}>Close</Button>
           </>
         ) : (
@@ -209,7 +253,7 @@ export function RunDialog({ onClose, script: preset, agentIds, agentId, adHoc }:
               {missingRequired.length > 0 && <span style={{ color: 'var(--danger)' }}> · missing: {missingRequired.join(', ')}</span>}
             </span>
             <Button onClick={onClose}>Cancel</Button>
-            <Button variant="primary" onClick={start} busy={starting} disabled={!canStart || matched.length === 0}>
+            <Button variant="primary" onClick={() => start()} busy={starting} disabled={!canStart || matched.length === 0}>
               Run on {matched.length} {matched.length === 1 ? 'device' : 'devices'}
             </Button>
           </>

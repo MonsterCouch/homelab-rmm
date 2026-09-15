@@ -64,18 +64,78 @@ func TestShellCommandLine(t *testing.T) {
 	}
 }
 
+func TestWinCodePages(t *testing.T) {
+	// The two constants are Windows' CP_ACP and CP_OEMCP. Swapping them
+	// would not fail anything loudly, it would only mangle non-ASCII
+	// output, so pin the values.
+	if cpACP != 0 || cpOEM != 1 {
+		t.Fatalf("code pages drifted: cpACP=%d cpOEM=%d", cpACP, cpOEM)
+	}
+}
+
 func TestWinDecodeOutput(t *testing.T) {
-	// valid UTF-8 (pwsh 7, winget, ASCII tools) passes through untouched
-	for _, s := range []string{"", "plain ascii\r\n", "déjà vu — ok"} {
-		if got := winDecodeOutput([]byte(s)); got != s {
-			t.Errorf("utf-8 %q mangled to %q", s, got)
+	// valid UTF-8 (pwsh 7, winget, ASCII tools) passes through untouched,
+	// whichever code page the capture names
+	for _, cp := range []uint32{cpACP, cpOEM} {
+		for _, s := range []string{"", "plain ascii\r\n", "déjà vu — ok"} {
+			if got := winDecodeOutput([]byte(s), cp); got != s {
+				t.Errorf("utf-8 %q mangled to %q (cp %d)", s, got, cp)
+			}
 		}
 	}
-	// a lone high byte is not UTF-8: it is decoded from the OEM code page
+	// a lone high byte is not UTF-8: it is decoded from the named code page
 	// and never surfaces as U+FFFD
-	got := winDecodeOutput([]byte{'a', 0x82, 'b'})
-	if strings.ContainsRune(got, '�') || len([]rune(got)) != 3 {
-		t.Errorf("OEM byte decoded to %q", got)
+	for _, cp := range []uint32{cpACP, cpOEM} {
+		got := winDecodeOutput([]byte{'a', 0x82, 'b'}, cp)
+		if got == "" || strings.ContainsRune(got, '\ufffd') {
+			t.Errorf("high byte decoded to %q (cp %d)", got, cp)
+		}
+	}
+	// The exact letters only hold on a Western install, where ACP is 1252
+	// and OEM is 437/850. There 0x82 is U+201A in ANSI and "é" in OEM: the
+	// same byte, two different characters, which is the whole of evt-01 -
+	// wevtutil writes ANSI when redirected and used to be read as OEM.
+	if acp := windows.GetACP(); acp != 1252 {
+		t.Logf("ACP is %d, not 1252: skipping the exact-letter check", acp)
+		return
+	}
+	if got := winDecodeOutput([]byte{0x82}, cpACP); got != "\u201a" {
+		t.Errorf("ANSI 0x82 = %q, want U+201A", got)
+	}
+	if got := winDecodeOutput([]byte{0x82}, cpOEM); got != "é" {
+		t.Errorf("OEM 0x82 = %q, want é", got)
+	}
+}
+
+// The code page is a property of the capture: an outputBuffer decodes what it
+// collected once, at String time, with the code page the runner gave it.
+func TestOutputBufferDecodesWithItsCodePage(t *testing.T) {
+	acp := &outputBuffer{limit: 64, cp: cpACP}
+	oem := &outputBuffer{limit: 64, cp: cpOEM}
+	for _, b := range []*outputBuffer{acp, oem} {
+		if n, err := b.Write([]byte{0x82}); n != 1 || err != nil {
+			t.Fatalf("write = %d %v", n, err)
+		}
+	}
+	if windows.GetACP() != 1252 {
+		return // the two code pages need not differ on this byte elsewhere
+	}
+	if acp.String() == oem.String() {
+		t.Errorf("both buffers decoded to %q: cp is not reaching winDecodeOutput", acp.String())
+	}
+}
+
+// A runaway tool is truncated, never killed by a short write, and says so.
+func TestOutputBufferTruncates(t *testing.T) {
+	b := &outputBuffer{limit: 4, cp: cpOEM}
+	for _, chunk := range []string{"ab", "cdef", "gh"} {
+		if n, err := b.Write([]byte(chunk)); n != len(chunk) || err != nil {
+			t.Fatalf("write %q = %d %v (a short write kills the child)", chunk, n, err)
+		}
+	}
+	got := b.String()
+	if !strings.HasPrefix(got, "abcd") || !strings.Contains(got, "[output truncated]") {
+		t.Errorf("truncated capture = %q", got)
 	}
 }
 

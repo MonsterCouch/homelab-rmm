@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 )
 
 // Config is everything the server needs to start. Every field has a default
@@ -20,6 +21,9 @@ type Config struct {
 	LogLevel  string
 	Insecure  bool // plain HTTP (behind a reverse proxy that terminates TLS)
 	SkipSeed  bool // do not create the starter scripts/rules on first run (tests)
+	// TrustedProxies lists CIDRs whose X-Forwarded-For header is believed
+	// (the reverse proxy in front of --insecure). Empty = never trust it.
+	TrustedProxies []string
 }
 
 // DefaultDataDir is %ProgramData%\HomelabRMM on Windows and /var/lib/homelab-rmm
@@ -63,6 +67,9 @@ func (c Config) FromEnv() Config {
 	}
 	if v := os.Getenv("RMM_INSECURE"); v != "" {
 		c.Insecure, _ = strconv.ParseBool(v)
+	}
+	if v := os.Getenv("RMM_TRUSTED_PROXIES"); v != "" {
+		c.TrustedProxies = strings.Split(v, ",")
 	}
 	return c
 }

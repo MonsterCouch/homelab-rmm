@@ -3,12 +3,14 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 
@@ -52,13 +54,16 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer ws.Close()
-	var wmu sync.Mutex
-	send := func(v any) {
-		wmu.Lock()
-		defer wmu.Unlock()
-		ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		ws.WriteJSON(v)
-	}
+	sw := &wsWriter{c: ws}
+	send := func(v any) { sw.json(v) }
+
+	// Same as the desktop viewer: the terminal used to end by dropping the
+	// socket, so every ending - a closed tab, an agent that went away, a shell
+	// that would not open - arrived in the browser as 1006. Registered before
+	// the request-scoped cleanup below so it runs after it, and after
+	// defer ws.Close() so it runs before that.
+	closeCode, closeText := websocket.CloseNormalClosure, ""
+	defer func() { sw.writeClose(closeCode, closeText) }()
 
 	var (
 		session string
@@ -90,10 +95,29 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 			if session != "" {
 				continue
 			}
+			// The sink runs on the hub's read loop, so the agent's first
+			// prompt can reach it before this goroutine has sent "opened" -
+			// which the viewer reads as output from a session it has not been
+			// told about yet. Anything the sink produces before the marker is
+			// queued and flushed straight after it, in order.
+			var (
+				openMu sync.Mutex
+				opened bool
+				queued []any
+			)
+			emit := func(v any) {
+				openMu.Lock()
+				defer openMu.Unlock()
+				if !opened {
+					queued = append(queued, v)
+					return
+				}
+				send(v)
+			}
 			id, c, err := s.hub.Stream(agentID, protocol.ReqShellOpen, protocol.ShellOpen{Shell: msg.Shell, Cols: msg.Cols, Rows: msg.Rows}, func(env protocol.Envelope) {
 				if env.Err != "" {
-					send(map[string]any{"t": "error", "message": env.Err})
-					send(map[string]any{"t": "closed"})
+					emit(map[string]any{"t": "error", "message": env.Err})
+					emit(map[string]any{"t": "closed"})
 					return
 				}
 				var chunk protocol.ShellChunk
@@ -101,17 +125,25 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if chunk.EOF || env.T == protocol.TypeReply {
-					send(map[string]any{"t": "closed"})
+					emit(map[string]any{"t": "closed"})
 					return
 				}
-				send(map[string]any{"t": "out", "data": chunk.Data})
+				emit(map[string]any{"t": "out", "data": chunk.Data})
 			})
 			if err != nil {
 				send(map[string]any{"t": "error", "message": err.Error()})
+				closeCode, closeText = websocket.CloseInternalServerErr, "shell could not be opened: "+err.Error()
 				return
 			}
 			session, cancel = id, c
+			openMu.Lock()
 			send(map[string]any{"t": "opened", "session": id})
+			opened = true
+			for _, v := range queued {
+				send(v)
+			}
+			queued = nil
+			openMu.Unlock()
 		case "in":
 			if session != "" {
 				s.hub.Notify(agentID, protocol.ReqShellInput, protocol.ShellInput{Session: session, Data: msg.Data})
@@ -121,6 +153,7 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 				s.hub.Notify(agentID, protocol.ReqShellResize, protocol.ShellResize{Session: session, Cols: msg.Cols, Rows: msg.Rows})
 			}
 		case "close":
+			closeText = "session closed"
 			return
 		}
 	}
@@ -144,6 +177,40 @@ type desktopSession struct {
 	viewer  *websocket.Conn
 	helper  chan *websocket.Conn
 	created time.Time
+	// mu guards done. done is set by the viewer handler on its way out: a
+	// helper that connects after that is closed at once instead of being
+	// parked in the buffered channel forever, still capturing the screen and
+	// streaming into a socket nobody owns.
+	mu   sync.Mutex
+	done bool
+}
+
+// finish marks the session dead and closes a helper that is already waiting.
+func (ds *desktopSession) finish() {
+	ds.mu.Lock()
+	ds.done = true
+	ds.mu.Unlock()
+	select {
+	case h := <-ds.helper:
+		h.Close()
+	default:
+	}
+}
+
+// offerHelper hands the helper socket to the waiting viewer. It reports false
+// when nobody will ever read it, in which case the caller closes it.
+func (ds *desktopSession) offerHelper(c *websocket.Conn) bool {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	if ds.done {
+		return false
+	}
+	select {
+	case ds.helper <- c:
+		return true
+	default:
+		return false
+	}
 }
 
 func newDesktopBroker() *desktopBroker { return &desktopBroker{pending: map[string]*desktopSession{}} }
@@ -163,12 +230,90 @@ func (w *wsWriter) write(mt int, data []byte) error {
 	return w.c.WriteMessage(mt, data)
 }
 
+// writeClose sends a Close control frame. gorilla/websocket documents Close
+// and WriteControl as safe to call concurrently with the other write methods,
+// so this deliberately does not take w.mu: the pump that is closing must not
+// wait behind a peer write that is stuck on its 15 s deadline.
+//
+// A close frame's payload is capped at 125 bytes (2 of them the code), so the
+// reason is trimmed rather than silently failing the whole frame.
+func (w *wsWriter) writeClose(code int, reason string) {
+	w.c.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, closeReason(reason)), time.Now().Add(2*time.Second))
+}
+
+func closeReason(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	for len(s) > 120 {
+		_, n := utf8.DecodeLastRuneInString(s)
+		s = s[:len(s)-n]
+	}
+	return s
+}
+
+// closeCodeFor turns a read error into the code the OTHER side should be told.
+// A peer that hung up without a close frame (1006, or a bare I/O error) is not
+// a finished session: reporting both as 1000 leaves the viewer unable to tell
+// "the operator closed the tab" from "the helper crashed", which is the whole
+// complaint 1006 raised in the first place.
+func closeCodeFor(err error, who string) (int, string) {
+	var ce *websocket.CloseError
+	if errors.As(err, &ce) {
+		switch ce.Code {
+		case websocket.CloseAbnormalClosure:
+			// no close frame arrived; fall through to the died case
+		case websocket.CloseNoStatusReceived:
+			return websocket.CloseNormalClosure, "" // a close frame, just no code
+		default:
+			return ce.Code, ce.Text // a real close: forward it verbatim
+		}
+	}
+	return websocket.CloseInternalServerErr, who + " disconnected without closing the session"
+}
+
 func (w *wsWriter) json(v any) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
 	return w.write(websocket.TextMessage, b)
+}
+
+// wsFrame is one message read from a socket.
+type wsFrame struct {
+	mt   int
+	data []byte
+}
+
+// framePump reads a socket from the moment it is upgraded. After a hijack
+// net/http stops reading the connection and only cancels the request context
+// once the handler returns, so r.Context() can never tell a handler that its
+// own viewer went away; a pump can. Frames are queued rather than dropped so
+// nothing sent before the bridge starts is lost.
+type framePump struct {
+	frames chan wsFrame
+	done   chan struct{} // closed when the socket ends
+	stop   chan struct{} // closed by the consumer to release the pump
+	err    error         // read error, valid once done is closed
+}
+
+func pumpFrames(c *websocket.Conn) *framePump {
+	p := &framePump{frames: make(chan wsFrame, 32), done: make(chan struct{}), stop: make(chan struct{})}
+	go func() {
+		defer close(p.done)
+		for {
+			mt, data, err := c.ReadMessage()
+			if err != nil {
+				p.err = err
+				return
+			}
+			select {
+			case p.frames <- wsFrame{mt, data}:
+			case <-p.stop:
+				return
+			}
+		}
+	}()
+	return p
 }
 
 func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
@@ -188,6 +333,26 @@ func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 	defer viewer.Close()
 	viewer.SetReadLimit(1 << 20)
 	vw := &wsWriter{c: viewer}
+	// Read the viewer from the moment it is upgraded. The waits below need to
+	// know when the viewer goes away, and r.Context() cannot tell them: after
+	// the hijack it is only cancelled once this handler returns.
+	vp := pumpFrames(viewer)
+	defer close(vp.stop)
+
+	// Every way out of this handler before the bridge starts is a failure the
+	// operator hit for a reason - no graphical session, a helper that crashed
+	// on launch, a locked desktop - and each used to drop the socket without a
+	// close frame, so the browser reported 1006 and the viewer's error text was
+	// suppressed as "not clean". The JSON {"t":"error"} above says what went
+	// wrong; this says the session is over and that it was not a network fault.
+	// Registered after defer viewer.Close(), so it runs before it.
+	bridged := false
+	closeCode, closeText := websocket.CloseInternalServerErr, "desktop session could not be started"
+	defer func() {
+		if !bridged {
+			vw.writeClose(closeCode, closeText)
+		}
+	}()
 
 	token := randomToken(24)
 	ds := &desktopSession{agentID: agentID, viewer: viewer, helper: make(chan *websocket.Conn, 1), created: time.Now()}
@@ -198,13 +363,17 @@ func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 		s.desktops.mu.Lock()
 		delete(s.desktops.pending, token)
 		s.desktops.mu.Unlock()
+		// ... and mark the session dead, so a helper that connects in the gap
+		// between this handler giving up and the token being forgotten is
+		// closed rather than parked in the channel with nobody to read it.
+		ds.finish()
 	}()
 	s.audit(r, "desktop.open", agentID, nil)
 
 	quality := int(queryInt(r, "quality", 60))
 	startErr := make(chan error, 1)
 	go func() {
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		var res protocol.DesktopStartResult
 		err := s.hub.Request(ctx, agentID, protocol.ReqDesktopStart, protocol.DesktopStart{Token: token, Quality: quality}, &res)
@@ -224,25 +393,33 @@ func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 	case helper = <-ds.helper:
 	case err := <-startErr:
 		if err != nil {
+			closeText = "desktop start failed: " + err.Error()
 			return
 		}
 		select {
 		case helper = <-ds.helper:
 		case <-time.After(30 * time.Second):
-			vw.json(map[string]string{"t": "error", "message": "desktop helper did not connect within 30 seconds"})
+			const msg = "desktop helper did not connect within 30 seconds"
+			vw.json(map[string]string{"t": "error", "message": msg})
+			closeText = msg
 			return
-		case <-r.Context().Done():
+		case <-vp.done:
+			closeCode, closeText = websocket.CloseGoingAway, "the viewer went away"
 			return
 		}
 	case <-time.After(45 * time.Second):
-		vw.json(map[string]string{"t": "error", "message": "desktop helper did not connect within 45 seconds"})
+		const msg = "desktop helper did not connect within 45 seconds"
+		vw.json(map[string]string{"t": "error", "message": msg})
+		closeText = msg
 		return
-	case <-r.Context().Done():
+	case <-vp.done:
+		closeCode, closeText = websocket.CloseGoingAway, "the viewer went away"
 		return
 	}
 	defer helper.Close()
 	vw.json(map[string]string{"t": "connected"})
-	bridge(viewer, vw, helper, &wsWriter{c: helper})
+	bridged = true // bridge() writes the close frame from here on
+	bridge(vp, viewer, vw, helper, &wsWriter{c: helper})
 }
 
 // handleDesktopAgentWS is where the helper process connects. Its token is the
@@ -264,36 +441,68 @@ func (s *Server) handleDesktopAgentWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	helper.SetReadLimit(32 << 20)
-	select {
-	case ds.helper <- helper:
-	default:
+	if !ds.offerHelper(helper) {
 		helper.Close()
 		return
 	}
-	// keep the handler alive until the bridge closes the socket
-	<-r.Context().Done()
+	// Return at once and let the bridge own the socket. Waiting on
+	// r.Context() here waited for this handler itself: after the hijack
+	// net/http only cancels the context once ServeHTTP returns, so every
+	// desktop session used to leak this goroutine and the hijacked
+	// connection's buffers for the lifetime of the process.
 }
 
-// bridge pumps frames both ways until either side closes.
-func bridge(a *websocket.Conn, aw *wsWriter, b *websocket.Conn, bw *wsWriter) {
+// bridge pumps frames both ways until either side closes. viewer/helper name
+// the two ends so the survivor is told which of them went away. The viewer
+// side is already being read by vp, started when the socket was upgraded, so
+// its frames come from that queue rather than from a second reader.
+func bridge(vp *framePump, viewer *websocket.Conn, vw *wsWriter, helper *websocket.Conn, hw *wsWriter) {
 	done := make(chan struct{}, 2)
-	pump := func(src *websocket.Conn, dst *wsWriter) {
+	go func() {
 		defer func() { done <- struct{}{} }()
 		for {
-			mt, data, err := src.ReadMessage()
+			select {
+			case f := <-vp.frames:
+				if err := hw.write(f.mt, f.data); err != nil {
+					return
+				}
+			case <-vp.done:
+				// deliver what was already read, then say why we are going
+				for {
+					select {
+					case f := <-vp.frames:
+						if err := hw.write(f.mt, f.data); err != nil {
+							return
+						}
+					default:
+						// Tell the surviving side why it is going away,
+						// forwarding the peer's close code when there was one.
+						// Without this the other end only sees the TCP close
+						// and reports 1006 (abnormal), which the browser
+						// viewer cannot tell from a network fault.
+						hw.writeClose(closeCodeFor(vp.err, "the viewer"))
+						return
+					}
+				}
+			}
+		}
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for {
+			mt, data, err := helper.ReadMessage()
 			if err != nil {
+				vw.writeClose(closeCodeFor(err, "the desktop helper"))
 				return
 			}
-			if err := dst.write(mt, data); err != nil {
+			if err := vw.write(mt, data); err != nil {
 				return
 			}
 		}
-	}
-	go pump(a, bw)
-	go pump(b, aw)
+	}()
 	<-done
-	a.Close()
-	b.Close()
+	viewer.Close()
+	helper.Close()
 	<-done
 	slog.Debug("desktop bridge closed")
 }

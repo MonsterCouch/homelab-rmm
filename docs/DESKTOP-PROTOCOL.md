@@ -46,7 +46,7 @@ scales from its canvas size to `screen.w`/`screen.h`).
 |---|---|
 | `{"t":"mousemove","x":..,"y":..}` | absolute move |
 | `{"t":"mousedown","button":0,"x":..,"y":..}` / `{"t":"mouseup",...}` | button 0 left, 1 middle, 2 right |
-| `{"t":"wheel","dx":0,"dy":120,"x":..,"y":..}` | `dy` > 0 scrolls down; units are browser `deltaY` pixels (~100 per notch). The helper converts to one wheel notch per 100. |
+| `{"t":"wheel","dx":0,"dy":120,"x":..,"y":..}` | `dy` > 0 scrolls down; units are browser `deltaY` pixels. 100 units = one notch, and the helper rounds any single event between 40 and 200 units (either sign, each axis on its own) to exactly one notch — browsers disagree about a notch (Chrome on Windows sends 120, Chrome on Linux 100 or 53), and rounding is what stops every fifth 120 px notch from scrolling twice. Smaller deltas are trackpad scrolling and accumulate until they reach 100; a rounded notch discards whatever remainder was pending. For `deltaMode` 1 (line) and 2 (page) the viewer converts to whole notches × 100 before sending. |
 | `{"t":"keydown","code":"KeyA","key":"a","ctrl":false,"alt":false,"shift":false,"meta":false}` / `{"t":"keyup",...}` | `code` is the W3C physical key code (`KeyA`, `Digit1`, `Enter`, `ControlLeft`, `F5`, `ArrowUp`, `Numpad1`, ...). The helper maps `code` to a virtual key / X keysym; when the code is unknown it falls back to `key` for printable characters. |
 | `{"t":"paste","text":"..."}` | type the text into the remote session (used for clipboard paste). |
 | `{"t":"monitor","index":1}` | switch to another monitor; the helper answers with a new `screen` message and a full frame. |
@@ -58,17 +58,48 @@ scales from its canvas size to `screen.w`/`screen.h`).
 ## Helper launch
 
 - **Windows**: the agent runs as a service in session 0, which cannot see the user's desktop. It
-  finds the console session (`WTSGetActiveConsoleSessionId`), gets that session's user token
-  (`WTSQueryUserToken`) — or, when nobody is logged in, duplicates its own SYSTEM token and sets
-  `TokenSessionId` so the logon screen can be captured — then `CreateProcessAsUser` with
-  `lpDesktop = "winsta0\default"` runs `rmm-agent.exe desktop-helper --server ... --token ...`.
+  finds the console session (`WTSGetActiveConsoleSessionId`), duplicates its own SYSTEM token and
+  sets `TokenSessionId` to that session, then `CreateProcessAsUser` with
+  `lpDesktop = "winsta0\default"` runs `rmm-agent.exe desktop-helper --server ... --fingerprint ...`.
   The helper captures with GDI (`BitBlt` via `kbinani/screenshot`) and injects input with
-  `SendInput`. UAC prompts and the lock screen live on the secure desktop (`winlogon`) and are
-  only visible when the helper runs as SYSTEM; that is why the SYSTEM-token path is used when
-  no user token is available.
+  `SendInput`. It runs as SYSTEM on purpose: UAC prompts, the lock screen and Ctrl+Alt+Del live on
+  the secure desktop (`winlogon`), whose DACL admits LocalSystem alone, and `WTSQueryUserToken`
+  hands back an administrator's UAC-*filtered* token, which UIPI stops from clicking anything
+  elevated. When the agent itself is not LocalSystem there is no SYSTEM token to move, and the
+  helper falls back to the console user's token — the linked, elevated one when UAC filtered it —
+  with a `note` saying the lock screen will not be visible. A helper that cannot follow the input
+  desktop ends the session with `{"t":"error"}` rather than streaming a frozen picture of the old
+  one.
 - **Linux**: the agent finds the active graphical session with `loginctl` (Type=x11), takes its
   `DISPLAY`, `XAUTHORITY` and user, and runs the helper as that user (`SysProcAttr.Credential`).
   Capture uses XShm/XGetImage through `kbinani/screenshot`; input uses the XTEST extension via
-  `jezek/xgb`. Wayland sessions are reported as unsupported in the `note`.
+  `jezek/xgb`. An active X11 session owned by a user wins; the display manager's greeter
+  (`Class=greeter`) is used only when there is nothing else, and the `note` then says no user is
+  logged in. Wayland sessions are reported as unsupported in the `note` — a Wayland *greeter* is
+  reported as "no user is logged in" instead, because that is the more useful half of the truth.
+- **Linux without logind** (no systemd, a hand-started X server, a kiosk box, Xvfb) — three
+  optional keys in the agent config, `agent.json` in `$RMM_AGENT_DIR` or `/etc/homelab-rmm`, are
+  consulted **before** `loginctl` and skip it entirely when any of them is set:
+
+  | key | meaning |
+  |---|---|
+  | `desktop_display` | the X display to attach to, e.g. `":0"`. Defaults to the display of a running process owned by `desktop_user`, else `":0"`. |
+  | `desktop_user` | the account to run the helper as: a name or a numeric uid. Defaults to the account the agent itself runs as, which is what a root-started X server needs. |
+  | `desktop_xauthority` | path to the X cookie file. Must exist when set; defaults to `$HOME/.Xauthority`, then `/run/user/<uid>/gdm/Xauthority`. |
+
+  ```json
+  { "server_url": "https://rmm.example:8443", "desktop_display": ":0", "desktop_user": "alice" }
+  ```
+
+  Keys that name an account or a cookie file that does not exist are logged at WARN and `loginctl`
+  is tried after all. With neither the keys nor a usable `loginctl` the start fails with
+  `cannot find the graphical session (<loginctl error>); set desktop_display and desktop_user in
+  agent.json (<path>)` instead of a raw `loginctl` error.
 - When the agent is already running interactively (developer mode, `rmm-agent run` from a
   terminal with a display), the helper runs in-process instead of spawning.
+- **The one-time bridge token is passed in the environment**, as `RMM_DESKTOP_TOKEN`, on both
+  platforms: `/proc/<pid>/cmdline` is world-readable on Linux and any local account can read a
+  command line on Windows, so an argument would hand a live session token to every local user.
+  `--token` is still accepted and takes precedence, as a developer override for running
+  `rmm-agent desktop-helper` by hand; the helper drops the variable from its own environment as
+  soon as it has read it, so nothing it starts inherits the token.

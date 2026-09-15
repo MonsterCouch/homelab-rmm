@@ -6,6 +6,7 @@ interface AuthCtx {
   /** undefined while the initial /api/auth/state request is in flight */
   user: User | null | undefined;
   needsSetup: boolean;
+  setupCodeRequired: boolean;
   version: string;
   refresh: () => Promise<void>;
   setUser: (u: User | null) => void;
@@ -19,12 +20,14 @@ const Ctx = createContext<AuthCtx | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null | undefined>(undefined);
   const [needsSetup, setNeedsSetup] = useState(false);
+  const [setupCodeRequired, setSetupCodeRequired] = useState(true);
   const [version, setVersion] = useState('');
 
   const refresh = useCallback(async () => {
     try {
       const st = await api.authState();
       setNeedsSetup(st.needs_setup);
+      setSetupCodeRequired(st.setup_code_required ?? true);
       setVersion(st.version);
       setUser(st.user);
     } catch {
@@ -57,6 +60,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     () => ({
       user,
       needsSetup,
+      setupCodeRequired,
       version,
       refresh,
       setUser,
@@ -64,7 +68,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       canWrite: !!user && user.role !== 'viewer',
       isAdmin: !!user && user.role === 'admin',
     }),
-    [user, needsSetup, version, refresh, logout],
+    [user, needsSetup, setupCodeRequired, version, refresh, logout],
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

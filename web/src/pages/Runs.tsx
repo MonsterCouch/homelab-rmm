@@ -14,15 +14,28 @@ const STATUSES = ['all', 'running', 'queued', 'done', 'failed', 'timeout', 'canc
 export function Runs() {
   const [params, setParams] = useSearchParams();
   const agentFilter = params.get('agent') ?? '';
+  // status and task live in the URL so "3 failed" on the dashboard or a task
+  // row is a link, and so a filtered view can be shared or bookmarked.
+  const status = params.get('status') || 'all';
+  const taskFilter = params.get('task') ?? '';
   const openId = params.get('id');
   const runs = useAsync(() => api.runs(agentFilter, 500), [agentFilter]);
   useLiveReload(['run'], runs.reload, { debounceMs: 800 });
   const agents = useAsync(() => api.agents(), []);
-  const [status, setStatus] = useState('all');
+  const tasks = useAsync(() => api.tasks(), []);
   const [q, setQ] = useState('');
   const dq = useDebounced(q);
 
-  const rows = useMemo(() => (runs.data ?? []).filter((r) => (status === 'all' || r.status === status) && textMatch(dq, r.script_name, r.agent_name, r.run_by, r.trigger, r.id)), [runs.data, status, dq]);
+  const rows = useMemo(
+    () =>
+      (runs.data ?? []).filter(
+        (r) =>
+          (status === 'all' || r.status === status) &&
+          (!taskFilter || String(r.task_id ?? '') === taskFilter) &&
+          textMatch(dq, r.script_name, r.agent_name, r.run_by, r.trigger, r.id),
+      ),
+    [runs.data, status, taskFilter, dq],
+  );
 
   const setParam = (k: string, v: string) => {
     const next = new URLSearchParams(params);
@@ -41,7 +54,7 @@ export function Runs() {
       </div>
       <div className="toolbar">
         <input type="search" placeholder="Search script, device, user…" value={q} onChange={(e) => setQ(e.target.value)} style={{ maxWidth: 280 }} aria-label="Search runs" />
-        <select value={status} onChange={(e) => setStatus(e.target.value)} style={{ width: 140 }} aria-label="Status">
+        <select value={status} onChange={(e) => setParam('status', e.target.value === 'all' ? '' : e.target.value)} style={{ width: 140 }} aria-label="Status">
           {STATUSES.map((s) => (
             <option key={s} value={s}>
               {s === 'all' ? 'Any status' : s}
@@ -56,6 +69,19 @@ export function Runs() {
             </option>
           ))}
         </select>
+        <select value={taskFilter} onChange={(e) => setParam('task', e.target.value)} style={{ width: 180 }} aria-label="Task">
+          <option value="">Any task</option>
+          {(tasks.data ?? []).map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.name}
+            </option>
+          ))}
+        </select>
+        {(status !== 'all' || agentFilter || taskFilter) && (
+          <Button variant="ghost" size="sm" onClick={() => setParams(openId ? { id: openId } : {}, { replace: true })}>
+            Clear filters
+          </Button>
+        )}
         <span className="grow" />
         {runs.data && (
           <span className="muted small">
@@ -65,7 +91,7 @@ export function Runs() {
       </div>
       {runs.error && <ErrorBox error={runs.error} onRetry={runs.reload} />}
       <RunsTable rows={runs.data ? rows : undefined} loading={runs.loading} onOpen={(r) => setParam('id', r.id)} emptyTitle={runs.data?.length ? 'No runs match' : 'No runs yet'} />
-      {openId && <RunDrawer runId={openId} onClose={() => setParam('id', '')} onChanged={runs.reload} />}
+      {openId && <RunDrawer runId={openId} onClose={() => setParam('id', '')} onChanged={runs.reload} onOpenRun={(id) => setParam('id', id)} />}
     </>
   );
 }

@@ -16,6 +16,8 @@ export interface User {
 
 export interface AuthState {
   needs_setup: boolean;
+  /** first-run setup from another machine needs the code printed in the server log */
+  setup_code_required?: boolean;
   user: User | null;
   version: string;
 }

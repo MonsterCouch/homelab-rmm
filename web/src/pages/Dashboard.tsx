@@ -1,15 +1,28 @@
+import { useMemo } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
-import { useAsync, useInterval } from '../hooks/useAsync';
+import type { Agent, Task } from '../api/types';
+import { useAsync, useInterval, useLocalState } from '../hooks/useAsync';
 import { useLiveReload } from '../hooks/useEvents';
+import { describeCron } from '../lib/cron';
 import { duration, relTime } from '../lib/format';
-import { Empty, ErrorBox, RunStatusChip, SeverityChip, Skeleton } from '../components/ui';
+import { useAuth } from '../state/auth';
+import { Bar, Button, Chip, Empty, ErrorBox, RunStatusChip, SeverityChip, Skeleton } from '../components/ui';
 
 export function Dashboard() {
   const navigate = useNavigate();
   const d = useAsync(() => api.dashboard(), []);
+  // The fleet list answers most of "what needs me now?" without a new endpoint:
+  // who is offline, which disks are filling, who is behind on patches or agent
+  // version. It is the same call the devices page makes.
+  const agents = useAsync(() => api.agents(), []);
+  const tasks = useAsync(() => api.tasks(), []);
   useLiveReload(['agent_online', 'agent_offline', 'alert', 'run', 'patches', 'inventory', 'hello'], d.reload, { debounceMs: 600 });
+  // Not on 'metrics': that is one event per device every 30 s, and refetching
+  // the whole fleet list that often is a lot of work for a disk gauge.
+  useLiveReload(['agent_online', 'agent_offline', 'inventory', 'patches'], agents.reload, { debounceMs: 5000 });
   useInterval(d.reload, 60_000);
+  useInterval(agents.reload, 120_000);
 
   const data = d.data;
   if (d.error && !data) return <ErrorBox error={d.error} onRetry={d.reload} />;
@@ -32,6 +45,7 @@ export function Dashboard() {
         </div>
       ) : (
         <>
+          <GettingStarted devices={total} />
           <div className="grid cols-4 mb">
             <div className="card stat link" role="link" tabIndex={0} onClick={() => navigate('/devices?online=1')} onKeyDown={(e) => e.key === 'Enter' && navigate('/devices?online=1')}>
               <span className="label">Devices online</span>
@@ -48,7 +62,15 @@ export function Dashboard() {
               <span className={`value ${data.devices_need_patches > 0 ? 'warn' : ''}`}>{data.devices_need_patches}</span>
               <span className="foot">{data.pending_reboot} pending reboot</span>
             </div>
-            <div className="card stat link" role="link" tabIndex={0} onClick={() => navigate('/runs')} onKeyDown={(e) => e.key === 'Enter' && navigate('/runs')}>
+            {/* The failed count is the reason to open this tile, so it carries the
+                filter with it instead of dropping the reader in an unfiltered list. */}
+            <div
+              className="card stat link"
+              role="link"
+              tabIndex={0}
+              onClick={() => navigate(data.runs_failed_24h > 0 ? '/runs?status=failed' : '/runs')}
+              onKeyDown={(e) => e.key === 'Enter' && navigate(data.runs_failed_24h > 0 ? '/runs?status=failed' : '/runs')}
+            >
               <span className="label">Runs (24h)</span>
               <span className="value">{data.runs_24h}</span>
               <span className="foot" style={data.runs_failed_24h > 0 ? { color: 'var(--danger)' } : undefined}>
@@ -85,6 +107,11 @@ export function Dashboard() {
               <div className="card-head">
                 Recent runs
                 <div className="actions">
+                  {data.runs_failed_24h > 0 && (
+                    <Link to="/runs?status=failed" className="small" style={{ color: 'var(--danger)' }}>
+                      {data.runs_failed_24h} failed
+                    </Link>
+                  )}
                   <Link to="/runs" className="small">
                     View all
                   </Link>
@@ -132,6 +159,7 @@ export function Dashboard() {
               </div>
             </div>
           </div>
+          <FleetWidgets agents={agents.data} tasks={tasks.data} />
         </>
       )}
     </>
@@ -151,6 +179,242 @@ function OSRow({ label, n, total, color, onClick }: { label: string; n: number; 
       <span className="bar">
         <i style={{ width: `${pct}%`, background: color }} />
       </span>
+    </div>
+  );
+}
+
+// ---------- second row: what needs attention ----------
+
+interface DiskRow {
+  agent: Agent;
+  mount: string;
+  pct: number;
+}
+
+/**
+ * Widgets derived from the fleet list and the task list. Each one is a
+ * question the dashboard could not answer before (who is offline right now,
+ * which disks are nearly full, how far the fleet is from patched, what runs
+ * next, which agents are behind) and each hides itself when it has nothing to
+ * say, rather than showing an empty box.
+ */
+function FleetWidgets({ agents, tasks }: { agents: Agent[] | undefined; tasks: Task[] | undefined }) {
+  const offline = useMemo(() => (agents ?? []).filter((a) => !a.online).sort((x, y) => y.last_seen - x.last_seen).slice(0, 6), [agents]);
+  const disks = useMemo(() => {
+    const out: DiskRow[] = [];
+    for (const a of agents ?? []) {
+      for (const dk of a.last_metrics?.disks ?? []) out.push({ agent: a, mount: dk.mount, pct: dk.used_pct });
+    }
+    return out.sort((x, y) => y.pct - x.pct).filter((r) => r.pct >= 70).slice(0, 6);
+  }, [agents]);
+  const compliance = useMemo(() => {
+    const list = agents ?? [];
+    const pending = list.reduce((n, a) => n + a.patches_available, 0);
+    return { total: list.length, ok: list.filter((a) => a.patches_available === 0).length, pending };
+  }, [agents]);
+  const next = useMemo(
+    () => (tasks ?? []).filter((t) => t.enabled && t.next_run > 0).sort((x, y) => x.next_run - y.next_run).slice(0, 5),
+    [tasks],
+  );
+  const versions = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const a of agents ?? []) m.set(a.version || 'unknown', (m.get(a.version || 'unknown') ?? 0) + 1);
+    return [...m.entries()].sort((x, y) => y[1] - x[1]);
+  }, [agents]);
+
+  const cards = [
+    offline.length > 0 && (
+      <div className="card" key="offline">
+        <div className="card-head">
+          Offline devices
+          <div className="actions">
+            <Link to="/devices?online=0" className="small">
+              View all
+            </Link>
+          </div>
+        </div>
+        <div className="list">
+          {offline.map((a) => (
+            <div key={a.id} className="list-item">
+              <span className="dot off" />
+              <div className="grow">
+                <div className="title truncate">
+                  <Link to={`/devices/${a.id}`}>{a.display_name}</Link>
+                </div>
+                <div className="sub">last seen {relTime(a.last_seen)}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    ),
+    disks.length > 0 && (
+      <div className="card" key="disks">
+        <div className="card-head">Disks filling up</div>
+        <div className="list">
+          {disks.map((r) => (
+            <div key={`${r.agent.id}|${r.mount}`} className="list-item">
+              <div className="grow">
+                <div className="title truncate">
+                  <Link to={`/devices/${r.agent.id}`}>{r.agent.display_name}</Link> <span className="muted small mono">{r.mount}</span>
+                </div>
+                <Bar value={r.pct} />
+              </div>
+              <span className="mono small">{Math.round(r.pct)}%</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    ),
+    compliance.total > 0 && (
+      <div className="card" key="compliance">
+        <div className="card-head">
+          Patch compliance
+          <div className="actions">
+            <Link to="/patches" className="small">
+              Patches
+            </Link>
+          </div>
+        </div>
+        <div className="card-body stack">
+          <div className="row between">
+            <span>Fully patched</span>
+            <span className="muted small">
+              {compliance.ok} / {compliance.total}
+            </span>
+          </div>
+          <Bar value={(compliance.ok / compliance.total) * 100} warn={101} danger={101} />
+          <dl className="kv">
+            <dt>Updates pending</dt>
+            <dd>{compliance.pending}</dd>
+            <dt>Devices with updates</dt>
+            <dd>{compliance.total - compliance.ok}</dd>
+          </dl>
+        </div>
+      </div>
+    ),
+    next.length > 0 && (
+      <div className="card" key="next">
+        <div className="card-head">
+          Next scheduled
+          <div className="actions">
+            <Link to="/tasks" className="small">
+              Tasks
+            </Link>
+          </div>
+        </div>
+        <div className="list">
+          {next.map((t) => (
+            <div key={t.id} className="list-item">
+              <div className="grow">
+                <div className="title truncate">{t.name}</div>
+                <div className="sub">{describeCron(t.schedule)}</div>
+              </div>
+              <span className="muted small nowrap">{relTime(t.next_run)}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    ),
+    versions.length > 1 && (
+      <div className="card" key="versions">
+        <div className="card-head">Agent versions</div>
+        <div className="list">
+          {versions.map(([v, n]) => (
+            <div key={v} className="list-item">
+              <Chip outline>{v}</Chip>
+              <span className="grow" />
+              <span className="muted small">{n} device{n === 1 ? '' : 's'}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    ),
+  ].filter(Boolean);
+
+  if (!cards.length) return null;
+  return (
+    <div className="grid cols-3" style={{ marginTop: 14 }}>
+      {cards}
+    </div>
+  );
+}
+
+// ---------- first-run checklist ----------
+
+interface Step {
+  id: string;
+  label: string;
+  done: boolean;
+  to: string;
+  hint: string;
+}
+
+/**
+ * What decides whether this install is actually useful, in order: a device, a
+ * public URL that is not loopback (every install one-liner embeds it), mail so
+ * alerts leave the box, 2FA on the account that can do anything, and a patch
+ * policy. Each item is driven by real state, so it ticks itself.
+ */
+function GettingStarted({ devices }: { devices: number }) {
+  const { user, isAdmin, canWrite } = useAuth();
+  const [dismissed, setDismissed] = useLocalState(`rmm.gettingStarted.${user?.id ?? 0}`, false);
+  const system = useAsync(() => api.system(), [], { enabled: canWrite && !dismissed });
+  const policies = useAsync(() => api.patchPolicies(), [], { enabled: canWrite && !dismissed });
+  // Mail settings are admin-only; a tech gets the rest of the list.
+  const settings = useAsync(() => api.settings(), [], { enabled: isAdmin && !dismissed });
+
+  if (!canWrite || dismissed) return null;
+
+  const url = system.data?.public_url ?? '';
+  const loopback = /\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/i.test(url);
+  const steps: Step[] = [
+    { id: 'device', label: 'Enrol a device', done: devices > 0, to: '/devices?enroll=1', hint: 'The install one-liner is in the enrol drawer.' },
+    {
+      id: 'url',
+      label: 'Set the public URL agents dial',
+      done: !!url && !loopback,
+      to: '/settings',
+      hint: loopback ? `Currently ${url} — only this machine can reach that.` : 'Agents connect to this address, and it is baked into every install command.',
+    },
+    ...(isAdmin ? [{ id: 'smtp', label: 'Send alert email', done: !!settings.data?.smtp.enabled, to: '/settings', hint: 'Without SMTP an alert only exists in this console.' }] : []),
+    { id: 'totp', label: 'Turn on two-factor for your account', done: !!user?.totp_enabled, to: '/account', hint: 'This console can run code as SYSTEM on every device.' },
+    { id: 'patch', label: 'Schedule patch scans', done: (policies.data ?? []).some((p) => p.enabled), to: '/patches?tab=policies', hint: 'A policy scans its targets on a schedule.' },
+  ];
+  const left = steps.filter((s) => !s.done);
+  if (!left.length) return null;
+
+  return (
+    <div className="card mb checklist">
+      <div className="card-head">
+        Getting started
+        <span className="muted small">
+          {steps.length - left.length} of {steps.length} done
+        </span>
+        <div className="actions">
+          <Button size="xs" variant="ghost" onClick={() => setDismissed(true)}>
+            Dismiss
+          </Button>
+        </div>
+      </div>
+      <div className="list">
+        {steps.map((s) => (
+          <div key={s.id} className="list-item">
+            <span className={`tick ${s.done ? 'done' : ''}`}>{s.done ? '✓' : ''}</span>
+            <div className="grow">
+              <div className="title">
+                {s.done ? s.label : <Link to={s.to}>{s.label}</Link>}
+              </div>
+              {!s.done && <div className="sub">{s.hint}</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="tbl-foot">
+        <span>
+          A starter library is already here: seeded scripts on <Link to="/scripts">Scripts</Link>, alert rules on <Link to="/alerts?tab=rules">Alerts</Link>.
+        </span>
+      </div>
     </div>
   );
 }

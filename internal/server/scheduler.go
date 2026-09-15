@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -23,7 +22,18 @@ type scheduler struct {
 	mu   sync.Mutex
 	cron *cron.Cron
 	ctx  context.Context
+	// autoLimit caps how often one automation may fire. Automations can feed
+	// each other (alert_opened -> run_script -> failure -> script_failed
+	// alert -> alert_opened), and nothing else in the chain refuses to
+	// re-enter: without a ceiling the loop runs as fast as the device can
+	// execute the script, one run row, one alert row and one email per turn.
+	autoLimit *rateLimiter
 }
+
+// maxAutomationFiresPerMinute is deliberately generous for a home lab: a fleet
+// of twenty devices coming online at once is normal, a hundred fires a minute
+// from one automation is not.
+const maxAutomationFiresPerMinute = 60
 
 var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
 
@@ -33,13 +43,13 @@ func validateCron(expr string) error {
 }
 
 func newScheduler(s *Server) *scheduler {
-	return &scheduler{s: s, ctx: context.Background()}
+	return &scheduler{s: s, ctx: context.Background(), autoLimit: newRateLimiter(maxAutomationFiresPerMinute, time.Minute)}
 }
 
 func (sc *scheduler) start(ctx context.Context) {
 	sc.ctx = ctx
 	sc.reload()
-	go func() {
+	sc.s.goJob(func() {
 		t := time.NewTicker(time.Hour)
 		defer t.Stop()
 		sc.purge()
@@ -56,7 +66,7 @@ func (sc *scheduler) start(ctx context.Context) {
 				sc.purge()
 			}
 		}
-	}()
+	})
 }
 
 // reload rebuilds the cron table from the tasks and patch policies tables.
@@ -250,7 +260,13 @@ func (sc *scheduler) automation(trigger, agentID string, data map[string]any) {
 				continue
 			}
 		}
-		go sc.runAutomation(&a, agentID, agent, data)
+		if !sc.autoLimit.allow(fmt.Sprintf("automation:%d", a.ID)) {
+			slog.Warn("automation rate limit hit; skipping this fire (check for a loop: an alert_opened -> run_script automation whose script fails re-opens the alert)",
+				"automation", a.Name, "trigger", trigger, "limit_per_minute", maxAutomationFiresPerMinute)
+			continue
+		}
+		auto := a
+		sc.s.goJob(func() { sc.runAutomation(&auto, agentID, agent, data) })
 	}
 }
 
@@ -316,14 +332,30 @@ func (sc *scheduler) purge() {
 	ret.MetricsDays, ret.RunsDays, ret.AuditDays, ret.EventsDays = 30, 90, 365, 30
 	sc.s.db.SettingJSON("retention", &ret)
 	day := int64(86400)
-	sc.s.db.Exec(`DELETE FROM metrics WHERE ts < ?`, now()-int64(ret.MetricsDays)*day)
+	// The two big append-only tables are deleted in bounded time slices so a
+	// single statement never holds the one SQLite connection for long.
+	sc.s.db.purgeByTS("metrics", "ts", now()-int64(ret.MetricsDays)*day)
+	sc.s.db.purgeByTS("agent_events", "ts", now()-int64(ret.EventsDays)*day)
 	sc.s.db.Exec(`DELETE FROM script_runs WHERE started_at < ? AND status NOT IN ('running','queued')`, now()-int64(ret.RunsDays)*day)
 	sc.s.db.Exec(`DELETE FROM audit WHERE ts < ?`, now()-int64(ret.AuditDays)*day)
-	sc.s.db.Exec(`DELETE FROM agent_events WHERE ts < ?`, now()-int64(ret.EventsDays)*day)
+	// Alerts whose kind has no auto-resolve path (a failed run, a failed
+	// patch, a log line) are resolved once they are long stale, so they stop
+	// being counted forever by the per-device open-alert count and can then
+	// age out with every other resolved alert.
+	if res, err := sc.s.db.Exec(`UPDATE alerts SET status='resolved', resolved_at=?
+		WHERE status != 'resolved' AND opened_at < ? AND rule_kind IN ('script_failed','patch_failed','event')`,
+		now(), now()-int64(staleAlertDays)*day); err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			slog.Info("resolved stale alerts", "count", n, "older_than_days", staleAlertDays)
+		}
+	}
 	sc.s.db.Exec(`DELETE FROM alerts WHERE status = 'resolved' AND resolved_at < ?`, now()-int64(ret.AuditDays)*day)
 	sc.s.db.Exec(`DELETE FROM enroll_tokens WHERE expires_at < ?`, now()-day)
 	sc.s.db.purgeSessions()
 	// runs stuck in 'running' after a server restart can never finish
 	sc.s.db.Exec(`UPDATE script_runs SET status='failed', stderr='server restarted while the script was running', finished_at=? WHERE status='running' AND started_at < ?`, now(), now()-6*3600)
-	_ = strings.TrimSpace
 }
+
+// staleAlertDays is how long an alert of a kind that nothing auto-resolves
+// may stay open before purge closes it.
+const staleAlertDays = 30

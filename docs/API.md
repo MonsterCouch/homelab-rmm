@@ -9,15 +9,40 @@ Go structs in the same package (`Agent`, `Script`, `Run`, `Task`, `Automation`, 
 ## Authentication
 
 - Cookie session (`rmm_session`, HttpOnly, SameSite=Strict).
-- Every non-GET request **must** send the header `X-Requested-With: fetch` (CSRF guard) or it is
-  rejected with 403.
-- `GET /api/auth/state` → `{needs_setup, user, version}`. When `needs_setup` is true the UI shows
-  the first-run form and calls `POST /api/auth/setup {username,password,email}`.
+- Every non-GET request **must** carry an `X-Requested-With` header or it is rejected with 403.
+  Only its **presence** is checked, never its value — the point is that a cross-site form or a
+  CORS "simple request" cannot set a custom header at all, so `XMLHttpRequest` works as well as
+  the `fetch` the console sends. That includes `/api/auth/setup`, `/api/auth/login` and
+  `/api/auth/logout`, which sit outside the session middleware and carry their own copy of the
+  check (`authGuard`): they also require the `Origin` host (when present) to match `Host`, and
+  refuse a body whose `Content-Type` is not `application/json` (415). WebSocket upgrades are
+  exempt from the header (a browser cannot set one on a WebSocket) and are guarded by the
+  same-origin check instead.
+- `GET /api/auth/state` → `{needs_setup, setup_code_required, user, version}`. When
+  `needs_setup` is true the UI shows the first-run form and calls
+  `POST /api/auth/setup {username,password,email,code}` → `{ok:true}` plus the session cookie.
+  `setup_code_required` is true whenever setup still has to happen — there is no exemption for
+  any source address, loopback included. The server prints a one-time setup code at startup while
+  it has no users (console and `server.log`) and every setup request must send it as `code`. 403
+  on a wrong code, 403 once a user exists, 429 when rate-limited (the setup endpoint shares the
+  login limiter). Concurrent requests are serialised, so exactly one of them creates the
+  administrator.
 - `POST /api/auth/login {username,password,code}` → `{ok,user}` or `{needs_totp:true}` (re-post
   with the 6-digit `code`). 401 on bad credentials, 429 when rate-limited.
 - `POST /api/auth/logout`.
+- `POST /api/me/password {current,new}` changes your own password and **deletes your other
+  sessions**; the calling session survives.
 - Roles: `admin` (everything), `tech` (everything except users/settings), `viewer` (read-only:
-  every POST/PUT/PATCH/DELETE returns 403).
+  every POST/PUT/PATCH/DELETE returns 403, and so do the GETs that are not really reads —
+  `/ws/shell/{id}`, `/ws/desktop/{id}`, `/api/agents/{id}/fs/download` and `GET /api/enroll`,
+  whose body carries the enrolment token values).
+- The client address used by the rate limiter and the audit log is the peer address.
+  `X-Forwarded-For` is honoured only when the peer is inside a network given to
+  `--trusted-proxies` / `RMM_TRUSTED_PROXIES`, and then the list is read from the **right**,
+  skipping hops that are themselves trusted proxies — the proxies this project ships configs for
+  append to the header rather than replacing it, so the left-most hop is the client's own text.
+- Every response carries `Content-Security-Policy: default-src 'self'` (script-src `'self'`, no
+  inline script), `X-Content-Type-Options`, `X-Frame-Options: DENY` and `Referrer-Policy`.
 - Errors are `{"error": "message"}` with a 4xx/5xx status.
 
 ## Live updates
@@ -48,7 +73,9 @@ See `routes()` in `internal/server/api.go`. Highlights:
   `{"t":"out","data"}`, `{"t":"closed"}`, `{"t":"error","message"}`.
 - Remote desktop: WebSocket `/ws/desktop/{id}?quality=60` — see `docs/DESKTOP-PROTOCOL.md`.
 - Groups `/api/groups`, enrolment `/api/enroll` (POST returns `{token, windows, linux}` install
-  commands; GET returns `{tokens, public_url, fingerprint}`).
+  commands; GET returns `{tokens, public_url, fingerprint}`). `GET /install/{token}?os=windows|linux&arch=`
+  renders the install script and is unauthenticated, but only for a token that could still enrol
+  (404 otherwise) and an `arch` of `amd64|arm64|arm|386` (400 otherwise).
 - Scripts `/api/scripts`, `POST /api/scripts/run {script_id|language+body, args, targets|agent_ids}`
   → `{runs: {agentId: runId|"error: ..."}}`, runs `/api/runs?agent=&limit=`, `/api/runs/{id}`
   (includes stdout/stderr, live while running), `POST /api/runs/{id}/cancel`.
@@ -58,6 +85,9 @@ See `routes()` in `internal/server/api.go`. Highlights:
 - Automations `/api/automations` (`trigger`: agent_online|agent_offline|alert_opened|alert_resolved|
   enrolled|reboot_required|patch_installed; `action`: run_script|email|webhook; `action_params`:
   `{script_id, args}` / `{subject}` / `{url}`; `filter`: `{targets, rule_ids[], severity}`).
+  `agent_online`/`agent_offline` follow the socket with no grace period, so a reconnect flap
+  fires both — use an `offline` alert rule plus `alert_opened` when you want "offline for N
+  minutes". Each automation is capped at 60 fires a minute.
 - Alert rules `/api/alert-rules` (`kind`: cpu|memory|disk|offline|service|reboot_required|
   script_failed|patch_failed|event; `params`: `{threshold, minutes, mount, service, pattern}`),
   alerts `/api/alerts?status=open|acked|resolved|all`, `POST /api/alerts/{id}/ack|resolve`,

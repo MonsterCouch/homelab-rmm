@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -119,6 +120,13 @@ func (d *DB) agentByKey(key string) (string, bool) {
 	return id, true
 }
 
+// unlimitedUses is the only non-positive uses_left that still enrols. Any
+// other value <= 0 is exhausted, so a row an older server drove negative (or a
+// hand-edited one) reads as spent rather than as "unlimited forever".
+const unlimitedUses = -1
+
+func usesExhausted(usesLeft int) bool { return usesLeft != unlimitedUses && usesLeft <= 0 }
+
 // checkEnrollToken reports whether a token could still enrol a device.
 func (d *DB) checkEnrollToken(token string) error {
 	var usesLeft int
@@ -129,54 +137,101 @@ func (d *DB) checkEnrollToken(token string) error {
 	if expires < now() {
 		return errors.New("token expired")
 	}
-	if usesLeft == 0 {
+	if usesExhausted(usesLeft) {
 		return errors.New("token exhausted")
 	}
 	return nil
 }
 
-// enrollAgent consumes an enrolment token and creates the agent record.
-func (d *DB) enrollAgent(token string, hello protocol.Hello, ip string) (id, key string, err error) {
-	var (
-		tid      int64
-		usesLeft int
-		expires  int64
-		gid      sql.NullInt64
-	)
-	err = d.QueryRow(`SELECT id, uses_left, expires_at, group_id FROM enroll_tokens WHERE token = ?`, token).Scan(&tid, &usesLeft, &expires, &gid)
-	if err != nil {
-		return "", "", errors.New("unknown token")
-	}
-	if expires < now() {
-		return "", "", errors.New("token expired")
-	}
-	if usesLeft == 0 {
-		return "", "", errors.New("token exhausted")
-	}
-	// A re-enrolment from the same hostname+os replaces the old record's key
-	// instead of creating a duplicate device (reinstalls are common).
-	var existing string
-	d.QueryRow(`SELECT id FROM agents WHERE hostname = ? AND os = ? AND online = 0`, hello.Hostname, hello.OS).Scan(&existing)
+// enrolResult is what an enrolment did, beyond the identity it issued.
+type enrolResult struct {
+	ID  string
+	Key string
+	// Rekeyed: an existing OFFLINE record with this hostname+os was adopted
+	// and given the new key (a reinstall - or a device claiming another's
+	// hostname, which is why it is audited apart from a fresh enrolment).
+	Rekeyed bool
+	// DuplicateHostname: a record with this hostname+os already existed but
+	// was online, so a second one was created. Same takeover attempt, louder
+	// symptom (two devices with one name in the console).
+	DuplicateHostname bool
+}
 
-	key = randomToken(32)
-	if existing != "" {
-		id = existing
-		if _, err = d.Exec(`UPDATE agents SET key_hash = ?, version = ?, platform = ?, arch = ?, last_ip = ? WHERE id = ?`,
-			hashKey(key), hello.Version, hello.Platform, hello.Arch, ip, id); err != nil {
-			return "", "", err
+// enrollAgent consumes an enrolment token and creates the agent record. The
+// token is consumed with a conditional UPDATE inside the same transaction
+// that creates the device, so concurrent enrolments cannot stretch a
+// single-use token, and uses_left never drops below zero (-1 = unlimited).
+// isOnline reports whether a device has a live socket right now. The
+// agents.online column is a convenience that a restart or a replaced socket
+// can leave stale, and a stale 0 widens the window in which another machine
+// claiming the same hostname takes over the record.
+func (d *DB) enrollAgent(token string, hello protocol.Hello, ip string, isOnline func(string) bool) (enrolResult, error) {
+	var res enrolResult
+	res.Key = randomToken(32)
+	err := d.withTx(context.Background(), func(tx *sql.Tx) error {
+		var (
+			tid      int64
+			usesLeft int
+			expires  int64
+			gid      sql.NullInt64
+		)
+		if err := tx.QueryRow(`SELECT id, uses_left, expires_at, group_id FROM enroll_tokens WHERE token = ?`, token).Scan(&tid, &usesLeft, &expires, &gid); err != nil {
+			return errors.New("unknown token")
 		}
-	} else {
-		id = randomHex(8)
-		_, err = d.Exec(`INSERT INTO agents(id, key_hash, hostname, os, platform, arch, version, group_id, last_ip, enrolled_at, last_seen)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, hashKey(key), hello.Hostname, hello.OS, hello.Platform, hello.Arch, hello.Version, gid, ip, now(), now())
-		if err != nil {
-			return "", "", err
+		if expires < now() {
+			return errors.New("token expired")
 		}
+		if usesExhausted(usesLeft) {
+			return errors.New("token exhausted")
+		}
+		if usesLeft > 0 {
+			r, err := tx.Exec(`UPDATE enroll_tokens SET uses_left = uses_left - 1 WHERE id = ? AND uses_left > 0`, tid)
+			if err != nil {
+				return err
+			}
+			if n, _ := r.RowsAffected(); n != 1 {
+				return errors.New("token exhausted")
+			}
+		}
+		// A re-enrolment from the same hostname+os replaces the old record's
+		// key instead of creating a duplicate device (reinstalls are common).
+		// Liveness comes from the hub, not the column.
+		var candidates []string
+		crows, qerr := tx.Query(`SELECT id FROM agents WHERE hostname = ? AND os = ? ORDER BY online ASC`, hello.Hostname, hello.OS)
+		if qerr == nil {
+			for crows.Next() {
+				var id string
+				crows.Scan(&id)
+				candidates = append(candidates, id)
+			}
+			crows.Close()
+		}
+		var existing string
+		for _, id := range candidates {
+			if isOnline == nil || !isOnline(id) {
+				existing = id
+				break
+			}
+		}
+		if existing != "" {
+			res.ID, res.Rekeyed = existing, true
+			_, err := tx.Exec(`UPDATE agents SET key_hash = ?, version = ?, platform = ?, arch = ?, last_ip = ? WHERE id = ?`,
+				hashKey(res.Key), hello.Version, hello.Platform, hello.Arch, ip, res.ID)
+			return err
+		}
+		// hostname is not unique, so an enrolment that collides with a device
+		// that is currently ONLINE gets its own record. Report it: the record
+		// it failed to adopt is the one it was aiming at.
+		res.DuplicateHostname = len(candidates) > 0
+		res.ID = randomHex(8)
+		_, err := tx.Exec(`INSERT INTO agents(id, key_hash, hostname, os, platform, arch, version, group_id, last_ip, enrolled_at, last_seen)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?)`, res.ID, hashKey(res.Key), hello.Hostname, hello.OS, hello.Platform, hello.Arch, hello.Version, gid, ip, now(), now())
+		return err
+	})
+	if err != nil {
+		return enrolResult{}, err
 	}
-	if usesLeft > 0 {
-		d.Exec(`UPDATE enroll_tokens SET uses_left = uses_left - 1 WHERE id = ?`, tid)
-	}
-	return id, key, nil
+	return res, nil
 }
 
 func (d *DB) markOnline(id string, hello protocol.Hello, ip string, online bool) {
@@ -218,9 +273,21 @@ type MetricRow struct {
 	Procs    int                  `json:"procs"`
 }
 
+// maxMetricPoints caps the buckets one chart may ask for. Without it
+// ?points=100000000 made the bucket 1 second wide and streamed every stored
+// sample for the device - tens of thousands of rows with embedded disks JSON -
+// through the single database connection, blocking everything else.
+const maxMetricPoints = 2000
+
 func (d *DB) MetricsRange(id string, from, to int64, maxPoints int) ([]MetricRow, error) {
 	if maxPoints <= 0 {
 		maxPoints = 600
+	}
+	if maxPoints > maxMetricPoints {
+		maxPoints = maxMetricPoints
+	}
+	if from < 0 {
+		from = 0
 	}
 	// Bucket to at most maxPoints by averaging within buckets; SQLite does the
 	// grouping so a 30-day range does not ship a million rows to the browser.
@@ -232,7 +299,12 @@ func (d *DB) MetricsRange(id string, from, to int64, maxPoints int) ([]MetricRow
 	if bucket < 1 {
 		bucket = 1
 	}
-	rows, err := d.Query(`SELECT (ts / ?) * ?, AVG(cpu), AVG(mem_used), MAX(mem_total), MAX(disks), AVG(net_rx), AVG(net_tx), MAX(uptime), AVG(load1), MAX(procs)
+	// disks and uptime are bare columns beside exactly one max() aggregate,
+	// which SQLite defines as coming from the row that produced that maximum:
+	// the LAST sample in the bucket. MAX(disks) was a lexicographic maximum
+	// over JSON text, so the disk series was an arbitrary sample that
+	// corresponded to no real point in time.
+	rows, err := d.Query(`SELECT (ts / ?) * ?, AVG(cpu), AVG(mem_used), AVG(mem_total), AVG(net_rx), AVG(net_tx), AVG(load1), AVG(procs), MAX(ts), disks, uptime
 		FROM metrics WHERE agent_id = ? AND ts BETWEEN ? AND ? GROUP BY 1 ORDER BY 1`, bucket, bucket, id, from, to)
 	if err != nil {
 		return nil, err
@@ -242,11 +314,12 @@ func (d *DB) MetricsRange(id string, from, to int64, maxPoints int) ([]MetricRow
 	for rows.Next() {
 		var r MetricRow
 		var disks string
-		var mem, rx, tx float64
-		if err := rows.Scan(&r.TS, &r.CPU, &mem, &r.MemTotal, &disks, &rx, &tx, &r.Uptime, &r.Load1, &r.Procs); err != nil {
+		var mem, memTotal, rx, tx, procs float64
+		var lastTS int64
+		if err := rows.Scan(&r.TS, &r.CPU, &mem, &memTotal, &rx, &tx, &r.Load1, &procs, &lastTS, &disks, &r.Uptime); err != nil {
 			return nil, err
 		}
-		r.MemUsed, r.NetRx, r.NetTx = uint64(mem), uint64(rx), uint64(tx)
+		r.MemUsed, r.MemTotal, r.NetRx, r.NetTx, r.Procs = uint64(mem), uint64(memTotal), uint64(rx), uint64(tx), int(procs)
 		json.Unmarshal([]byte(disks), &r.Disks)
 		out = append(out, r)
 	}

@@ -100,6 +100,6 @@ if ($Server) {
         }
         Write-Host "removed agent.json and agent.log from $DataDir"
     } else {
-        Write-Host "kept $DataDir\agent.json (this device's identity; -Purge removes it)"
+        Write-Host "kept $DataDir\agent.json (this device's identity AND its enrolment token, so a reinstall keeps the device's history - and a token still valid there would re-enrol it; -Purge removes it)"
     }
 }

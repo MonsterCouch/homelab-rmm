@@ -24,7 +24,10 @@ rmm.example.lan {
 	encode zstd gzip
 
 	reverse_proxy 127.0.0.1:8080 {
-		# Caddy forwards Host and adds X-Forwarded-For/Proto by default,
+		# Caddy forwards Host and adds X-Forwarded-For/Proto by default.
+		# The server only believes that header when it was started with
+		# --trusted-proxies 127.0.0.1 (otherwise every request is audited
+		# and rate-limited as coming from the proxy itself). Caddy also
 		# upgrades WebSocket connections without extra configuration and
 		# applies no read/write timeout to proxied connections unless one
 		# is configured, so agent sockets and desktop streams stay up.
