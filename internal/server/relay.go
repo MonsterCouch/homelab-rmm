@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -147,6 +148,29 @@ type desktopSession struct {
 
 func newDesktopBroker() *desktopBroker { return &desktopBroker{pending: map[string]*desktopSession{}} }
 
+// wsWriter serialises writes: gorilla/websocket permits one concurrent
+// writer per connection and the desktop path has three (note, connected,
+// bridge pump).
+type wsWriter struct {
+	c  *websocket.Conn
+	mu sync.Mutex
+}
+
+func (w *wsWriter) write(mt int, data []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.c.SetWriteDeadline(time.Now().Add(15 * time.Second))
+	return w.c.WriteMessage(mt, data)
+}
+
+func (w *wsWriter) json(v any) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return w.write(websocket.TextMessage, b)
+}
+
 func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 	agentID := r.PathValue("id")
 	if !sameOrigin(r) {
@@ -163,6 +187,7 @@ func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer viewer.Close()
 	viewer.SetReadLimit(1 << 20)
+	vw := &wsWriter{c: viewer}
 
 	token := randomToken(24)
 	ds := &desktopSession{agentID: agentID, viewer: viewer, helper: make(chan *websocket.Conn, 1), created: time.Now()}
@@ -177,29 +202,47 @@ func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 	s.audit(r, "desktop.open", agentID, nil)
 
 	quality := int(queryInt(r, "quality", 60))
+	startErr := make(chan error, 1)
 	go func() {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
 		var res protocol.DesktopStartResult
-		err := s.hub.Request(r.Context(), agentID, protocol.ReqDesktopStart, protocol.DesktopStart{Token: token, Quality: quality}, &res)
+		err := s.hub.Request(ctx, agentID, protocol.ReqDesktopStart, protocol.DesktopStart{Token: token, Quality: quality}, &res)
 		if err != nil {
-			viewer.WriteMessage(websocket.TextMessage, []byte(`{"t":"error","message":`+jsonText(err.Error())+`}`))
-			viewer.Close()
-		} else if res.Note != "" {
-			viewer.WriteMessage(websocket.TextMessage, []byte(`{"t":"note","message":`+jsonText(res.Note)+`}`))
+			vw.json(map[string]string{"t": "error", "message": err.Error()})
+			startErr <- err
+			return
 		}
+		if res.Note != "" {
+			vw.json(map[string]string{"t": "note", "message": res.Note})
+		}
+		startErr <- nil
 	}()
 
 	var helper *websocket.Conn
 	select {
 	case helper = <-ds.helper:
-	case <-time.After(30 * time.Second):
-		viewer.WriteMessage(websocket.TextMessage, []byte(`{"t":"error","message":"desktop helper did not connect within 30 seconds"}`))
+	case err := <-startErr:
+		if err != nil {
+			return
+		}
+		select {
+		case helper = <-ds.helper:
+		case <-time.After(30 * time.Second):
+			vw.json(map[string]string{"t": "error", "message": "desktop helper did not connect within 30 seconds"})
+			return
+		case <-r.Context().Done():
+			return
+		}
+	case <-time.After(45 * time.Second):
+		vw.json(map[string]string{"t": "error", "message": "desktop helper did not connect within 45 seconds"})
 		return
 	case <-r.Context().Done():
 		return
 	}
 	defer helper.Close()
-	viewer.WriteMessage(websocket.TextMessage, []byte(`{"t":"connected"}`))
-	bridge(viewer, helper)
+	vw.json(map[string]string{"t": "connected"})
+	bridge(viewer, vw, helper, &wsWriter{c: helper})
 }
 
 // handleDesktopAgentWS is where the helper process connects. Its token is the
@@ -208,6 +251,9 @@ func (s *Server) handleDesktopAgentWS(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	s.desktops.mu.Lock()
 	ds := s.desktops.pending[token]
+	if ds != nil {
+		delete(s.desktops.pending, token) // single use
+	}
 	s.desktops.mu.Unlock()
 	if ds == nil {
 		writeErr(w, 401, "unknown desktop session")
@@ -229,27 +275,22 @@ func (s *Server) handleDesktopAgentWS(w http.ResponseWriter, r *http.Request) {
 }
 
 // bridge pumps frames both ways until either side closes.
-func bridge(a, b *websocket.Conn) {
+func bridge(a *websocket.Conn, aw *wsWriter, b *websocket.Conn, bw *wsWriter) {
 	done := make(chan struct{}, 2)
-	pump := func(src, dst *websocket.Conn) {
+	pump := func(src *websocket.Conn, dst *wsWriter) {
 		defer func() { done <- struct{}{} }()
-		var mu sync.Mutex
 		for {
 			mt, data, err := src.ReadMessage()
 			if err != nil {
 				return
 			}
-			mu.Lock()
-			dst.SetWriteDeadline(time.Now().Add(15 * time.Second))
-			err = dst.WriteMessage(mt, data)
-			mu.Unlock()
-			if err != nil {
+			if err := dst.write(mt, data); err != nil {
 				return
 			}
 		}
 	}
-	go pump(a, b)
-	go pump(b, a)
+	go pump(a, bw)
+	go pump(b, aw)
 	<-done
 	a.Close()
 	b.Close()
