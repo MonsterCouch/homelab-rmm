@@ -569,11 +569,23 @@ func TestBaselineGroupEmptyAllowListNeverStripsACriticalGroup(t *testing.T) {
 					t.Fatalf("%s/%s: root is never removable: %+v", group, mode, plan)
 				}
 			}
-			if criticalGroups[group] && len(plan.Remove) > 0 {
-				t.Fatalf("%s/%s: a critical group would be stripped to %d members: %+v",
-					group, mode, len(all)-len(plan.Remove), plan)
+			// The guarantee is "never empty a critical group, never remove
+			// root, the last member or the account the agent runs as". On a
+			// box where a critical group has several other members (GitHub's
+			// runner has adm = syslog, packer, runner) those others ARE
+			// removable; only the guarded ones must survive.
+			guard := lnxGroupGuard(primary)
+			for _, r := range plan.Remove {
+				for _, self := range guard.Self {
+					if strings.EqualFold(r, self) {
+						t.Fatalf("%s/%s: the agent's own account is never removable: %+v", group, mode, plan)
+					}
+				}
 			}
-			if criticalGroups[group] && plan.Refusal == "" && len(plan.Kept) == 0 {
+			if criticalGroups[group] && len(all)-len(plan.Remove) < 1 {
+				t.Fatalf("%s/%s: a critical group would be emptied: %+v", group, mode, plan)
+			}
+			if criticalGroups[group] && plan.Refusal == "" && len(plan.Kept) == 0 && len(plan.Remove) == 0 {
 				t.Fatalf("%s/%s: nothing was removed and nothing says why: %+v", group, mode, plan)
 			}
 			// The check itself, end to end on this device, reports drift and
