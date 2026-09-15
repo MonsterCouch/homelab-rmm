@@ -8,7 +8,14 @@ package desktop
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
+	"net/url"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // Serve runs inside the helper process (or in-process when the agent already
@@ -16,7 +23,58 @@ import (
 // /ws/desktop-agent?token=<token> endpoint, pinning the certificate by
 // fingerprint, and streams until the socket closes or ctx ends.
 func Serve(ctx context.Context, serverURL, token, fingerprint string, quality int) error {
-	return errors.New("remote desktop is not implemented on this platform")
+	if serverURL == "" || token == "" {
+		return errors.New("desktop helper needs --server and --token")
+	}
+	target := wsURL(serverURL, "/ws/desktop-agent?token="+url.QueryEscape(token))
+
+	// Probe the platform before dialling so a machine without a usable
+	// display fails with one clear message, but still tell the viewer
+	// about it: an error over the socket beats a 30 s "did not connect".
+	// The injector comes first on purpose: on X11 it holds the one
+	// persistent connection, and the capture backend's per-call
+	// connections must never be the server's last client (an X server
+	// regenerates when that disconnects and drops whoever connects
+	// meanwhile).
+	var (
+		cap  capturer
+		inj  injector
+		perr error
+	)
+	if perr = platformInit(); perr == nil {
+		if inj, perr = newInjector(); perr == nil {
+			cap = screenCapturer{}
+			if _, perr = cap.monitors(); perr != nil {
+				inj.close()
+				inj = nil
+			}
+		}
+	}
+
+	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ws, err := dial(dialCtx, target, fingerprint)
+	cancel()
+	if err != nil {
+		if inj != nil {
+			inj.close()
+		}
+		return err
+	}
+	if perr != nil {
+		slog.Error("desktop helper cannot start", "err", perr)
+		msg, _ := json.Marshal(map[string]string{"t": "error", "message": perr.Error()})
+		ws.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		ws.WriteMessage(websocket.TextMessage, msg)
+		ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+		ws.Close()
+		return perr
+	}
+	defer inj.close()
+	slog.Info("desktop helper connected", "server", serverURL, "quality", quality)
+	s := newSession(ws, cap, inj, quality)
+	err = s.run(ctx)
+	slog.Info("desktop helper finished", "err", err)
+	return err
 }
 
 // Launch starts the helper for the interactive session from the agent
@@ -25,5 +83,30 @@ func Serve(ctx context.Context, serverURL, token, fingerprint string, quality in
 // X", "no user logged in, showing the logon screen") and an error when no
 // interactive session can be reached.
 func Launch(exe, serverURL, token, fingerprint string, quality int) (note string, err error) {
-	return "", errors.New("remote desktop is not implemented on this platform")
+	if exe == "" {
+		return "", errors.New("agent executable path is empty")
+	}
+	if serverURL == "" || token == "" {
+		return "", errors.New("desktop start needs a server URL and a token")
+	}
+	if quality < minQuality || quality > maxQuality {
+		quality = 60
+	}
+	return launch(exe, serverURL, token, fingerprint, quality)
+}
+
+// helperArgs is the command line every launcher builds; keeping it in one
+// place means main.go's flag set and the launchers cannot drift apart.
+func helperArgs(serverURL, token, fingerprint string, quality int) []string {
+	return []string{"desktop-helper", "--server", serverURL, "--token", token, "--fingerprint", fingerprint, "--quality", fmt.Sprint(quality)}
+}
+
+// serveInProcess is the developer-mode path: the agent itself has a
+// display, so the helper runs as a goroutine of this process.
+func serveInProcess(serverURL, token, fingerprint string, quality int) {
+	go func() {
+		if err := Serve(context.Background(), serverURL, token, fingerprint, quality); err != nil {
+			slog.Error("in-process desktop helper ended", "err", err)
+		}
+	}()
 }

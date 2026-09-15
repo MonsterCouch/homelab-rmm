@@ -1,0 +1,34 @@
+# Caddy in front of Homelab RMM.
+#
+# Run the server with plain HTTP and its public URL set to the proxy name:
+#
+#   rmm-server run --insecure --listen 127.0.0.1:8080 --public-url https://rmm.example.lan
+#
+# Caddy terminates TLS (its own automatic certificates, or the internal CA
+# for LAN names) and proxies everything, including the WebSockets used by
+# agents (/ws/agent), terminals (/ws/shell/...), remote desktop
+# (/ws/desktop/...) and the Server-Sent Events stream (/api/events).
+#
+# The agent enrolment command that the console prints pins the certificate
+# fingerprint it sees on the server. With --insecure the server has no
+# certificate, so the fingerprint is empty and agents fall back to the system
+# trust store: the certificate Caddy serves must be one the devices trust
+# (a public CA, or Caddy's internal root installed on every device).
+# Read docs/OPERATIONS.md "Reverse proxy" before choosing this layout.
+
+rmm.example.lan {
+	# LAN-only name: let Caddy mint a certificate from its internal CA.
+	# Remove this line for a public name with automatic Let's Encrypt.
+	tls internal
+
+	encode zstd gzip
+
+	reverse_proxy 127.0.0.1:8080 {
+		# Caddy forwards Host and adds X-Forwarded-For/Proto by default,
+		# upgrades WebSocket connections without extra configuration and
+		# applies no read/write timeout to proxied connections unless one
+		# is configured, so agent sockets and desktop streams stay up.
+		# SSE and streamed script output must not be buffered:
+		flush_interval -1
+	}
+}

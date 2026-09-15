@@ -19,6 +19,7 @@ type Config struct {
 	DevWebDir string // serve UI from this directory instead of the embedded build (development)
 	LogLevel  string
 	Insecure  bool // plain HTTP (behind a reverse proxy that terminates TLS)
+	SkipSeed  bool // do not create the starter scripts/rules on first run (tests)
 }
 
 // DefaultDataDir is %ProgramData%\HomelabRMM on Windows and /var/lib/homelab-rmm

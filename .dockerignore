@@ -1,0 +1,17 @@
+# Keep the build context small: the image builds the UI and binaries itself.
+.git
+.github
+dist
+build
+web/node_modules
+web/dist
+web/e2e/shots
+*.db
+*.db-wal
+*.db-shm
+*.log
+rmm-server
+rmm-server.exe
+rmm-agent
+rmm-agent.exe
+tmp

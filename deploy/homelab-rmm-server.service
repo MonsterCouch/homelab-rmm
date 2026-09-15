@@ -1,0 +1,49 @@
+# Example systemd unit for the Homelab RMM server.
+#
+# `rmm-server install` writes an equivalent unit (HomelabRMMServer.service)
+# for you; use this file instead when you want a dedicated service account or
+# hardening directives. Install with:
+#
+#   sudo useradd --system --home /var/lib/homelab-rmm --shell /usr/sbin/nologin rmm
+#   sudo mkdir -p /opt/homelab-rmm /var/lib/homelab-rmm
+#   sudo cp rmm-server /opt/homelab-rmm/ && sudo cp -r agents /opt/homelab-rmm/
+#   sudo chown -R rmm:rmm /var/lib/homelab-rmm
+#   sudo cp deploy/homelab-rmm-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now homelab-rmm-server
+#
+# Binding :8443 as a non-root user is fine (ports >= 1024). To listen on 443
+# directly add AmbientCapabilities=CAP_NET_BIND_SERVICE, or put a reverse
+# proxy in front (deploy/Caddyfile, deploy/nginx.conf).
+
+[Unit]
+Description=Homelab RMM Server
+Documentation=https://github.com/MonsterCouch/homelab-rmm
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rmm
+Group=rmm
+WorkingDirectory=/var/lib/homelab-rmm
+# Flags: --listen, --data, --public-url, --cert/--key, --insecure. The same
+# settings can come from RMM_LISTEN, RMM_DATA_DIR, RMM_PUBLIC_URL,
+# RMM_CERT_FILE, RMM_KEY_FILE, RMM_INSECURE (see docs/OPERATIONS.md).
+ExecStart=/opt/homelab-rmm/rmm-server run --data /var/lib/homelab-rmm --listen :8443
+Environment=RMM_PUBLIC_URL=https://rmm.example.lan:8443
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# Hardening. The server only needs its data directory writable.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/homelab-rmm
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

@@ -204,6 +204,7 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	slog.Info("agent disconnected", "id", agentID, "host", hello.Hostname)
 	h.broadcast(hubEvent{Kind: "agent_offline", AgentID: agentID})
 	h.s.onAgentOffline(agentID)
+	h.s.sched.automation("agent_offline", agentID, nil)
 }
 
 func (h *Hub) keepalive(ac *agentConn) {

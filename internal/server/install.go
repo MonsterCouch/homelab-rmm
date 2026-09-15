@@ -114,7 +114,7 @@ mkdir -p /opt/homelab-rmm
 echo "Downloading agent from $SERVER ..."
 curl -fsSk -o /opt/homelab-rmm/rmm-agent.new "$SERVER/api/agent-download/rmm-agent-linux-$ARCH"
 chmod 755 /opt/homelab-rmm/rmm-agent.new
-systemctl stop homelab-rmm-agent 2>/dev/null || true
+systemctl stop HomelabRMMAgent 2>/dev/null || true
 mv -f /opt/homelab-rmm/rmm-agent.new /opt/homelab-rmm/rmm-agent
 /opt/homelab-rmm/rmm-agent install --server "$SERVER" --token "$TOKEN" --fingerprint "$FP"
 echo "Agent installed and started."

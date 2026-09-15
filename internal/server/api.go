@@ -418,8 +418,16 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	s.db.QueryRow(`SELECT COUNT(DISTINCT agent_id) FROM patches WHERE status IN ('available','approved')`).Scan(&patches)
 	dayAgo := now() - 86400
 	s.db.QueryRow(`SELECT COUNT(*), SUM(status IN ('failed','timeout')) FROM script_runs WHERE started_at > ?`, dayAgo).Scan(&runsToday, &runsFailed)
-	alerts, _ := s.db.ListAlerts("open", "", 10)
-	runs, _ := s.db.ListRuns("", 10)
+	alerts, err := s.db.ListAlerts("open", "", 10)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	runs, err := s.db.ListRuns("", 10)
+	if err != nil {
+		fail(w, err)
+		return
+	}
 	writeJSON(w, 200, map[string]any{
 		"agents_online": online, "agents_offline": offline, "pending_reboot": reboot,
 		"windows": windows, "linux": linux,

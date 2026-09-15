@@ -134,6 +134,12 @@ func (a *Agent) session(ctx context.Context) error {
 	sessCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	go a.pushLoop(sessCtx)
+	// a cancelled context (service stop, SIGTERM) must unblock ReadMessage
+	go func() {
+		<-sessCtx.Done()
+		ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "shutting down"), time.Now().Add(time.Second))
+		ws.Close()
+	}()
 
 	for {
 		_, data, err := ws.ReadMessage()
@@ -372,5 +378,3 @@ func (a *Agent) handle(ctx context.Context, env protocol.Envelope) {
 	}
 	c.reply(env.ID, out)
 }
-
-var _ = websocket.TextMessage

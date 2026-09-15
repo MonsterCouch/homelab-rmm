@@ -1,0 +1,34 @@
+# Homelab RMM server in Docker.
+#
+#   docker compose up -d --build
+#   open https://<host>:8443 and accept the self-signed certificate
+#
+# Set RMM_PUBLIC_URL to the address agents will use to reach this container:
+# it is embedded in every install command and is the name agents pin the
+# certificate under. Change it later in Settings if needed.
+
+services:
+  rmm:
+    build:
+      context: .
+      args:
+        VERSION: dev
+    image: homelab-rmm:local
+    container_name: homelab-rmm
+    restart: unless-stopped
+    ports:
+      - "8443:8443"
+    environment:
+      RMM_PUBLIC_URL: https://rmm.example.lan:8443
+      # RMM_INSECURE: "1"          # plain HTTP, only behind a TLS-terminating proxy (docs/OPERATIONS.md)
+      # RMM_DEBUG: "1"             # verbose logging
+    volumes:
+      # database, certificate, server.log and optional agents/ overrides live here
+      - rmm-data:/data
+      # bind mount alternative (the image runs as uid 65532):
+      #   mkdir -p ./data && sudo chown 65532:65532 ./data
+      # - ./data:/data
+    # WAL-mode SQLite likes the file system; avoid network shares for /data.
+
+volumes:
+  rmm-data:

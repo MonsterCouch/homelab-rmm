@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,9 +19,14 @@ func TestScriptRunnerStreamsAndExitCodes(t *testing.T) {
 		t.Skip("bash test")
 	}
 	r := newScriptRunner()
-	var chunks []protocol.ScriptChunk
+	var (
+		mu     sync.Mutex
+		chunks []protocol.ScriptChunk
+	)
 	res := r.run(context.Background(), protocol.ScriptRun{RunID: "r1", Language: "bash", Body: "echo out1\necho err1 >&2\necho \"$1 $RMM_RUN_ID\"\nexit 7", Args: []string{"arg"}, Timeout: 10}, func(c protocol.ScriptChunk) {
+		mu.Lock()
 		chunks = append(chunks, c)
+		mu.Unlock()
 	})
 	if res.ExitCode != 7 || res.TimedOut || res.Error != "" {
 		t.Fatalf("unexpected result: %+v", res)

@@ -45,6 +45,11 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
+	if !cfg.SkipSeed {
+		if err := seedDefaults(db); err != nil {
+			return nil, fmt.Errorf("seed defaults: %w", err)
+		}
+	}
 	s := &Server{cfg: cfg, db: db, startedAt: time.Now()}
 	s.hub = newHub(s)
 	s.mail = newMailer(db)

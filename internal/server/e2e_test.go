@@ -177,7 +177,7 @@ func (b *browser) mustJSON(method, path string, body any, out any) {
 
 func newTestServer(t *testing.T) (*Server, *httptest.Server, *browser) {
 	t.Helper()
-	cfg := Config{DataDir: t.TempDir(), Listen: "127.0.0.1:0", Insecure: true}
+	cfg := Config{DataDir: t.TempDir(), Listen: "127.0.0.1:0", Insecure: true, SkipSeed: true}
 	s, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
