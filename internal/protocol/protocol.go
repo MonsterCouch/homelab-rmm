@@ -35,33 +35,40 @@ const (
 // Message types sent by the server. Each is a request the agent answers with a
 // TypeReply carrying the same ID (or a sequence of TypeStream then TypeReply).
 const (
-	ReqPing             = "ping"
-	ReqInventoryRefresh = "inventory.refresh"
-	ReqShellOpen        = "shell.open"
-	ReqShellInput       = "shell.input"
-	ReqShellResize      = "shell.resize"
-	ReqShellClose       = "shell.close"
-	ReqScriptRun        = "script.run"
-	ReqScriptCancel     = "script.cancel"
-	ReqProcList         = "proc.list"
-	ReqProcKill         = "proc.kill"
-	ReqSvcList          = "svc.list"
-	ReqSvcAction        = "svc.action"
-	ReqUpdatesScan      = "updates.scan"
-	ReqUpdatesInstall   = "updates.install"
-	ReqEventLogQuery    = "eventlog.query"
-	ReqFsList           = "fs.list"
-	ReqFsRead           = "fs.read"
-	ReqFsWrite          = "fs.write"
-	ReqFsDelete         = "fs.delete"
-	ReqFsMkdir          = "fs.mkdir"
-	ReqFsRename         = "fs.rename"
-	ReqPower            = "power"
-	ReqDesktopStart     = "desktop.start"
-	ReqWakeOnLan        = "wol"
-	ReqAgentUpdate      = "agent.update"
-	ReqAgentConfig      = "agent.config"
+	ReqPing              = "ping"
+	ReqInventoryRefresh  = "inventory.refresh"
+	ReqShellOpen         = "shell.open"
+	ReqShellInput        = "shell.input"
+	ReqShellResize       = "shell.resize"
+	ReqShellClose        = "shell.close"
+	ReqScriptRun         = "script.run"
+	ReqScriptCancel      = "script.cancel"
+	ReqProcList          = "proc.list"
+	ReqProcKill          = "proc.kill"
+	ReqSvcList           = "svc.list"
+	ReqSvcAction         = "svc.action"
+	ReqUpdatesScan       = "updates.scan"
+	ReqUpdatesInstall    = "updates.install"
+	ReqEventLogQuery     = "eventlog.query"
+	ReqFsList            = "fs.list"
+	ReqFsRead            = "fs.read"
+	ReqFsWrite           = "fs.write"
+	ReqFsDelete          = "fs.delete"
+	ReqFsMkdir           = "fs.mkdir"
+	ReqFsRename          = "fs.rename"
+	ReqPower             = "power"
+	ReqDesktopStart      = "desktop.start"
+	ReqWakeOnLan         = "wol"
+	ReqAgentUpdate       = "agent.update"
+	ReqAgentConfig       = "agent.config"
+	ReqBaselineEvaluate  = "baseline.evaluate"  // evaluate assigned baselines now; reply []BaselineReport
+	ReqBaselineRemediate = "baseline.remediate" // run the fixes for listed checks now; reply BaselineReport
+	ReqBaselinePreview   = "baseline.preview"   // evaluate an unsaved spec, never storing or fixing; reply BaselineReport
 )
+
+// TypeBaseline is sent by the agent after every evaluation pass (scheduled,
+// startup, manual or remediation) with one BaselineReport.
+const TypeBaseline = "baseline"
 
 // Hello is the agent's first frame.
 type Hello struct {
@@ -80,6 +87,10 @@ type AgentConfig struct {
 	InventoryIntervalSec int      `json:"inventory_interval_sec"`
 	PatchScanIntervalSec int      `json:"patch_scan_interval_sec"`
 	MonitoredServices    []string `json:"monitored_services"`
+	// Baselines are the desired-state specs assigned to this device. The
+	// agent evaluates them on their own interval, offline too, and reports
+	// with TypeBaseline. An empty list clears every assignment.
+	Baselines []BaselineSpec `json:"baselines,omitempty"`
 }
 
 // Inventory is the full description of a device.
@@ -390,6 +401,65 @@ type DesktopStart struct {
 type DesktopStartResult struct {
 	Started bool   `json:"started"`
 	Note    string `json:"note,omitempty"`
+}
+
+// ---- Baselines (desired state) ----
+//
+// A baseline is a set of checks that describe how a device should look. The
+// agent evaluates it on IntervalSec (offline too), fixes drift when the
+// baseline is enforced and the check allows remediation, and reports every
+// pass. Check kinds and their params are documented in docs/BASELINES.md.
+
+type BaselineSpec struct {
+	ID          int64           `json:"id"`
+	Name        string          `json:"name"`
+	Version     int             `json:"version"` // bumped on every edit; reports echo it
+	Enforce     bool            `json:"enforce"` // auto-remediate checks that allow it
+	IntervalSec int             `json:"interval_sec"`
+	Checks      []BaselineCheck `json:"checks"`
+}
+
+type BaselineCheck struct {
+	ID         int64           `json:"id"`
+	Name       string          `json:"name"`
+	Kind       string          `json:"kind"`   // service, package, registry, file, command, group_members, firewall, time_sync, sysctl, windows_feature, reboot_pending, disk_free
+	Params     json.RawMessage `json:"params"` // kind-specific, see docs/BASELINES.md
+	Remediate  bool            `json:"remediate"`
+	Severity   string          `json:"severity"`  // info, warning, critical (drift alert severity)
+	OSFilter   string          `json:"os_filter"` // "", windows, linux
+	TimeoutSec int             `json:"timeout_sec"`
+}
+
+// BaselineReport is one evaluation pass of one baseline on one device.
+type BaselineReport struct {
+	BaselineID int64            `json:"baseline_id"`
+	Version    int              `json:"version"`
+	TS         int64            `json:"ts"`
+	Trigger    string           `json:"trigger"` // schedule, startup, config, manual, remediate, preview
+	Results    []BaselineResult `json:"results"`
+}
+
+type BaselineResult struct {
+	CheckID    int64  `json:"check_id"`
+	State      string `json:"state"` // pass, fail, fixed, error, skipped
+	Expected   string `json:"expected"`
+	Observed   string `json:"observed"`
+	Detail     string `json:"detail,omitempty"` // explanation, error text or fix output (bounded)
+	Fixed      bool   `json:"fixed"`            // a remediation ran in this pass
+	DurationMs int64  `json:"duration_ms"`
+}
+
+type BaselineEvaluate struct {
+	BaselineIDs []int64 `json:"baseline_ids,omitempty"` // empty = every assigned baseline
+}
+
+type BaselineRemediate struct {
+	BaselineID int64   `json:"baseline_id"`
+	CheckIDs   []int64 `json:"check_ids,omitempty"` // empty = every failing check that allows remediation
+}
+
+type BaselinePreview struct {
+	Spec BaselineSpec `json:"spec"`
 }
 
 // ---- Wake-on-LAN ----
