@@ -1,5 +1,7 @@
 # Build, test and cross-compile on every push to main and every pull request;
-# publish a GitHub Release with the archives when a v* tag is pushed.
+# publish a GitHub Release with the archives when a v* tag is pushed, or when
+# the workflow is run by hand with a release_tag (Actions -> Build -> Run
+# workflow): the tag is then created on the current commit by the release job.
 name: Build
 
 on:
@@ -8,6 +10,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Create this tag on the current commit and publish a release (e.g. v0.1.0). Leave empty for a plain build.'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -24,6 +31,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # git describe needs the tags for the version stamp
+
+      - name: Stamp the requested release version
+        # A manual release names its tag before it exists; a local tag makes
+        # `git describe` (the VERSION the Makefile embeds) report it. The tag
+        # itself is created on GitHub by the release job.
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        run: |
+          case "${{ inputs.release_tag }}" in
+            v[0-9]*) ;;
+            *) echo "::error::release_tag must look like v1.2.3"; exit 1 ;;
+          esac
+          git tag "${{ inputs.release_tag }}"
 
       - uses: actions/setup-node@v4
         with:
@@ -81,7 +100,7 @@ jobs:
 
   release:
     name: GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -95,7 +114,9 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ inputs.release_tag || github.ref_name }}
           generate_release_notes: true
           files: |
             dist/homelab-rmm-*.zip
