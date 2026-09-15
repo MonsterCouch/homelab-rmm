@@ -27,6 +27,34 @@ type fakeAgent struct {
 	reqs  chan protocol.Envelope
 	stop  chan struct{}
 	shell map[string]bool
+	// baselineAnswer, when set, is the pass the fake agent reports after a
+	// baseline.evaluate or baseline.remediate request. A real agent ACKs the
+	// request and sends the report as its own TypeBaseline frame, so that is
+	// what this does - the reply is never a report (one pass, one ingest).
+	baselineAnswer *protocol.BaselineReport
+	// baselineRequests records what the server asked for, so a test can
+	// assert that an evaluate reached the device.
+	baselineRequests []protocol.Envelope
+}
+
+// setBaselineAnswer arms the report the fake agent sends after the next
+// evaluate or remediate request.
+func (f *fakeAgent) setBaselineAnswer(rep *protocol.BaselineReport) {
+	f.mu.Lock()
+	f.baselineAnswer = rep
+	f.mu.Unlock()
+}
+
+func (f *fakeAgent) baselineAsks() []protocol.Envelope {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]protocol.Envelope{}, f.baselineRequests...)
+}
+
+// sendBaselineReport pushes an unsolicited pass, exactly as a scheduled or
+// offline evaluation does.
+func (f *fakeAgent) sendBaselineReport(rep protocol.BaselineReport) {
+	f.send(protocol.Envelope{T: protocol.TypeBaseline, D: protocol.Must(rep)})
 }
 
 func (f *fakeAgent) send(env protocol.Envelope) {
@@ -122,6 +150,31 @@ func (f *fakeAgent) loop() {
 				}
 			}
 			f.send(protocol.Envelope{T: protocol.TypeReply, ID: env.ID, D: protocol.Must(res)})
+		case protocol.ReqBaselineEvaluate, protocol.ReqBaselineRemediate:
+			f.mu.Lock()
+			f.baselineRequests = append(f.baselineRequests, env)
+			answer := f.baselineAnswer
+			f.baselineAnswer = nil
+			f.mu.Unlock()
+			// ACK only. The pass arrives as its own TypeBaseline frame.
+			f.send(protocol.Envelope{T: protocol.TypeReply, ID: env.ID, D: protocol.Must(map[string]any{"accepted": true})})
+			if answer != nil {
+				f.sendBaselineReport(*answer)
+			}
+		case protocol.ReqBaselinePreview:
+			// The one request whose REPLY is the report, and which never
+			// sends a TypeBaseline frame.
+			var in protocol.BaselinePreview
+			json.Unmarshal(env.D, &in)
+			rep := protocol.BaselineReport{BaselineID: in.Spec.ID, Version: in.Spec.Version, TS: time.Now().Unix(), Trigger: "preview"}
+			for i, c := range in.Spec.Checks {
+				state, observed := "pass", "ok"
+				if i == 0 {
+					state, observed = "fail", "drifted"
+				}
+				rep.Results = append(rep.Results, protocol.BaselineResult{CheckID: c.ID, State: state, Expected: "ok", Observed: observed, DurationMs: 3})
+			}
+			f.send(protocol.Envelope{T: protocol.TypeReply, ID: env.ID, D: protocol.Must(rep)})
 		case protocol.ReqInventoryRefresh:
 			f.send(protocol.Envelope{T: protocol.TypeInventory, D: protocol.Must(protocol.Inventory{Hostname: "testbox", OS: "linux", Network: []protocol.NetIface{{Name: "eth0", MAC: "aa:bb:cc:dd:ee:ff", IPs: []string{"10.0.0.5/24"}}}})})
 			f.send(protocol.Envelope{T: protocol.TypeReply, ID: env.ID})

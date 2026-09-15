@@ -108,6 +108,24 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("POST /api/alerts/{id}/resolve", s.requireWrite(s.handleResolveAlert))
 	api.HandleFunc("POST /api/alerts/resolve-all", s.requireWrite(s.handleResolveAllAlerts))
 
+	// Baselines. Reads are session-only (a viewer may look at compliance);
+	// every mutation is requireWrite, and preview/evaluate/remediate are
+	// writes too because they run code on a device. The admin-only gates for
+	// `command`, `file` outside the config trees and allow_reboot live inside
+	// the save handler, since the route itself is requireWrite.
+	api.HandleFunc("GET /api/baselines", s.handleListBaselines)
+	api.HandleFunc("POST /api/baselines", s.requireWrite(s.handleCreateBaseline))
+	api.HandleFunc("POST /api/baselines/preview", s.requireWrite(s.handleBaselinePreview))
+	api.HandleFunc("GET /api/baselines/{id}", s.handleGetBaseline)
+	api.HandleFunc("PUT /api/baselines/{id}", s.requireWrite(s.handleUpdateBaseline))
+	api.HandleFunc("DELETE /api/baselines/{id}", s.requireWrite(s.handleDeleteBaseline))
+	api.HandleFunc("GET /api/baselines/{id}/status", s.handleBaselineStatus)
+	api.HandleFunc("POST /api/baselines/{id}/evaluate", s.requireWrite(s.handleBaselineEvaluate))
+	api.HandleFunc("POST /api/baselines/{id}/remediate", s.requireWrite(s.handleBaselineRemediate))
+	api.HandleFunc("GET /api/agents/{id}/baselines", s.handleAgentBaselines)
+	api.HandleFunc("GET /api/agents/{id}/baselines/history", s.handleAgentBaselineHistory)
+	api.HandleFunc("GET /api/compliance", s.handleCompliance)
+
 	api.HandleFunc("GET /api/patches", s.handleListPatches)
 	api.HandleFunc("POST /api/patches/status", s.requireWrite(s.handlePatchStatus))
 	api.HandleFunc("GET /api/patch-policies", s.handleListPatchPolicies)

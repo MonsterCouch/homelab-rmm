@@ -184,6 +184,12 @@ func installUpdates(ctx context.Context, req protocol.UpdatesInstall, progress f
 	if pm == "" {
 		return nil, errNoPackageManager
 	}
+	// One package transaction at a time on this device. A baseline `package`
+	// remediation takes the same mutex and backs off rather than meeting a
+	// held dpkg or rpm lock, which surfaces as a failed install instead of as
+	// a queue (see pkgOpMutex in baseline_kinds.go).
+	pkgOpMutex.Lock()
+	defer pkgOpMutex.Unlock()
 	progress("Refreshing package index (" + pm + ")")
 	if err := pmRefresh(ctx, pm); err != nil {
 		if ctx.Err() != nil {

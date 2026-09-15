@@ -14,7 +14,7 @@
 
 import { createRequire } from 'node:module';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -83,10 +83,16 @@ let expectViewerDenials = false;
 // A real Linux agent is enrolled when a binary is available (AGENT_BIN or the
 // repo-root build) so the device pages, terminal and run streaming are tested
 // against live data instead of an empty table.
+// Set once GET /api/baselines has answered 200. Until then the console's own
+// probe requests may 404 (they are not counted as problems); an API that never
+// answers IS a problem - server, console and agent all ship the feature now.
+let baselinesReady = false;
 const AGENT_BIN = process.env.AGENT_BIN || join(here, '..', '..', 'rmm-agent');
 const haveAgent = process.platform === 'linux' && existsSync(AGENT_BIN);
 let agentProc = null;
 const skipped = [];
+// The temp directory the baseline walk asks the agent to manage.
+let baselineDir = null;
 
 function startAgent(token) {
   const dir = mkdtempSync(join(tmpdir(), 'rmm-ui-agent-'));
@@ -309,6 +315,384 @@ async function desktopViewerWithFakeHelper(page, ctx) {
   await shot(page, 'device-desktop-fake');
 }
 
+// ---- baselines: desired state, drift detection, self-healing ----
+//
+// The whole loop against the real Linux agent: build a baseline in the
+// editor, dry-run it, save it, watch the first pass land, break the desired
+// state from outside the product and watch the agent put it back, and read
+// the drift alert open and resolve. Everything the agent is asked to manage
+// lives in a temp directory this function owns.
+function diskFreePct() {
+  try {
+    const out = execFileSync('df', ['-P', '/'], { encoding: 'utf8' }).trim().split('\n');
+    const cols = out[out.length - 1].split(/\s+/);
+    const total = Number(cols[1]);
+    const avail = Number(cols[3]);
+    const used = Number(String(cols[4]).replace('%', ''));
+    // The agent measures free/total; df's capacity column measures
+    // used/(used+available), which on a filesystem with reserved blocks is a
+    // much rosier number. Take whichever is smaller so the threshold the
+    // test picks is below both.
+    const byTotal = total > 0 ? (avail / total) * 100 : 100;
+    const byCapacity = Number.isFinite(used) ? 100 - used : 100;
+    return Math.min(byTotal, byCapacity);
+  } catch {
+    /* fall through */
+  }
+  return 50;
+}
+
+async function baselineWalk(page) {
+  const dir = mkdtempSync(join(tmpdir(), 'rmm-baseline-'));
+  const target = join(dir, 'desired.conf');
+  const marker = join(dir, 'marker');
+  const sentinel = join(dir, 'sentinel');
+  const CONTENT = 'SMOKE_BASELINE=1\n';
+  // A threshold the root filesystem certainly satisfies: the point of the
+  // disk check here is that a passing check renders, not that it trips.
+  const free = diskFreePct();
+  const minFree = Math.max(1, Math.min(90, Math.floor(free / 2)));
+  if (free < 3) skipped.push(`the root filesystem is only ${free.toFixed(1)}% free, so the disk_free check is testing a 1% threshold`);
+
+  // The agent binary is whatever is on disk (AGENT_BIN, or the gitignored
+  // repo-root build). One that predates the baselines API answers
+  // "unknown request baseline.preview", which otherwise surfaces 200 lines
+  // later as a 60 s selector timeout that reads exactly like a product bug.
+  // Ask the device directly, and say what is actually wrong.
+  {
+    const probe = await page.evaluate(async () => {
+      const h = { 'Content-Type': 'application/json', 'X-Requested-With': 'fetch' };
+      try {
+        const agents = await fetch('/api/agents', { headers: h }).then((r) => r.json());
+        const id = agents?.[0]?.id;
+        if (!id) return { devices: [{ status: 'error', error: 'no device is enrolled' }] };
+        return await fetch('/api/baselines/preview', {
+          method: 'POST',
+          headers: h,
+          body: JSON.stringify({
+            spec: { name: 'agent capability probe', enforce: false, interval_sec: 3600, checks: [{ name: 'probe', kind: 'disk_free', params: { mount: '/', min_free_pct: 1 }, remediate: false, severity: 'info', os_filter: 'linux', timeout_sec: 10 }] },
+            agent_ids: [id],
+          }),
+        }).then((r) => r.json());
+      } catch (e) {
+        return { devices: [{ status: 'error', error: String(e) }] };
+      }
+    });
+    const dev = probe?.devices?.[0] ?? { status: 'error', error: 'no device in the preview response' };
+    if (dev.status !== 'ok') {
+      throw new Error(
+        `the enrolled agent cannot run baseline.preview (${dev.status}: ${dev.error}). ` +
+          `AGENT_BIN is ${AGENT_BIN} - rebuild it (make build, or go build -o rmm-agent ./cmd/rmm-agent) before running the smoke.`,
+      );
+    }
+  }
+
+  await page.click('nav a[href="/baselines"]');
+  await page.waitForSelector('h1:has-text("Baselines")');
+  await page.locator('.tbl tbody tr').first().or(page.locator('.empty')).first().waitFor();
+  const seededRows = await page.locator('.tbl tbody tr').count();
+  if (seededRows) {
+    const enabled = await page.locator('.tbl tbody tr [role=switch][aria-checked="true"]').count();
+    if (enabled) problems.push(`${enabled} seeded baseline(s) arrived enabled; seeds must ship disabled and unenforced`);
+    if (await page.locator('.tbl tbody tr .chip:has-text("enforcing")').count()) problems.push('a seeded baseline arrived enforcing');
+    step(`baselines page lists ${seededRows} seeded baseline(s), all disabled and report-only`);
+  } else skipped.push('no seeded baselines in this database, so the seed-safety assertions were skipped');
+  await shot(page, 'baselines');
+
+  // ---- editor ----
+  await page.click('button:has-text("New baseline")');
+  await page.waitForURL(/\/baselines\/new$/);
+  await page.fill('#bl-name', 'Smoke desired state');
+  await page.fill('#bl-desc', 'created by the console smoke test');
+  await page.click('[data-testid="bl-enabled"] button[role=switch]');
+  await page.click('[data-testid="bl-enforce"] button[role=switch]');
+  await page.waitForSelector('.banner.warn:has-text("will change these devices without asking")');
+  step('baseline editor: the enforce toggle carries the "the agent will change these devices without asking" warning');
+
+  const addCheck = async (fill) => {
+    await page.click('.card-head:has-text("Checks") button:has-text("Add check")');
+    await page.waitForSelector('.modal:has-text("Add check")');
+    await fill();
+    await page.click('.modal-foot button:has-text("Add check")');
+    await page.waitForSelector('.modal', { state: 'detached' });
+  };
+
+  await addCheck(async () => {
+    await page.fill('#chk-name', 'Smoke file present');
+    await page.selectOption('#chk-kind', 'file');
+    await page.fill('#p-path', target);
+    await page.fill('#p-content', CONTENT);
+    await page.fill('#p-mode', '0644');
+    await page.click('[data-testid="chk-remediate"] button[role=switch]');
+  });
+  await addCheck(async () => {
+    await page.fill('#chk-name', 'Smoke marker present');
+    await page.selectOption('#chk-kind', 'command');
+    await page.waitForSelector('.modal .banner.danger:has-text("runs as SYSTEM")');
+    await page.fill('#p-expected', 'marker present');
+    await page.fill('#p-check', `#!/usr/bin/env bash\ntest -f ${marker}\n`);
+    await page.fill('#p-fix', `#!/usr/bin/env bash\ntouch ${marker}\n`);
+    await page.click('[data-testid="chk-remediate"] button[role=switch]');
+  });
+  await addCheck(async () => {
+    await page.fill('#chk-name', 'Root disk free');
+    await page.selectOption('#chk-kind', 'disk_free');
+    await page.fill('#p-mount', '/');
+    await page.fill('#p-min-free', String(minFree));
+  });
+  await addCheck(async () => {
+    await page.fill('#chk-name', 'Smoke drift sentinel');
+    await page.selectOption('#chk-kind', 'command');
+    await page.fill('#p-expected', 'sentinel present');
+    await page.fill('#p-check', `#!/usr/bin/env bash\ntest -f ${sentinel}\n`);
+  });
+  await page.waitForSelector('.tbl tbody tr:has-text("Smoke drift sentinel")');
+  step('four checks added through the typed forms (file, two command scripts, disk free) with per-check remediation, severity, OS filter and timeout');
+
+  // Client-side validation mirrors the server's: a path that is not absolute
+  // is refused here, before a 400 can happen.
+  await page.click('.tbl tbody tr:has-text("Smoke file present") button:has-text("Edit")');
+  await page.waitForSelector('.modal:has-text("Edit check")');
+  await page.fill('#p-path', 'relative/path.conf');
+  await page.waitForSelector('.form-error:has-text("absolute path")');
+  const saveDisabled = await page.locator('.modal-foot button:has-text("Save check")').isDisabled();
+  if (!saveDisabled) problems.push('the check dialog let an invalid path be saved');
+  // and the raw-JSON editor is checked against the same shapes
+  await page.click('.modal button:has-text("Raw JSON")');
+  await page.fill('#chk-raw', '{"path":"/tmp/x","state":"present","contentt":"oops"}');
+  await page.waitForSelector('.field .err:has-text("does not take")');
+  await page.fill('#chk-raw', JSON.stringify({ path: target, state: 'present', content: CONTENT, mode: '0644' }, null, 2));
+  await page.waitForSelector('.modal-foot button:has-text("Save check"):not([disabled])');
+  await page.click('.modal-foot button:has-text("Save check")');
+  await page.waitForSelector('.modal', { state: 'detached' });
+  step('check dialog validates against the same rules as the server (bad path refused, unknown params key refused in raw JSON mode)');
+  await shot(page, 'baseline-editor');
+
+  // ---- preview: a dry run that never fixes and never stores ----
+  await page.click('button:has-text("Preview on devices")');
+  await page.waitForSelector('.modal:has-text("Preview on devices")');
+  await page.click('.modal-foot button:has-text("Run preview")');
+  await page.waitForSelector('.modal .card:has-text("Smoke file present")', { timeout: 60000 });
+  const previewStates = await page.$$eval('.modal .tbl tbody tr', (rows) => rows.map((r) => `${r.children[0].textContent.trim()}=${r.children[1].textContent.trim()}`));
+  const wantPreview = ['Smoke file present=fail', 'Smoke marker present=fail', 'Root disk free=pass', 'Smoke drift sentinel=fail'];
+  if (previewStates.join(' | ') !== wantPreview.join(' | ')) problems.push(`preview reported ${previewStates.join(' | ')}, expected ${wantPreview.join(' | ')}`);
+  if (existsSync(target) || existsSync(marker)) problems.push('the preview fixed something: a dry run must never remediate or write');
+  await shot(page, 'baseline-preview');
+  await page.click('.modal-foot button:has-text("Close")');
+  await page.waitForSelector('.modal', { state: 'detached' });
+  step('preview dry-ran the unsaved draft on the live device: drift reported as fail, nothing fixed, nothing stored');
+
+  // ---- save ----
+  await page.click('button:has-text("Create baseline")');
+  await page.waitForSelector('.modal:has-text("Enforce this baseline?")');
+  await page.click('.modal button:has-text("Enforce")');
+  await page.waitForURL(/\/baselines\/\d+$/, { timeout: 30000 });
+  await page.waitForSelector('.toast:has-text("Baseline created")');
+  const baselineURL = page.url();
+  step('baseline saved (enforced, enabled) and the status view opened');
+
+  // ---- the first pass ----
+  const states = () => page.$$eval('.baseline-matrix tbody tr:first-child button.cell-btn .chip', (els) => els.map((e) => e.textContent.trim()));
+  const waitStates = async (want, what, timeout = 180000) => {
+    const deadline = Date.now() + timeout;
+    let got = [];
+    let i = 0;
+    while (Date.now() < deadline) {
+      got = await states().catch(() => []);
+      if (got.length === want.length && want.every((w, n) => w === '*' || got[n] === w)) return true;
+      await page.waitForTimeout(2500);
+      if (++i % 3 === 0) await page.click('button[aria-label="Refresh"]').catch(() => {});
+    }
+    problems.push(`${what}: the matrix never reached [${want.join(', ')}] (last [${got.join(', ')}])`);
+    return false;
+  };
+  await page.waitForSelector('.baseline-matrix', { timeout: 30000 });
+  const first = await waitStates(['fixed', 'fixed', 'pass', 'fail'], 'first pass');
+  if (first) {
+    if (!existsSync(target)) problems.push('the file check reported fixed but the file was not written');
+    else if (readFileSync(target, 'utf8') !== CONTENT) problems.push('the file check wrote the wrong content');
+    if (!existsSync(marker)) problems.push('the command check reported fixed but its fix script did not run');
+  }
+  step('first pass landed: the enforced checks fixed themselves on the device, the disk check passed and the sentinel reported drift');
+  await shot(page, 'baseline-status');
+
+  // expected vs observed is one click away, and so is the fix
+  await page.click('.baseline-matrix tbody tr:first-child button.cell-btn >> nth=3');
+  await page.waitForSelector('.drawer:has-text("Smoke drift sentinel")');
+  await page.waitForSelector('.drawer dt:has-text("Observed")');
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('.drawer', { state: 'detached' });
+  await page.click('.baseline-matrix tbody tr:first-child button:has-text("History")');
+  await page.waitForSelector('.drawer:has-text("History")');
+  await page.waitForSelector('.drawer .tbl tbody tr, .drawer .empty', { timeout: 20000 });
+  await shot(page, 'baseline-history');
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('.drawer', { state: 'detached' });
+  step('status matrix: a cell opens expected/observed/since/detail with a fix button, and the device history drawer lists the transitions');
+
+  // ---- the drift alert ----
+  await page.click('nav a[href="/alerts"]');
+  await page.waitForSelector('h1:has-text("Alerts")');
+  await page.selectOption('select[aria-label="Source"]', 'drift');
+  const driftRow = page.locator('.tbl tbody tr:has-text("Smoke drift sentinel")');
+  await driftRow.first().waitFor({ timeout: 60000 });
+  if (!(await page.locator('.tbl tbody tr:has-text("Smoke drift sentinel") .chip:has-text("drift")').count())) {
+    problems.push('the drift alert does not say it came from a baseline check');
+  }
+  await shot(page, 'alerts-drift');
+  step('the failing check opened a drift alert, readable in Alerts with its check name and a drift source filter');
+
+  // ---- break it from outside the product, then watch the agent fix it ----
+  rmSync(target, { force: true });
+  rmSync(marker, { force: true });
+  await page.goto(baselineURL);
+  await page.waitForSelector('.baseline-matrix');
+  await page.click('.baseline-matrix tbody tr:first-child button:has-text("Evaluate")');
+  await page.waitForSelector('.toast:has-text("Evaluation requested")');
+  const back = await waitFile(() => existsSync(target) && existsSync(marker), 120000);
+  if (!back) problems.push('the files deleted out of band were not put back by the enforced baseline');
+  await waitStates(['fixed', 'fixed', 'pass', 'fail'], 'after the out-of-band deletion');
+  step('deleting the managed file and the marker outside the product and asking for an evaluation put both back and reported them fixed');
+
+  // ---- the drift clears and the alert resolves ----
+  writeFileSync(sentinel, 'ok\n');
+  await page.click('.baseline-matrix tbody tr:first-child button:has-text("Evaluate")');
+  await page.waitForSelector('.toast:has-text("Evaluation requested")');
+  await waitStates(['*', '*', 'pass', 'pass'], 'after the sentinel appeared');
+  await page.click('nav a[href="/alerts"]');
+  await page.waitForSelector('h1:has-text("Alerts")');
+  await page.selectOption('select[aria-label="Source"]', 'drift');
+  await page.click('.btn-group button:has-text("Resolved")');
+  await page.locator('.tbl tbody tr:has-text("Smoke drift sentinel")').first().waitFor({ timeout: 60000 });
+  step('the check going back to pass resolved its drift alert');
+
+  // ---- editing keeps the results (PUT is a merge, not a delete + reinsert) ----
+  await page.goto(baselineURL);
+  await page.waitForSelector('.baseline-matrix');
+  await page.click('.page-head button:has-text("Edit")');
+  await page.waitForURL(/\/baselines\/\d+\/edit$/);
+  await page.fill('#bl-desc', 'edited by the console smoke test');
+  await page.click('button:has-text("Save baseline")');
+  await page.waitForSelector('.modal:has-text("Enforce this baseline?")');
+  await page.click('.modal button:has-text("Enforce")');
+  await page.waitForURL(/\/baselines\/\d+$/, { timeout: 30000 });
+  await page.waitForSelector('.baseline-matrix');
+  const afterEdit = await states();
+  if (afterEdit.filter((s) => s === 'unknown').length) problems.push(`saving the baseline lost results: ${afterEdit.join(', ')}`);
+  step('saving an edit keeps every check id, so the matrix keeps its results instead of emptying');
+
+  // ---- manual remediation: the path enforcement does not cover ----
+  // With enforcement off the agent reports drift and leaves it alone, so the
+  // operator's "Remediate" button is the only thing that changes the device.
+  await page.click('.page-head button:has-text("Edit")');
+  await page.waitForURL(/\/baselines\/\d+\/edit$/);
+  await page.click('[data-testid="bl-enforce"] button[role=switch]');
+  await page.click('button:has-text("Save baseline")');
+  await page.waitForURL(/\/baselines\/\d+$/, { timeout: 30000 });
+  await page.waitForSelector('.baseline-matrix');
+  rmSync(target, { force: true });
+  await page.click('.baseline-matrix tbody tr:first-child button:has-text("Evaluate")');
+  await page.waitForSelector('.toast:has-text("Evaluation requested")');
+  await waitStates(['fail', '*', '*', '*'], 'with enforcement off');
+  if (existsSync(target)) problems.push('a baseline that is not enforced fixed the device anyway');
+  await page.click('.baseline-matrix tbody tr:first-child button:has-text("Remediate")');
+  await page.waitForSelector('.modal:has-text("Remediate failing checks")');
+  await page.click('.modal-foot button:has-text("Remediate")');
+  await page.waitForSelector('.toast:has-text("Remediation requested")');
+  if (!(await waitFile(() => existsSync(target), 120000))) problems.push('manual remediation did not put the managed file back');
+  await waitStates(['fixed', '*', '*', '*'], 'after manual remediation');
+  step('with enforcement off drift is reported and left alone, and the device row\u2019s Remediate button runs the fixes on demand');
+
+  // ---- device compliance tab ----
+  await page.click('.baseline-matrix tbody tr:first-child a');
+  await page.waitForURL(/\/devices\/[0-9a-f]+\/compliance$/);
+  await page.waitForSelector('.card-head:has-text("Smoke desired state")');
+  await page.waitForSelector('.tbl tbody tr:has-text("Smoke file present")');
+  await page.waitForSelector('.tbl td:has-text("SMOKE_BASELINE"), .tbl tbody tr:has-text("Smoke file present") .chip');
+  step('device Compliance tab shows the assigned baseline, every check and its expected vs observed');
+  await shot(page, 'device-compliance');
+
+  // ---- dashboard tile ----
+  await page.click('nav a[href="/"]');
+  await page.waitForSelector('h1:has-text("Dashboard")');
+  await page.waitForSelector('[data-testid="tile-compliance"]', { timeout: 30000 });
+  const tile = (await page.locator('[data-testid="tile-compliance"]').textContent()) ?? '';
+  if (!/%/.test(tile)) problems.push(`the dashboard compliance tile shows no percentage: ${tile.slice(0, 120)}`);
+  if (!/drift alert/.test(tile)) problems.push('the dashboard compliance tile does not link the open drift alerts');
+  step('dashboard tile reports fleet compliance, drifted devices and open drift alerts');
+  await shot(page, 'dashboard-compliance');
+  await baselineEditorGuards(page, baselineURL);
+  return dir;
+}
+
+// Controls that were each a dead end for the operator, exercised on the
+// baseline the walk has already saved. Nothing here saves: every dialog is
+// cancelled, so the baseline the rest of the run asserts on is untouched.
+async function baselineEditorGuards(page, baselineURL) {
+  await page.goto(`${baselineURL}/edit`);
+  await page.waitForSelector('#bl-name');
+
+  // A custom interval is a mode of its own: picking "Custom…" used to snap the
+  // select back to the preset the interval already was, so the seconds field
+  // never appeared and no custom interval could be entered at all.
+  await page.selectOption('#bl-interval', 'custom');
+  if (!(await page.locator('#bl-interval-sec').count())) problems.push('the editor’s "Custom…" evaluation interval shows no seconds field, so a custom interval cannot be entered');
+  await page.selectOption('#bl-interval', '3600');
+
+  // The raw-JSON box and the typed form are one state: a JSON typo must not
+  // keep Save disabled after the operator goes back to the form, where the
+  // message is not even on screen.
+  await page.click('.tbl tbody tr:has-text("Smoke file present") button:has-text("Edit")');
+  await page.waitForSelector('.modal:has-text("Edit check")');
+  await page.click('.modal button:has-text("Raw JSON")');
+  await page.fill('#chk-raw', '{"path": "/etc/x", ');
+  await page.waitForSelector('.field .err');
+  await page.click('.modal button:has-text("Typed form")');
+  if (await page.locator('.modal-foot button:has-text("Save check")').isDisabled()) {
+    problems.push('a JSON syntax error typed in raw mode keeps Save disabled after switching back to the typed form, with no message on screen');
+  }
+  // `file` hides content/sha256/contains/mode/owner for state absent, so they
+  // have to go with the switch: keeping them left the check permanently
+  // invalid with nothing on screen to clear.
+  await page.selectOption('#p-state', 'absent');
+  if (await page.locator('.modal-foot button:has-text("Save check")').isDisabled()) {
+    const why = (await page.locator('.modal .form-error').textContent().catch(() => '')) ?? '';
+    problems.push(`switching a file check to "absent" leaves the present-only params behind and Save is stuck (${why.trim()})`);
+  }
+  // Changing the kind of a SAVED check is a delete + insert on the server: the
+  // check loses its id, its results and its open drift alert, so the dialog
+  // says so before Save is pressed.
+  await page.selectOption('#chk-kind', 'firewall');
+  if (!(await page.locator('.modal .banner:has-text("Changing the kind replaces this check")').count())) {
+    problems.push('changing the kind of a saved check does not warn that the server deletes it and inserts a new one');
+  }
+  await page.click('.modal-foot button:has-text("Cancel")');
+  await page.waitForSelector('.modal', { state: 'detached' });
+  step('editor guards: a custom interval can be typed, a raw-JSON typo does not wedge Save, a file check switched to absent stays savable, and changing a saved check’s kind warns it is a replacement');
+
+  // The list row opens the status view, so its own buttons have to keep their
+  // clicks: Edit used to land on the status view and Delete on the baseline it
+  // had just deleted.
+  await page.click('nav a[href="/baselines"]');
+  await page.waitForSelector('h1:has-text("Baselines")');
+  await page.click('.tbl tbody tr:has-text("Smoke desired state") button:has-text("Edit")');
+  await page.waitForTimeout(800);
+  if (!/\/edit$/.test(page.url())) problems.push(`the baselines list Edit button lands on ${page.url()} instead of the editor: the row click runs after it`);
+  else step('the baselines list Edit button opens the editor rather than the row’s status view');
+  await page.goto(baselineURL);
+  await page.waitForSelector('.baseline-matrix');
+}
+
+/** Poll a predicate about the filesystem the agent is managing. */
+async function waitFile(pred, timeout) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (pred()) return true;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return false;
+}
+
 function step(name) {
   covered.push(name);
   console.log(`- ${name}`);
@@ -392,6 +776,9 @@ async function main() {
     if (res.status() < 400) return;
     if (expectAuthFailure && res.status() === 401 && res.url().endsWith('/api/auth/login')) return;
     if (expectSetupFailure && res.status() === 403 && res.url().endsWith('/api/auth/setup')) return;
+    // Until the probe has seen /api/baselines answer, the feature is not in
+    // this build: its 404s are expected, not failures.
+    if (!baselinesReady && res.status() === 404 && /\/api\/(baselines|compliance)/.test(res.url())) return;
     // Inside a container without systemd the agent cannot list units or read
     // the journal; the API reports that as 400 and the UI must show it, not crash.
     if (res.status() === 400 && /\/api\/agents\/[^/]+\/(services|eventlog)/.test(res.url())) {
@@ -432,6 +819,16 @@ async function main() {
   await page.waitForSelector('.stat .value');
   step('setup created admin and landed on the dashboard with stat tiles');
   await shot(page, 'dashboard');
+
+  // ---- baselines readiness ----
+  // The server, the console and the agent all ship the feature now, so a
+  // missing API is a broken build, not a build the walk politely skips.
+  {
+    const status = await page.evaluate(() => fetch('/api/baselines', { headers: { 'X-Requested-With': 'fetch' } }).then((r) => r.status).catch(() => 0));
+    baselinesReady = status === 200;
+    if (baselinesReady) step('baselines API answers, so the desired-state walk runs');
+    else problems.push(`GET /api/baselines returned ${status}: this build has no baselines API, so the desired-state walk cannot run`);
+  }
 
   // ---- theme toggle ----
   const before = await page.evaluate(() => document.documentElement.dataset.theme);
@@ -625,8 +1022,15 @@ async function main() {
     const state = await page.evaluate(() => fetch('/api/auth/state').then((r) => r.json()));
     await page.waitForSelector(`dl.kv dd:has-text("${state.version}")`);
   }
-  await page.fill('input[type=url]', 'http://127.0.0.1:18080');
-  await page.click('button:has-text("Save changes")');
+  // Clearing first guarantees an input event even when the field already
+  // holds the value being typed (React only fires change when the value
+  // really changes, and a save landing mid-edit can put the old one back).
+  const setPublicURL = async (url) => {
+    await page.fill('input[type=url]', '');
+    await page.fill('input[type=url]', url);
+    await page.click('button:has-text("Save changes")');
+  };
+  await setPublicURL('http://127.0.0.1:18080');
   await page.waitForSelector('.toast:has-text("Settings saved")');
   step('settings page renders system card; public URL saved');
   await shot(page, 'settings');
@@ -637,8 +1041,7 @@ async function main() {
   for (let i = 0; i < 6; i++) {
     // Save is disabled until the form is dirty, so each pass changes the public
     // URL; the last one puts the value the step above saved back.
-    await page.fill('input[type=url]', i < 5 ? `http://127.0.0.1:1810${i}` : 'http://127.0.0.1:18080');
-    await page.click('button:has-text("Save changes")');
+    await setPublicURL(i < 5 ? `http://127.0.0.1:1810${i}` : 'http://127.0.0.1:18080');
     maxToasts = Math.max(maxToasts, await page.locator('.toast').count());
   }
   maxToasts = Math.max(maxToasts, await page.locator('.toast').count());
@@ -854,6 +1257,8 @@ async function main() {
     await page.waitForSelector('button:has-text("Scan now")');
     step('events and patches tabs render for the device');
 
+    if (baselinesReady) baselineDir = await baselineWalk(page);
+
     // stop the agent: the device must go offline live
     stopAgent();
     await page.click('nav a[href="/devices"]');
@@ -936,6 +1341,14 @@ async function main() {
   await page.click('nav a[href="/scripts"]');
   await page.waitForSelector('h1:has-text("Scripts")');
   if (await page.locator('button:has-text("New script")').count()) problems.push('viewer sees the New script button');
+  if (baselinesReady) {
+    await page.click('nav a[href="/baselines"]');
+    await page.waitForSelector('h1:has-text("Baselines")');
+    if (await page.locator('button:has-text("New baseline")').count()) problems.push('viewer sees the New baseline button');
+    if (await page.locator('.cell-actions button:has-text("Delete")').count()) problems.push('viewer sees the baseline delete buttons');
+    await page.click('nav a[href="/scripts"]');
+    await page.waitForSelector('h1:has-text("Scripts")');
+  }
   step('viewer login: admin nav hidden and mutating buttons absent');
   await shot(page, 'viewer-scripts');
   await page.goto(BASE + '/settings');
@@ -985,6 +1398,7 @@ async function main() {
 
   await browser.close();
   stopAgent();
+  if (baselineDir) rmSync(baselineDir, { recursive: true, force: true });
 }
 
 main()

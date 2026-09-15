@@ -12,6 +12,9 @@ import { ScriptEditor } from './pages/ScriptEditor';
 import { Runs } from './pages/Runs';
 import { Tasks } from './pages/Tasks';
 import { Automations } from './pages/Automations';
+import { Baselines } from './pages/Baselines';
+import { BaselineEditor } from './pages/BaselineEditor';
+import { BaselineStatus } from './pages/BaselineStatus';
 import { Alerts } from './pages/Alerts';
 import { Patches } from './pages/Patches';
 import { Settings } from './pages/Settings';
@@ -76,6 +79,11 @@ export function App() {
         <Route path="runs" element={<Runs />} />
         <Route path="tasks" element={<Tasks />} />
         <Route path="automations" element={<Automations />} />
+        <Route path="baselines" element={<Baselines />} />
+        {/* static before dynamic: /baselines/new must not be read as an id */}
+        <Route path="baselines/new" element={<BaselineEditor />} />
+        <Route path="baselines/:id" element={<BaselineStatus />} />
+        <Route path="baselines/:id/edit" element={<BaselineEditor />} />
         <Route path="alerts" element={<Alerts />} />
         <Route path="patches" element={<Patches />} />
         <Route

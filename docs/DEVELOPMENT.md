@@ -191,15 +191,25 @@ Example: a new `disk.smart` request that returns S.M.A.R.T. health for each disk
 
 ## Releasing
 
-Nothing is released yet: the repository has no `v*` tag, so the download URLs in `README.md`
-resolve to nothing, and it has no `LICENSE`, so `tools/build.sh` puts a placeholder in every
-archive. Both are blockers for the first release rather than steps that can be skipped.
+`v0.1.0` is tagged and published, with the six archives and `SHA256SUMS` attached to it by CI, so
+the download URLs in `README.md` resolve. The repository still has no `LICENSE`, so
+`tools/build.sh` puts a placeholder in every archive — including the ones already released. That
+is the one release chore still outstanding.
 
 1. Add a `LICENSE` file (the packagers copy it into every archive as soon as it exists; until
    then they write "No LICENSE file is present in this build").
-2. Update `CHANGELOG.md` — move `[Unreleased]` to the new version with a date.
+2. Update `CHANGELOG.md` — move `[Unreleased]` to the new version with a date, and add its
+   compare link at the bottom of the file.
 3. `git tag v1.2.3 && git push --tags`.
 4. CI builds, tests and attaches `homelab-rmm-<os>-<arch>.zip`, the linux `.tar.gz` files and
    `SHA256SUMS` to the GitHub Release.
-5. Check that the README download links now resolve, and drop the "no tagged release yet" note
-   at the top of the quick starts.
+5. Check that the README's release note still reads true for the new version — in particular the
+   line about which features `releases/latest` now carries.
+
+Packaging by hand: `make package` is safe on its own — it depends on `server agents`, so it
+rebuilds first. The script targets do **not** build anything; `tools/build.sh package` and
+`tools\build.ps1 -Target package` archive whatever `server` and `agents` last left in `dist/`,
+and because the console is embedded in the server binary a stale archive looks right until it is
+run. Use `tools/build.sh all package`. `tools/build.sh` refuses a binary older than the sources
+or `web/dist` it was built from (`ALLOW_STALE_BUILD=1` packages it anyway); `tools/build.ps1`
+does not carry that check yet, so on Windows build before you package.

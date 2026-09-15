@@ -363,7 +363,10 @@ type Automation struct {
 	CreatedAt    int64           `json:"created_at"`
 }
 
-var validTriggers = map[string]bool{"agent_online": true, "agent_offline": true, "alert_opened": true, "alert_resolved": true, "enrolled": true, "reboot_required": true, "patch_installed": true}
+// validTriggers gates what an operator may create. drift_detected and
+// drift_fixed carry no rule_id, so an automation filtered by rule_ids never
+// matches one - the console says so beside the trigger picker.
+var validTriggers = map[string]bool{"agent_online": true, "agent_offline": true, "alert_opened": true, "alert_resolved": true, "enrolled": true, "reboot_required": true, "patch_installed": true, "drift_detected": true, "drift_fixed": true}
 var validActions = map[string]bool{"run_script": true, "email": true, "webhook": true}
 
 func (d *DB) ListAutomations() ([]Automation, error) {

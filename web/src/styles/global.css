@@ -28,6 +28,17 @@
   --info-soft: rgba(56, 189, 248, 0.16);
   --purple: #a78bfa;
   --purple-soft: rgba(167, 139, 250, 0.16);
+  /* Chip text. A chip paints its tone at 12-16% behind 11.5px bold text, so
+     the accent colour that is readable on the page background is NOT readable
+     on its own tint: measured against #161a21/#1c2129/#202632/#0f1217, plain
+     --danger came out at 3.44:1 and --purple at 4.27:1. These are the same
+     hues at >= 4.5:1 on every one of those. Change a tone and re-measure. */
+  --chip-ok: #22c55e;
+  --chip-warn: #f59e0b;
+  --chip-danger: #f87171;
+  --chip-info: #38bdf8;
+  --chip-purple: #c4b5fd;
+  --chip-accent: #8ab4ff;
   --shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
   --radius: 8px;
   --radius-sm: 5px;
@@ -66,6 +77,16 @@
   --info-soft: rgba(2, 132, 199, 0.12);
   --purple: #7c3aed;
   --purple-soft: rgba(124, 58, 237, 0.12);
+  /* The light theme was the worse of the two: a tint this pale under the
+     tone itself measured 2.47:1 (warn), 2.60 (ok), 3.16 (info), 3.60
+     (danger) against white, #f7f9fc, #eef2f7 and #f4f6fa. Darkened to clear
+     4.5:1 on all four while keeping the hue. */
+  --chip-ok: #0f6b33;
+  --chip-warn: #9a4a06;
+  --chip-danger: #b91c1c;
+  --chip-info: #0369a1;
+  --chip-purple: #6d28d9;
+  --chip-accent: #1d4ed8;
   --shadow: 0 8px 30px rgba(20, 30, 50, 0.16);
 }
 
@@ -905,27 +926,35 @@ table.tbl {
 }
 .chip.ok {
   background: var(--ok-soft);
-  color: var(--ok);
+  color: var(--chip-ok);
 }
 .chip.warn {
   background: var(--warn-soft);
-  color: var(--warn);
+  color: var(--chip-warn);
 }
 .chip.danger {
   background: var(--danger-soft);
-  color: var(--danger);
+  color: var(--chip-danger);
 }
 .chip.info {
   background: var(--info-soft);
-  color: var(--info);
+  color: var(--chip-info);
 }
 .chip.accent {
   background: var(--accent-soft);
-  color: var(--accent-text);
+  color: var(--chip-accent);
 }
 .chip.purple {
   background: var(--purple-soft);
-  color: var(--purple);
+  color: var(--chip-purple);
+}
+/* A result the baseline outgrew: still its own state and its own colour, at
+   full contrast, marked by an outline rather than by being faded out. The
+   word "stale" is in the chip's title and, for a screen reader, in .sr-only
+   text beside it — never in the paleness alone. */
+.chip-stale > .chip {
+  border-style: dashed;
+  border-color: currentColor;
 }
 .chip.outline {
   background: transparent;
@@ -1238,6 +1267,19 @@ table.tbl {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* Text for a screen reader only: a label a sighted operator reads from the
+   layout (a table's row header, a chip's stale marker) and nobody else can. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 .banner {
   padding: 9px 12px;
@@ -1959,4 +2001,52 @@ table.tbl {
   .skeleton {
     animation: none;
   }
+}
+
+/* ---------- baselines ---------- */
+/* The status matrix can be wider than the screen (one column per check), so
+   the device column stays put while the rest scrolls. */
+.baseline-matrix td.sticky-col,
+.baseline-matrix th.sticky-col {
+  position: sticky;
+  left: 0;
+  background: var(--bg-elev);
+  z-index: 1;
+  box-shadow: 1px 0 0 var(--border);
+}
+.baseline-matrix thead th.sticky-col {
+  background: var(--bg-elev2);
+  z-index: 3;
+}
+/* The device column is a ROW HEADER (th scope="row"), so a screen reader
+   announces which device a state cell belongs to. It has to keep looking
+   like a cell: .tbl th is a sticky, uppercase, muted COLUMN head. */
+.baseline-matrix tbody th {
+  top: auto;
+  font-size: 13px;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--text);
+  user-select: auto;
+  z-index: 1;
+}
+.baseline-matrix tbody tr:hover td.sticky-col,
+.baseline-matrix tbody tr:hover th.sticky-col {
+  background: var(--bg-hover);
+}
+/* A matrix cell is a button so it opens from the keyboard as well as the mouse. */
+.cell-btn {
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.cell-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm, 4px);
 }

@@ -151,17 +151,36 @@ func dedupe(ruleID int64, agentID, extra string) string {
 
 // open creates an alert unless one with the same key is already open.
 func (e *alertEngine) open(rule *AlertRule, agentID, key, title, msg string) {
+	var ruleID *int64
+	sev, kind, notify := "warning", "", true
+	if rule != nil {
+		ruleID, sev, kind, notify = &rule.ID, rule.Severity, rule.Kind, rule.NotifyEmail
+	}
+	e.openWith(ruleID, kind, sev, notify, agentID, key, title, msg)
+}
+
+// openDrift opens a baseline drift alert. A drift row has no alert_rules row
+// behind it (nothing about it is operator-configurable except the check's own
+// severity), so it carries rule_id NULL and rule_kind 'drift' - and 'drift' is
+// deliberately NOT in validRuleKinds, which gates the rules an operator
+// creates. Everything else is the ordinary path: the same dedupe, the same
+// maintenance-window suppression, the same SSE event, the same alert_opened
+// automation. notify is always false for drift: the mail is one digest per
+// device and baseline, not one per failing check (see baselineEngine).
+func (e *alertEngine) openDrift(agentID, key, severity, title, msg string, notify bool) {
+	if !validBaselineSeverity(severity) {
+		severity = "warning"
+	}
+	e.openWith(nil, "drift", severity, notify, agentID, key, title, msg)
+}
+
+func (e *alertEngine) openWith(ruleID *int64, kind, sev string, notify bool, agentID, key, title, msg string) {
 	var existing int64
 	if err := e.s.db.QueryRow(`SELECT id FROM alerts WHERE dedupe_key = ? AND status != 'resolved'`, key).Scan(&existing); err == nil {
 		return
 	}
 	if a, err := e.s.db.GetAgent(agentID); err == nil && a.MaintenanceUntil > now() {
 		return // in maintenance: stay quiet
-	}
-	var ruleID *int64
-	sev, kind, notify := "warning", "", true
-	if rule != nil {
-		ruleID, sev, kind, notify = &rule.ID, rule.Severity, rule.Kind, rule.NotifyEmail
 	}
 	res, err := e.s.db.Exec(`INSERT INTO alerts(rule_id, rule_kind, agent_id, severity, title, message, dedupe_key, status, opened_at) VALUES(?,?,?,?,?,?,?,'open',?)`,
 		ruleID, kind, agentID, sev, title, msg, key, now())

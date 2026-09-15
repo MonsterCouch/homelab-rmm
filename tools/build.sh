@@ -7,7 +7,9 @@
 #   tools/build.sh all        web, server, agents
 #   tools/build.sh test       go vet, go test, UI type-check + build
 #   tools/build.sh package    dist/homelab-rmm-<os>-<arch>.zip (+ .tar.gz on linux) and SHA256SUMS
-#                             (archives what `server` and `agents` built; it does NOT build the UI)
+#                             (archives what `server` and `agents` built; it does NOT build
+#                             anything, and refuses a binary older than the sources or web/dist
+#                             it was built from - ALLOW_STALE_BUILD=1 packages it anyway)
 #   tools/build.sh checksums  regenerate dist/SHA256SUMS
 #   tools/build.sh clean
 #
@@ -15,7 +17,7 @@
 # server binary embeds it; ALLOW_EMPTY_WEB=1 overrides that for a --dev-web binary.
 #
 # Environment: VERSION (default: git describe), GO, NPM, DIST (default dist),
-# ALLOW_EMPTY_WEB.
+# ALLOW_EMPTY_WEB, ALLOW_STALE_BUILD.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -129,6 +131,32 @@ do_checksums() {
 	log "wrote $DIST/SHA256SUMS"
 }
 
+# first_newer <binary>: prints one source file that is newer than the binary,
+# or nothing. `package` archives what `server` and `agents` left in dist/, so a
+# run that skips those ships whatever was built last time - a server binary
+# that predates the feature, beside the docs that describe it. Nothing about
+# that archive looks wrong until someone runs it, so it is refused here.
+# -print -quit rather than `| head -1`: closing the pipe on a running find is a
+# SIGPIPE, which under `set -o pipefail` kills the build with 141 and no message.
+first_newer() {
+	local ref=$1 hit=''
+	hit=$(find . -path ./dist -prune -o -path ./web/node_modules -prune -o -path ./node_modules -prune -o \
+		-type f -newer "$ref" \( -name '*.go' -o -name go.mod -o -name go.sum \) -print -quit 2>/dev/null) || true
+	if [ -z "$hit" ] && [ -d web/dist ]; then
+		hit=$(find web/dist -type f -newer "$ref" -print -quit 2>/dev/null) || true
+	fi
+	printf '%s' "$hit"
+}
+
+# fresh <binary> <rebuild hint>: die if anything it is built from is newer.
+fresh() {
+	local newer
+	[ -n "${ALLOW_STALE_BUILD:-}" ] && return 0
+	newer=$(first_newer "$1")
+	[ -n "$newer" ] || return 0
+	die "$1 is older than $newer: it would ship a binary built from different source than this tree. Run 'tools/build.sh $2' (or 'tools/build.sh all') first, or set ALLOW_STALE_BUILD=1 to package it anyway."
+}
+
 do_package() {
 	local p os arch name stage srv ap a
 	require_web
@@ -142,11 +170,13 @@ do_package() {
 		mkdir -p "$stage/agents"
 		srv=$(binname rmm-server "$os" "$arch")
 		[ -f "$srv" ] || die "missing $srv (run: tools/build.sh server)"
+		fresh "$srv" server
 		if [ "$os" = windows ]; then cp "$srv" "$stage/rmm-server.exe"; else cp "$srv" "$stage/rmm-server"; fi
 		# every agent binary goes into every archive: one server serves all device types
 		for ap in $AGENT_PLATFORMS; do
 			a=$(binname rmm-agent "${ap%/*}" "${ap#*/}")
 			[ -f "$a" ] || die "missing $a (run: tools/build.sh agents)"
+			fresh "$a" agents
 			cp "$a" "$stage/agents/"
 		done
 		cp README.md "$stage/"

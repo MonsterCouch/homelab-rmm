@@ -31,7 +31,7 @@ type Hub struct {
 }
 
 type hubEvent struct {
-	Kind    string `json:"kind"` // agent_online, agent_offline, metrics, inventory, alert, event, run
+	Kind    string `json:"kind"` // agent_online, agent_offline, metrics, inventory, alert, event, run, baseline
 	AgentID string `json:"agent_id,omitempty"`
 	Data    any    `json:"data,omitempty"`
 }
@@ -326,7 +326,10 @@ func (h *Hub) readLoop(ac *agentConn) {
 			if sink != nil {
 				sink(env)
 			}
-		case protocol.TypeInventory, protocol.TypeMetrics, protocol.TypeEvent:
+		case protocol.TypeInventory, protocol.TypeMetrics, protocol.TypeEvent, protocol.TypeBaseline:
+			// A baseline report is not droppable like a metrics sample: it is
+			// the only record of a pass that may have run while the device was
+			// offline, so it follows the inventory path (push back, then warn).
 			ac.enqueue(env)
 		default:
 			slog.Debug("unhandled agent frame", "type", env.T)
@@ -382,6 +385,13 @@ func (h *Hub) ingestLoop(ac *agentConn) {
 			var ev protocol.Event
 			if err := json.Unmarshal(env.D, &ev); err == nil {
 				h.s.onAgentEvent(ac.id, &ev)
+			}
+		case protocol.TypeBaseline:
+			var rep protocol.BaselineReport
+			if err := json.Unmarshal(env.D, &rep); err == nil {
+				h.s.onBaselineReport(ac.id, &rep)
+			} else {
+				slog.Warn("bad baseline report", "id", ac.id, "err", err)
 			}
 		}
 	}

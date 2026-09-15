@@ -22,10 +22,18 @@ self-signed setup is safe.
   parameters (defaults, required), timeouts and OS filters; live streamed output; run on one
   device, a group, a tag or everything; queued for offline devices; cron **scheduling**;
   **automations** on events (device online/offline, alert opened/resolved, enrolled, reboot
-  required, patch installed) that run a script, send an email or call a webhook.
+  required, patch installed, baseline drift detected/fixed) that run a script, send an email or
+  call a webhook.
 - **Patch management** — Windows Update (WUA) on Windows; apt, dnf/yum, pacman and zypper on
   Linux; scan, approve, ignore, install with live log, reboot policy, scheduled scan and install
   policies with approved / all / security-only modes.
+- **Baselines** — desired state with drift detection and self-healing: a named list of checks
+  (service, package, registry, file, command, local group members, firewall, time sync, sysctl,
+  Windows feature, pending reboot, disk free) assigned by group, tag or OS. Agents evaluate on
+  their own interval, **offline too**, report every pass, and — when the baseline is *enforced*
+  and the check allows it — fix the drift themselves. Drift opens an alert and fires
+  `drift_detected` / `drift_fixed` automations; a dry-run preview shows what a draft would do
+  before you save it. Fleet and per-device compliance scores.
 - **Remote terminal** — PowerShell, cmd, bash or sh in a real pseudo-terminal (ConPTY on Windows)
   from the browser.
 - **Remote desktop** — screen streaming with tile diffing, mouse and keyboard, multi-monitor,
@@ -44,9 +52,14 @@ self-signed setup is safe.
 
 _Coming soon: dashboard, device overview, remote desktop, script run with live output._
 
-> **There is no tagged release yet.** The repository carries no `v*` tag, so the download links
-> in the two quick starts below have nothing to resolve to. Until the first release is cut,
-> produce the archives yourself — see [Building from source](#building-from-source):
+> **Releases.** [v0.1.0](https://github.com/MonsterCouch/homelab-rmm/releases/tag/v0.1.0) is
+> published, so the download links in the two quick starts below resolve: each
+> `homelab-rmm-<os>-<arch>.zip`, the linux `.tar.gz` files and `SHA256SUMS` are attached to it,
+> and `releases/latest/download/...` always points at the newest tagged version. That is the
+> *released* version, not `main` — [CHANGELOG.md](CHANGELOG.md) says what is in each one, and
+> baselines (desired state, drift detection, self-healing) arrive in 0.2.0. To run something
+> newer than the latest tag, produce the archives yourself — see
+> [Building from source](#building-from-source):
 > `make all && make package` writes exactly the `dist/homelab-rmm-<os>-<arch>.zip` /
 > `.tar.gz` the quick starts unpack (server, `agents/`, docs, `deploy/`, `SHA256SUMS`) — or take
 > the `dist` artefact from the newest green run of the
@@ -56,8 +69,8 @@ _Coming soon: dashboard, device overview, remote desktop, script run with live o
 ## Quick start (Windows server)
 
 1. Download `homelab-rmm-windows-amd64.zip` (or `-arm64`) from the
-   [releases](https://github.com/MonsterCouch/homelab-rmm/releases) page (see the note above:
-   none published yet — build it or take the CI artefact).
+   [releases](https://github.com/MonsterCouch/homelab-rmm/releases) page (see the note above for
+   which version that is, and how to build a newer one).
 2. Extract it to `C:\Program Files\HomelabRMM`. You get `rmm-server.exe` and an `agents\` folder
    with the agent binaries for every platform; the server serves those to devices you enrol.
 3. From an **elevated** PowerShell:
@@ -119,8 +132,9 @@ Managing the service later: `rmm-server.exe start | stop | restart | status | un
 
 ## Quick start (Linux server)
 
-**Binary + systemd** (the `curl` line works once a release is tagged; until then unpack the
-archive `make package` built, or the CI `dist` artefact, into `/opt/homelab-rmm`)
+**Binary + systemd** (the `curl` line fetches the newest tagged release; to run something newer
+than that, unpack the archive `make package` built, or the CI `dist` artefact, into
+`/opt/homelab-rmm` instead)
 
 ```bash
 curl -LO https://github.com/MonsterCouch/homelab-rmm/releases/latest/download/homelab-rmm-linux-amd64.tar.gz   # or -arm64
@@ -211,6 +225,87 @@ rmm-agent install --server https://rmm.lan:8443 --token <token> --fingerprint <s
 The fingerprint is shown on the Enrol page and printed in `server.log` at startup. Omit
 `--fingerprint` only when the server certificate is signed by a CA the device already trusts.
 `--no-service` writes the config without registering a service (development).
+
+## Baselines
+
+A **baseline** is a named list of checks that says how a device should look, assigned with the same
+target model as tasks and alert rules. Agents evaluate their assigned baselines on their own
+interval — **offline too** — and report every pass. When the baseline is **enforced** and the check
+allows remediation, the agent fixes the drift itself and reports the check as `fixed`; otherwise it
+reports `fail` and leaves the device alone.
+
+Two baselines are seeded on first run, **disabled and unenforced**, with every destructive check
+report-only: *Windows workstation hygiene* and *Linux server hygiene*. Read them, adjust them,
+enable them; enforce them when you believe them.
+
+Baselines → **New baseline**, then add checks with the typed forms (or raw JSON). Twelve kinds:
+`service`, `package`, `registry`, `file`, `command`, `group_members`, `firewall`, `time_sync`,
+`sysctl`, `windows_feature`, `reboot_pending`, `disk_free`. Each check carries a severity
+(`info` reports but never opens an alert), an OS filter, a timeout and its own **remediate** flag —
+so one baseline can fix the two things you trust it to fix and only report the other five.
+
+**Preview on devices** dry-runs the draft on up to ten live devices before you save: it never fixes
+anything, never writes to the device and never stores a result. It does *run* the draft's checks,
+so previewing a draft that contains a `command` check needs the same **admin** role saving one
+does.
+
+A worked example — every SSH server must carry a hardening drop-in, and the agent must put it back:
+
+```jsonc
+POST /api/baselines
+{
+  "name": "SSH hardening",
+  "targets": { "tags": ["ssh"], "os": "linux" },
+  "enabled": true,
+  "enforce": true,            // the agent will change these devices without asking
+  "interval_sec": 3600,
+  "notify_email": true,
+  "checks": [
+    { "name": "Hardening drop-in present",
+      "kind": "file",
+      "params": { "path": "/etc/ssh/sshd_config.d/99-rmm.conf",
+                  "state": "present",
+                  "content": "PermitRootLogin no\nPasswordAuthentication no\n",
+                  "mode": "0644", "owner": "root:root" },
+      "remediate": true, "severity": "critical", "os_filter": "linux", "timeout_sec": 30 },
+
+    { "name": "sshd running and enabled",
+      "kind": "service",
+      "params": { "name": "ssh", "state": "running", "start_type": "auto" },
+      "remediate": true, "severity": "critical", "os_filter": "linux", "timeout_sec": 60 },
+
+    { "name": "Review members of sudo",
+      "kind": "group_members",
+      "params": { "group": "sudo", "allowed": ["ansible", "admin"], "mode": "subset" },
+      "remediate": false, "severity": "warning", "os_filter": "linux", "timeout_sec": 30 }
+  ]
+}
+```
+
+Delete the drop-in on a device and, within the interval, the agent writes it back and the check
+reports `fixed`. Take `"enforce": false` instead and the same drift reports `fail`, opens a drift
+alert with the check's severity, and waits for you — the status view's **Remediate** button runs
+the fixes on that one device on demand.
+
+What that gets you:
+
+- **Drift alerts** keyed `drift:<baseline>:<check>:<agent>`, resolved automatically when the check
+  passes again. Severity comes from the check; `info` checks never open one.
+- **Automations** on `drift_detected` and `drift_fixed` (run a script, send an email, POST a
+  webhook). They carry no alert rule, so an automation filtered by alert rules never matches one.
+- **Compliance**: per device, per baseline and fleet-wide, on the dashboard and on each device's
+  **Compliance** tab — which works for an offline device, because its last known state is the whole
+  point.
+- A **history** of every transition per device, kept for the events retention period.
+
+Two things to know before you switch `enforce` on. An enforced baseline changes machines with no
+further confirmation, so the toggle asks you to confirm; and the `command` kind runs arbitrary code
+as root/SYSTEM on every matched device, so a baseline containing one can only be created, edited or
+previewed by an **admin** and is audited by name. Check parameters are readable by every signed-in user,
+viewers included — put no secrets in them.
+
+[docs/BASELINES.md](docs/BASELINES.md) has every kind's parameters and its exact refusals, the
+state machine, the API and the console.
 
 ## Agent install, uninstall, update
 
@@ -306,6 +401,12 @@ stopping the service, putting the files back and starting it. More in
   server prints at startup.
 - The **console is root/SYSTEM on every enrolled device**. Keep it on the LAN or behind a VPN,
   turn on 2FA for every account and give day-to-day accounts the *tech* or *viewer* role.
+- An **enforced baseline changes devices without asking**, and its `command` kind is arbitrary
+  root/SYSTEM code. Enforcement is off by default, both seeded baselines ship disabled and
+  report-only, a baseline containing a `command` check, a `file` check outside `/etc` or
+  `ProgramData`, or an `allow_reboot` check needs the *admin* role, and the refusals that matter
+  (never empty a privileged group, never change a boot-start driver, never stop the agent's own
+  service, never write outside the allowed paths) are enforced on the **device**.
 - The install one-liners disable certificate validation for the very first fetch only, so that a
   self-signed server can bootstrap; the agent binary is then hash-checked and pulled over a
   pinned connection, and the agent pins the certificate from then on.
@@ -330,6 +431,7 @@ The full threat model, what is and is not protected, and recommendations are in
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | components, connection model, wire protocol, database schema, alert engine, scheduler, patch flow, desktop relay |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | paths, service control, logs, backup and restore, reverse proxies, custom certificates, retention, moving the server |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | dev loop, running an agent locally, tests, cross-compiling, adding a request type end to end |
+| [docs/BASELINES.md](docs/BASELINES.md) | desired state: check kinds, the state machine, versions, ingest, the API and the console |
 | [docs/SECURITY.md](docs/SECURITY.md) | threat model and recommendations |
 | [docs/API.md](docs/API.md) | HTTP API and event stream |
 | [docs/DESKTOP-PROTOCOL.md](docs/DESKTOP-PROTOCOL.md) | remote desktop wire format |
@@ -353,4 +455,5 @@ twin of the Makefile. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 **Not settled yet.** The repository carries no `LICENSE` file, so no licence is granted — treat
 the code as all rights reserved until one is added. The release archives ship a placeholder that
 says the same (`tools/build.sh` writes it when `LICENSE` is absent); once the file exists it is
-copied into every archive instead. Adding it is on the list for the first tagged release.
+copied into every archive instead. It was still missing when 0.1.0 was tagged, so that release
+carries the placeholder too; adding a real one is the outstanding licensing chore.

@@ -184,6 +184,49 @@ func TestViewerCannotOpenShellDesktopOrDownload(t *testing.T) {
 	}
 }
 
+// ---- viewer-02: the baseline routes. A preview, an evaluate and a remediate
+// read nothing: each one runs code on a device, so each is a write. The
+// compliance reads stay open to a viewer - the point of the feature is that
+// anyone can see the state of the fleet. ----
+
+func TestViewerCannotMutateBaselines(t *testing.T) {
+	_, ts, admin := newTestServerWith(t, Config{})
+	admin.mustJSON("POST", "/api/users", map[string]string{"username": "ro", "password": "password123", "role": "viewer"}, nil)
+	ro := newBrowser(t, ts)
+	ro.mustJSON("POST", "/api/auth/login", map[string]string{"username": "ro", "password": "password123"}, nil)
+
+	denied := []struct{ method, path string }{
+		{"POST", "/api/baselines"},
+		{"PUT", "/api/baselines/1"},
+		{"DELETE", "/api/baselines/1"},
+		{"POST", "/api/baselines/1/evaluate"},
+		{"POST", "/api/baselines/1/remediate"},
+		{"POST", "/api/baselines/preview"},
+	}
+	for _, d := range denied {
+		if st, body := ro.do(d.method, d.path, map[string]any{}); st != http.StatusForbidden {
+			t.Errorf("viewer %s %s should be 403, got %d %s", d.method, d.path, st, body)
+		}
+		// The 403 is the role gate, not the route: an admin gets past it and
+		// is stopped later by the baseline or the device not existing.
+		if st, body := admin.do(d.method, d.path, map[string]any{}); st == http.StatusForbidden {
+			t.Errorf("admin %s %s was refused by the role gate: %d %s", d.method, d.path, st, body)
+		}
+	}
+	for _, p := range []string{"/api/baselines", "/api/compliance"} {
+		if st, body := ro.do("GET", p, nil); st != http.StatusOK {
+			t.Errorf("viewer GET %s should be 200, got %d %s", p, st, body)
+		}
+	}
+	// The per-device reads are open to a viewer too; an unknown device is a
+	// 404 from the store, never a 403 from the role gate.
+	for _, p := range []string{"/api/agents/x/baselines", "/api/agents/x/baselines/history"} {
+		if st, body := ro.do("GET", p, nil); st == http.StatusForbidden {
+			t.Errorf("viewer GET %s was refused by the role gate: %d %s", p, st, body)
+		}
+	}
+}
+
 // ---- sec-03: 30 concurrent enrolments with a one-use token produced 22
 // devices and left uses_left at -10, which reads as "unlimited" forever. ----
 

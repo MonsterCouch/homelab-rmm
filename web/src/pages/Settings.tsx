@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
 import type { Settings as SettingsT } from '../api/types';
 import { Button, CopyButton, ErrorBox, Field, Loading, Switch, TagInput } from '../components/ui';
@@ -14,6 +14,11 @@ export function Settings() {
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState(false);
+  // What is on screen right now, readable from inside an awaited save. Every
+  // edit makes a new object, so identity answers "was this changed while the
+  // request was in flight?".
+  const latest = useRef<SettingsT | null>(null);
+  latest.current = form;
 
   useEffect(() => {
     if (settings.data && !dirty) setForm(settings.data);
@@ -32,10 +37,16 @@ export function Settings() {
 
   const save = async () => {
     setBusy(true);
+    const sent = form;
     try {
-      const saved = await api.saveSettings(form);
-      setForm(saved);
-      setDirty(false);
+      const saved = await api.saveSettings(sent);
+      // Taking the server's copy back is right only if nothing was typed
+      // while the request was in flight; otherwise the newer edit would be
+      // silently reverted and the form would go clean with it.
+      if (latest.current === sent) {
+        setForm(saved);
+        setDirty(false);
+      }
       toast.success('Settings saved', 'Agent intervals were pushed to connected devices.');
       void system.reload();
     } catch (err) {

@@ -231,7 +231,8 @@ the pin.
   to every connected agent when saved. The patch scan interval field is stored for future use;
   today scans are driven by patch policies and by the first-contact scan.
 - **Retention** — days to keep metrics (30), script runs (90), audit entries (365), agent
-  events (30). Resolved alerts follow the audit setting. Purge runs hourly. Shrinking retention
+  events (30). Resolved alerts follow the audit setting, and baseline drift history follows the
+  agent-events setting. Purge runs hourly. Shrinking retention
   does not shrink `rmm.db` on disk until you `VACUUM` it (`sqlite3 rmm.db VACUUM` with the server
   stopped).
 

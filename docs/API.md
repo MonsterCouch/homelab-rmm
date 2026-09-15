@@ -49,8 +49,11 @@ Go structs in the same package (`Agent`, `Script`, `Run`, `Task`, `Automation`, 
 
 `GET /api/events` is Server-Sent Events. Event names: `agent_online`, `agent_offline`, `metrics`
 (data = latest `protocol.Metrics`), `inventory`, `event`, `alert`, `run` (data =
-`{run_id, status?, stream?, data?, exit_code?}` — streamed script output), `patches`. Each has
-`{kind, agent_id, data}` JSON in the data field.
+`{run_id, status?, stream?, data?, exit_code?}` — streamed script output), `patches`, `baseline`
+(data = `{baseline_id, version, trigger, ts, counts{pass,fail,fixed,error,skipped}, compliance,
+changed[{check_id,from,to}], changed_truncated?}` — a notification, not data: refetch). Each has
+`{kind, agent_id, data}` JSON in the data field. An `EventSource` only receives named events it has
+a listener for, so a new kind has to be added to `KINDS` in `web/src/hooks/useEvents.tsx` as well.
 
 ## Endpoints
 
@@ -83,15 +86,34 @@ See `routes()` in `internal/server/api.go`. Highlights:
   5-field cron or `@hourly`/`@daily`; `targets` = `{all, agents[], groups[], tags[], os}`),
   `POST /api/tasks/{id}/run`.
 - Automations `/api/automations` (`trigger`: agent_online|agent_offline|alert_opened|alert_resolved|
-  enrolled|reboot_required|patch_installed; `action`: run_script|email|webhook; `action_params`:
+  enrolled|reboot_required|patch_installed|drift_detected|drift_fixed; `action`:
+  run_script|email|webhook; `action_params`:
   `{script_id, args}` / `{subject}` / `{url}`; `filter`: `{targets, rule_ids[], severity}`).
   `agent_online`/`agent_offline` follow the socket with no grace period, so a reconnect flap
   fires both — use an `offline` alert rule plus `alert_opened` when you want "offline for N
-  minutes". Each automation is capped at 60 fires a minute.
+  minutes". `drift_detected`/`drift_fixed` carry no `rule_id`, so a `rule_ids` filter never matches
+  one; their data map is `{baseline_id, baseline_name, check_id, check_name, kind, severity, state,
+  expected, observed, detail}`. Each automation is capped at 60 fires a minute.
 - Alert rules `/api/alert-rules` (`kind`: cpu|memory|disk|offline|service|reboot_required|
   script_failed|patch_failed|event; `params`: `{threshold, minutes, mount, service, pattern}`),
-  alerts `/api/alerts?status=open|acked|resolved|all`, `POST /api/alerts/{id}/ack|resolve`,
-  `POST /api/alerts/resolve-all`.
+  alerts `/api/alerts?status=open|acked|resolved|all`. Baseline drift produces alerts with
+  `rule_kind: "drift"` and a null `rule_id` — they have no `alert_rules` row, and `drift` is
+  deliberately not a creatable rule kind.
+  `POST /api/alerts/{id}/ack|resolve`, `POST /api/alerts/resolve-all`.
+- Baselines: `GET /api/baselines`, `POST /api/baselines` (201), `GET|PUT|DELETE
+  /api/baselines/{id}`, `GET /api/baselines/{id}/status?limit=` (the device × check matrix),
+  `POST /api/baselines/{id}/evaluate {agent_ids?}` (always 200; per-device `queued|offline|error`),
+  `POST /api/baselines/{id}/remediate {agent_id, check_ids?}` (409 when the device is offline),
+  `POST /api/baselines/preview {spec, agent_ids}` (1–10 devices, always 200; per-device
+  `ok|offline|timeout|error`; check ids are synthetic negatives), `GET /api/agents/{id}/baselines`,
+  `GET /api/agents/{id}/baselines/history?limit=&baseline_id=` (`baseline_id` narrows the rows to
+  one baseline in SQL), `GET /api/compliance`. A `PUT` is a **merge**:
+  a check with an `id` is updated in place, one without is inserted, one missing from the body is
+  deleted with its results and alerts. Reads are session-only (viewers included); every mutation
+  and `evaluate`/`remediate`/`preview` needs the write role, and a `command` check, a `file` check
+  outside `/etc`/`ProgramData` or an `allow_reboot` check needs **admin** — on `preview` as well as
+  on the save path, because a preview runs the draft on the devices it names. Full shapes and the
+  check-kind parameter schemas are in [BASELINES.md](BASELINES.md).
 - Patches `/api/patches?agent=&status=`, `POST /api/patches/status {items:[{AgentID,PatchID}], status: approved|ignored|available}`,
   policies `/api/patch-policies` (`mode`: approved|all|security; `reboot`: never|if_required|always).
 - Admin: `/api/settings` (GET/PUT `Settings`), `POST /api/settings/test-mail`, `/api/users`,

@@ -14,6 +14,7 @@ import {
   IconAlert,
   IconAudit,
   IconAutomation,
+  IconBaseline,
   IconBell,
   IconDashboard,
   IconDevices,
@@ -40,6 +41,7 @@ const NAV = [
   { to: '/runs', label: 'Runs', icon: IconRuns },
   { to: '/tasks', label: 'Tasks', icon: IconTasks },
   { to: '/automations', label: 'Automations', icon: IconAutomation },
+  { to: '/baselines', label: 'Baselines', icon: IconBaseline },
   { to: '/alerts', label: 'Alerts', icon: IconAlert, badge: true },
   { to: '/patches', label: 'Patches', icon: IconPatch },
 ];
@@ -83,7 +85,16 @@ export function Layout() {
         </div>
         <div className="nav-section">Manage</div>
         {NAV.map((n) => (
-          <NavLink key={n.to} to={n.to} end={n.end} className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`} title={n.label} aria-label={n.label}>
+          <NavLink
+            key={n.to}
+            to={n.to}
+            end={n.end}
+            className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
+            title={n.label}
+            // aria-label REPLACES the link's text for a screen reader, so the
+            // open-alert badge beside it was announced as nothing at all.
+            aria-label={n.badge && openAlerts > 0 ? `${n.label} (${openAlerts} open)` : n.label}
+          >
             <n.icon />
             <span>{n.label}</span>
             {n.badge && openAlerts > 0 && <span className="badge">{openAlerts}</span>}
@@ -282,6 +293,7 @@ const GOTO: Record<string, string> = {
   a: '/alerts',
   p: '/patches',
   m: '/automations',
+  b: '/baselines',
 };
 
 const SHORTCUTS: { keys: string[]; what: string }[] = [
@@ -292,6 +304,7 @@ const SHORTCUTS: { keys: string[]; what: string }[] = [
   { keys: ['g', 'r'], what: 'Go to runs' },
   { keys: ['g', 't'], what: 'Go to tasks' },
   { keys: ['g', 'm'], what: 'Go to automations' },
+  { keys: ['g', 'b'], what: 'Go to baselines' },
   { keys: ['g', 'a'], what: 'Go to alerts' },
   { keys: ['g', 'p'], what: 'Go to patches' },
   { keys: ['n'], what: 'New — the primary action on this page' },

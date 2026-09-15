@@ -61,8 +61,8 @@ const (
 	ReqWakeOnLan         = "wol"
 	ReqAgentUpdate       = "agent.update"
 	ReqAgentConfig       = "agent.config"
-	ReqBaselineEvaluate  = "baseline.evaluate"  // evaluate assigned baselines now; reply []BaselineReport
-	ReqBaselineRemediate = "baseline.remediate" // run the fixes for listed checks now; reply BaselineReport
+	ReqBaselineEvaluate  = "baseline.evaluate"  // evaluate assigned baselines now; reply is an ACK, results arrive as TypeBaseline frames
+	ReqBaselineRemediate = "baseline.remediate" // run the fixes for listed checks now; reply is an ACK, the result arrives as a TypeBaseline frame
 	ReqBaselinePreview   = "baseline.preview"   // evaluate an unsaved spec, never storing or fixing; reply BaselineReport
 )
 

@@ -73,6 +73,12 @@ func installUpdates(ctx context.Context, req protocol.UpdatesInstall, progress f
 		}
 		args = append(args, id)
 	}
+	// One servicing operation at a time on this device. A baseline `package`
+	// or `windows_feature` remediation takes the same mutex and backs off
+	// rather than meeting a held WUA or DISM lock, which surfaces as a failed
+	// install instead of as a queue (see pkgOpMutex in baseline_kinds.go).
+	pkgOpMutex.Lock()
+	defer pkgOpMutex.Unlock()
 	// The request's context dies with the WebSocket it arrived on. Killing
 	// PowerShell in the middle of $installer.Install() because the socket
 	// blipped would leave a half-applied cumulative update, so the install

@@ -29,6 +29,11 @@ func (s *Server) loadSettings() Settings {
 	st.SMTP = s.mail.settings()
 	st.AgentDefaults = protocol.AgentConfig{MetricsIntervalSec: 30, InventoryIntervalSec: 3600, PatchScanIntervalSec: 6 * 3600}
 	s.db.SettingJSON("agent_defaults", &st.AgentDefaults)
+	// agent_defaults is an operator-editable blob unmarshalled into the same
+	// struct the agent config is built from. Baselines are resolved per device
+	// from their targets and must never travel through here: a set frozen into
+	// this row would be pushed to every device whatever its targets say.
+	st.AgentDefaults.Baselines = nil
 	st.Retention.MetricsDays, st.Retention.RunsDays, st.Retention.AuditDays, st.Retention.EventsDays = 30, 90, 365, 30
 	s.db.SettingJSON("retention", &st.Retention)
 	return st
@@ -87,6 +92,7 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	changes := settingsDiff(cur, in)
 	s.db.SetSetting("public_url", in.PublicURL)
 	s.db.SetSettingJSON("smtp", in.SMTP)
+	in.AgentDefaults.Baselines = nil // never stored in settings; see loadSettings
 	s.db.SetSettingJSON("agent_defaults", in.AgentDefaults)
 	s.db.SetSettingJSON("retention", in.Retention)
 	// The audit log is the one place that answers "who changed what", and a

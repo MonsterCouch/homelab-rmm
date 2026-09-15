@@ -260,6 +260,13 @@ export const IconWrench = (p: P) => (
     <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9z" />
   </svg>
 );
+// Baselines: a shield with a tick — desired state, held.
+export const IconBaseline = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M12 3l7 3v6c0 4.4-3 8.3-7 9-4-0.7-7-4.6-7-9V6l7-3z" />
+    <path d="M9 12l2 2 4-4" />
+  </svg>
+);
 export const IconGrid = (p: P) => (
   <svg {...base(p)}>
     <rect x="3" y="3" width="7" height="7" />

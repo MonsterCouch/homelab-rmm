@@ -127,6 +127,44 @@ account by accident. A viewer is also refused the endpoints that are reads only 
 the hostname adoption below, to take over an offline device's record). Browsing a directory
 listing stays available.
 
+**Baseline enforcement and the `command` kind.** An **enforced** baseline changes devices with no
+further confirmation, and a `command` check is arbitrary code run as SYSTEM/root on every matched
+device on a timer. Four things bound that:
+
+- Enforcement is opt-in and loud. `enforce` defaults to false, the console toggle carries an
+  explicit warning, and both seeded baselines ship **disabled and unenforced** with every
+  destructive check (`group_members`, the SMB1 registry value, service start-type changes,
+  `reboot_pending`) shipping `remediate = 0`. The Linux seed's `sudo`/`wheel` reviews carry an
+  empty `allowed` list on purpose: a shipped allow-list there would be a fleet-wide
+  privilege-removal button one toggle away.
+- Extra privilege for the sharp kinds. Creating, editing **or previewing** a baseline containing a
+  `command` check, a `file` check writing outside `/etc` or `ProgramData`, or a `reboot_pending`
+  check with `allow_reboot` requires the **admin** role — the routes are `requireWrite`, and the
+  handlers check admin themselves. Preview is on that list because it *runs* the draft on the
+  devices named in the request: gating only the save path would leave the same script one
+  `POST /api/baselines/preview` away for any write account. They are audited as
+  `baseline.command_check` (with `"preview": true` and the agent ids when it was a dry run) and
+  `baseline.reboot_check` with the check name, alongside
+  `baseline.create/update/delete/enable/disable/evaluate/remediate/preview`. A baseline targeting `{"all": true}` that enforces an `allow_reboot` check is
+  refused unless the request carries `"confirm_fleet_reboot": true`.
+- **The refusals live on the device.** The agent enforces them whatever the server was talked into
+  sending: never empty `Administrators`/`sudo`/`wheel`/`adm`/`root` or remove RID 500, uid 0, the
+  account the agent runs as, or a domain principal without `allow_domain`; never change a
+  `boot`/`system` service start type; never stop or disable the agent's own service; never write
+  to `/proc`, `/sys`, `/dev`, `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers`,
+  `C:\Windows\System32\config` or the agent's own configuration directory; never follow a symlink
+  in a managed path's parent chain; never delete a directory; never accept a mode with a
+  setuid/setgid/sticky bit; at most one baseline-initiated reboot per device per 24 h, and none
+  while a script run or shell session is live. A `command` check runs through the same path as a
+  script run — a temp directory, a 0700 file, `exec.Command` with arguments, never a shell string.
+- **Windows package installs stay refused.** The `package` kind will not invoke winget from the
+  service account unless the check sets `allow_winget: true` *and* winget resolves, matching the
+  existing patch-management decision rather than quietly working around it.
+
+**Check parameters are not a place for secrets.** `GET /api/baselines/{id}` is session-only, which
+includes **viewers**, and the parameters carry the `command` bodies and any `file` content verbatim.
+The console says so in the Add-check dialog. Have the check read a secret on the device instead.
+
 **Audit.** Every login, script run, shell and desktop session, power action, patch operation,
 settings change and user change is written to the `audit` table with user and source address,
 along with `setup.refused` (a wrong setup code), `agent.enrolled`, `agent.rekeyed` and
@@ -230,6 +268,18 @@ Verify a fingerprint out of band before pasting it; it is the trust anchor for t
 - **Remote desktop shows whatever is on screen**, including the lock screen and UAC prompts on
   Windows (by design, via the SYSTEM token). Sessions are audited; there is no on-screen consent
   prompt for the person at the device.
+- **A `tech` can still make a device run code on a timer.** The admin gate covers the `command`,
+  privileged-`file` and `allow_reboot` kinds, but a write account can create a baseline of the
+  other kinds, enable it, enforce it and have every matched device act on it every minute. The
+  blast radius of `tech` is deliberately close to `admin`; the difference is user management and
+  the sharp kinds, not "cannot change devices".
+- **Baseline check parameters are stored and served in clear text**, like script parameters, and
+  are readable by every signed-in account including `viewer`.
+- **A preview runs the draft's `check` scripts on real devices** before anything is saved. It never
+  fixes, never writes to the device and never stores a result, but the code does execute — which is
+  why the endpoint is audited, needs the write role, and needs **admin** for exactly the drafts
+  saving would need admin for (a `command` check, a `file` check outside the managed trees, an
+  `allow_reboot` check).
 
 ## Recommendations
 

@@ -24,6 +24,7 @@ import { EventLog } from './EventLog';
 import { DevicePatches } from './DevicePatches';
 import { DeviceRuns } from './DeviceRuns';
 import { DeviceEvents } from './DeviceEvents';
+import { Compliance } from './Compliance';
 
 export interface TabProps {
   agent: Agent;
@@ -41,11 +42,14 @@ const TABS: readonly { id: string; label: string; needsOnline?: boolean }[] = [
   { id: 'files', label: 'Files', needsOnline: true },
   { id: 'eventlog', label: 'Event log', needsOnline: true },
   { id: 'patches', label: 'Patches' },
+  // No needsOnline: the last known compliance of a device that is not
+  // answering is exactly what this tab is for.
+  { id: 'compliance', label: 'Compliance' },
   { id: 'runs', label: 'Runs' },
   { id: 'events', label: 'Events' },
 ];
 
-type TabId = 'overview' | 'terminal' | 'desktop' | 'processes' | 'services' | 'software' | 'files' | 'eventlog' | 'patches' | 'runs' | 'events';
+type TabId = 'overview' | 'terminal' | 'desktop' | 'processes' | 'services' | 'software' | 'files' | 'eventlog' | 'patches' | 'compliance' | 'runs' | 'events';
 
 export function DeviceDetail() {
   const { id = '', tab = 'overview' } = useParams();
@@ -211,6 +215,7 @@ export function DeviceDetail() {
           {activeTab === 'files' && <Files {...tabProps} />}
           {activeTab === 'eventlog' && <EventLog {...tabProps} />}
           {activeTab === 'patches' && <DevicePatches {...tabProps} />}
+          {activeTab === 'compliance' && <Compliance {...tabProps} />}
           {activeTab === 'runs' && <DeviceRuns {...tabProps} />}
           {activeTab === 'events' && <DeviceEvents {...tabProps} />}
         </>

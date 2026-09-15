@@ -359,7 +359,9 @@ export type AutomationTrigger =
   | 'alert_resolved'
   | 'enrolled'
   | 'reboot_required'
-  | 'patch_installed';
+  | 'patch_installed'
+  | 'drift_detected'
+  | 'drift_fixed';
 
 export type AutomationAction = 'run_script' | 'email' | 'webhook';
 
@@ -557,6 +559,312 @@ export interface WolResult {
   macs: string[];
 }
 
+// ---- baselines (desired state, drift detection, self-healing) ----
+// Mirrors internal/server/api_baselines.go and internal/baselines. `params`
+// is a JSON object on the wire; the shapes per kind live in
+// components/baselines/kinds.ts, which is the console half of the one
+// validator both the server and the agent use.
+
+export type BaselineKind =
+  | 'service'
+  | 'package'
+  | 'registry'
+  | 'file'
+  | 'command'
+  | 'group_members'
+  | 'firewall'
+  | 'time_sync'
+  | 'sysctl'
+  | 'windows_feature'
+  | 'reboot_pending'
+  | 'disk_free';
+
+/** A check's state after one evaluation pass. A check with no row yet is "unknown" in the UI only. */
+export type BaselineState = 'pass' | 'fail' | 'fixed' | 'error' | 'skipped';
+
+export type BaselineTrigger = 'schedule' | 'startup' | 'config' | 'manual' | 'remediate' | 'preview';
+
+export type BaselineParams = Record<string, unknown>;
+
+export interface BaselineCheck {
+  /** 0 on a check that has not been saved yet; permanent once assigned (A1). */
+  id: number;
+  baseline_id?: number;
+  /** presentation order only — never an identity */
+  position?: number;
+  name: string;
+  kind: BaselineKind;
+  params: BaselineParams;
+  remediate: boolean;
+  severity: Severity;
+  os_filter: string;
+  timeout_sec: number;
+}
+
+export interface Baseline {
+  id: number;
+  name: string;
+  description: string;
+  targets: Targets;
+  enforce: boolean;
+  interval_sec: number;
+  notify_email: boolean;
+  enabled: boolean;
+  version: number;
+  checks_count: number;
+  devices: number;
+  devices_reported: number;
+  devices_drifted: number;
+  devices_unknown: number;
+  /** 0..100, or null when no check applies (A25) */
+  compliance: number | null;
+  last_change: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface BaselineDetail extends Baseline {
+  checks: BaselineCheck[];
+}
+
+/** POST /api/baselines and PUT /api/baselines/{id}. */
+export interface BaselineInput {
+  name: string;
+  description: string;
+  targets: Targets;
+  enforce: boolean;
+  interval_sec: number;
+  notify_email: boolean;
+  enabled: boolean;
+  checks: BaselineCheckInput[];
+  /** save a baseline whose targets match nothing (A50) */
+  allow_empty_targets?: boolean;
+  /** an allow_reboot check on {all:true} targets needs this (A41) */
+  confirm_fleet_reboot?: boolean;
+}
+
+export interface BaselineCheckInput {
+  /** omitted or 0 inserts; an existing id updates in place (A2) */
+  id?: number;
+  name: string;
+  kind: BaselineKind;
+  params: BaselineParams;
+  remediate: boolean;
+  severity: Severity;
+  os_filter: string;
+  timeout_sec: number;
+}
+
+export interface BaselineResult {
+  check_id: number;
+  state: BaselineState;
+  expected: string;
+  observed: string;
+  detail: string;
+  fixed: boolean;
+  duration_ms: number;
+  version: number;
+  /** the baseline changed after this result: the console greys it as "awaiting re-evaluation" (A12) */
+  stale: boolean;
+  /** the device clock at evaluation */
+  checked_at: number;
+  /** server time the report landed */
+  received_at: number;
+  /** server time the current state began (A24) */
+  since: number;
+}
+
+export interface BaselineCounts {
+  pass: number;
+  fail: number;
+  fixed: number;
+  error: number;
+  skipped: number;
+  unknown: number;
+}
+
+export interface BaselineDeviceStatus {
+  agent_id: string;
+  agent_name: string;
+  os: OS;
+  online: boolean;
+  maintenance_until: number;
+  compliance: number | null;
+  stale: boolean;
+  version: number;
+  last_report: number;
+  last_trigger: string;
+  counts: BaselineCounts;
+  results: BaselineResult[];
+}
+
+export interface BaselineSummary {
+  devices: number;
+  devices_reported: number;
+  devices_drifted: number;
+  devices_unknown: number;
+  compliance: number | null;
+}
+
+export interface BaselineStatus {
+  baseline: Baseline;
+  checks: BaselineCheck[];
+  devices: BaselineDeviceStatus[];
+  summary: BaselineSummary;
+  truncated: boolean;
+}
+
+export interface BaselineEvaluateAgent {
+  agent_id: string;
+  status: 'queued' | 'offline' | 'error' | string;
+  error?: string;
+}
+
+export interface BaselineEvaluateResult {
+  baseline_id: number;
+  requested: number;
+  queued: number;
+  offline: number;
+  agents: BaselineEvaluateAgent[];
+}
+
+export interface BaselineRefusal {
+  check_id: number;
+  reason: string;
+}
+
+export interface BaselineRemediateResult {
+  baseline_id: number;
+  agent_id: string;
+  accepted: number[];
+  refused: BaselineRefusal[];
+  /** always null: the pass arrives as a `baseline` SSE event (A6) */
+  report: null;
+}
+
+/** The unsaved spec a preview evaluates. Check ids are assigned by the server as -(index+1) (A7). */
+export interface BaselinePreviewSpec {
+  name: string;
+  enforce: boolean;
+  interval_sec: number;
+  checks: BaselineCheckInput[];
+}
+
+export interface BaselinePreviewSpecCheck {
+  index: number;
+  id: number;
+  name: string;
+  kind: string;
+  os_filter: string;
+}
+
+export interface BaselinePreviewResult {
+  check_id: number;
+  state: BaselineState;
+  expected: string;
+  observed: string;
+  detail: string;
+  fixed: boolean;
+  duration_ms: number;
+}
+
+export interface BaselinePreviewDevice {
+  agent_id: string;
+  agent_name: string;
+  os: OS;
+  status: 'ok' | 'offline' | 'timeout' | 'error' | string;
+  error: string;
+  results: BaselinePreviewResult[];
+  duration_ms: number;
+}
+
+export interface BaselinePreview {
+  spec_checks: BaselinePreviewSpecCheck[];
+  devices: BaselinePreviewDevice[];
+}
+
+export interface AgentBaselineCheck extends BaselineCheck {
+  result: BaselineResult | null;
+}
+
+export interface AgentBaseline {
+  id: number;
+  name: string;
+  enforce: boolean;
+  enabled: boolean;
+  interval_sec: number;
+  version: number;
+  last_report: number;
+  last_trigger: string;
+  stale: boolean;
+  compliance: number | null;
+  counts: BaselineCounts;
+  checks: AgentBaselineCheck[];
+}
+
+export interface AgentBaselines {
+  agent_id: string;
+  online: boolean;
+  compliance: number | null;
+  baselines: AgentBaseline[];
+}
+
+export interface BaselineHistoryRow {
+  id: number;
+  ts: number;
+  baseline_id: number;
+  baseline_name: string;
+  check_id: number;
+  check_name: string;
+  from_state: string;
+  to_state: string;
+  detail: string;
+}
+
+export interface AgentBaselineHistory {
+  agent_id: string;
+  history: BaselineHistoryRow[];
+}
+
+export interface ComplianceWorstCheck {
+  baseline_id: number;
+  baseline_name: string;
+  check_id: number;
+  check_name: string;
+  kind: string;
+  severity: string;
+  failing: number;
+  applicable: number;
+}
+
+export interface ComplianceBaseline {
+  id: number;
+  name: string;
+  enabled: boolean;
+  enforce: boolean;
+  score: number | null;
+  devices: number;
+  devices_drifted: number;
+}
+
+export interface ComplianceSummary {
+  score: number | null;
+  devices_total: number;
+  devices_with_baselines: number;
+  devices_compliant: number;
+  devices_drifted: number;
+  devices_unknown: number;
+  checks_total: number;
+  checks_failing: number;
+  checks_error: number;
+  open_drift_alerts: number;
+  baselines_enabled: number;
+  baselines_enforcing: number;
+  worst_checks: ComplianceWorstCheck[];
+  by_baseline: ComplianceBaseline[];
+  updated_at: number;
+}
+
 // ---- SSE ----
 
 export type EventKind =
@@ -568,7 +876,8 @@ export type EventKind =
   | 'event'
   | 'alert'
   | 'run'
-  | 'patches';
+  | 'patches'
+  | 'baseline';
 
 export interface RunEventData {
   run_id: string;
@@ -583,6 +892,21 @@ export interface AlertEventData {
   status?: string;
   severity?: string;
   title?: string;
+}
+
+/**
+ * One ingested baseline report. It is a notification, not data: `changed`
+ * carries only real transitions (capped at 20) and the console refetches.
+ */
+export interface BaselineEventData {
+  baseline_id: number;
+  version: number;
+  trigger: string;
+  ts: number;
+  counts: { pass: number; fail: number; fixed: number; error: number; skipped: number };
+  compliance: number | null;
+  changed: { check_id: number; from: string; to: string }[];
+  changed_truncated?: boolean;
 }
 
 export interface HubEvent<T = unknown> {

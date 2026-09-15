@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 )
@@ -19,6 +20,12 @@ const seededKey = "seeded"
 // Call it after openDB and before the alert engine and scheduler are
 // constructed: both read their tables once at startup.
 func seedDefaults(db *DB) error {
+	// Baselines carry their OWN guard key. Every v0.1.0 database already has
+	// seeded=1, so hanging them off that key would mean the starter baselines
+	// never appear on an upgrade - only on a database created from scratch.
+	if err := seedBaselines(db); err != nil {
+		return fmt.Errorf("seed baselines: %w", err)
+	}
 	if db.Setting(seededKey, "") == "1" {
 		return nil
 	}
@@ -51,6 +58,111 @@ func tableEmpty(db *DB, table string) (bool, error) {
 		return false, err
 	}
 	return n == 0, nil
+}
+
+// ---- baselines ----
+
+// seededBaselinesKey is separate from seededKey on purpose: baselines shipped
+// after 0.1.0, and every database from that release already records seeded=1.
+const seededBaselinesKey = "seeded_baselines"
+
+// seedBaseline is a starter desired-state definition. Both ship DISABLED and
+// NOT ENFORCED, and every destructive check in them ships with remediate off:
+// a seeded baseline must never change a device before an operator has read it,
+// enabled it and turned enforcement on deliberately.
+type seedBaseline struct {
+	Name        string
+	Description string
+	Targets     Targets
+	IntervalSec int
+	Checks      []baselineCheckInput
+}
+
+func seedBaselines(db *DB) error {
+	if db.Setting(seededBaselinesKey, "") == "1" {
+		return nil
+	}
+	empty, err := tableEmpty(db, "baselines")
+	if err != nil {
+		return err
+	}
+	if !empty {
+		// An operator already has baselines: record that seeding is done
+		// rather than adding ours beside theirs on every start.
+		return db.SetSetting(seededBaselinesKey, "1")
+	}
+	for _, b := range defaultBaselines {
+		in := baselineInput{Name: b.Name, Description: b.Description, Targets: b.Targets,
+			IntervalSec: b.IntervalSec, Checks: b.Checks, AllowEmptyTargets: true}
+		// The same validator the API uses: a typo in a seeded check must fail
+		// here, not on a device.
+		if err := validateBaselineInput(&in); err != nil {
+			return fmt.Errorf("%q: %w", b.Name, err)
+		}
+		res, err := db.Exec(`INSERT INTO baselines(name, description, targets, enforce, interval_sec, notify_email, enabled, version, created_at, updated_at)
+			VALUES(?,?,?,0,?,0,0,1,?,?)`, in.Name, in.Description, jsonText(in.Targets), in.IntervalSec, now(), now())
+		if err != nil {
+			return fmt.Errorf("%q: %w", b.Name, err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		for i, c := range in.Checks {
+			if _, err := db.Exec(`INSERT INTO baseline_checks(baseline_id, position, name, kind, params, remediate, severity, os_filter, timeout_sec)
+				VALUES(?,?,?,?,?,?,?,?,?)`, id, i, c.Name, c.Kind, string(c.Params), c.Remediate, c.Severity, c.OSFilter, c.TimeoutSec); err != nil {
+				return fmt.Errorf("%q check %q: %w", b.Name, c.Name, err)
+			}
+		}
+	}
+	slog.Info("seeded baselines", "count", len(defaultBaselines))
+	return db.SetSetting(seededBaselinesKey, "1")
+}
+
+func seedParams(v string) json.RawMessage { return json.RawMessage(v) }
+
+var defaultBaselines = []seedBaseline{
+	{
+		Name:        "Windows workstation hygiene",
+		Description: "Firewall, time sync, SMB1, the print spooler, local administrators, pending reboots and free space on C:. Disabled and not enforced: read it, adjust it, then enable it.",
+		Targets:     Targets{All: true, OS: "windows"},
+		IntervalSec: 3600,
+		Checks: []baselineCheckInput{
+			{Name: "Windows Firewall on for all profiles", Kind: "firewall", Params: seedParams(`{"enabled":true}`), Remediate: true, Severity: "critical", OSFilter: "windows", TimeoutSec: 60},
+			{Name: "Time synchronisation on", Kind: "time_sync", Params: seedParams(`{"enabled":true}`), Remediate: true, Severity: "warning", OSFilter: "windows", TimeoutSec: 60},
+			// Destructive or disruptive: report only until an operator says otherwise.
+			{Name: "SMB1 server disabled", Kind: "registry", Params: seedParams(`{"path":"HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters","name":"SMB1","type":"dword","value":0}`), Remediate: false, Severity: "critical", OSFilter: "windows", TimeoutSec: 60},
+			{Name: "Print Spooler stopped and set to manual", Kind: "service", Params: seedParams(`{"name":"Spooler","state":"stopped","start_type":"manual"}`), Remediate: false, Severity: "warning", OSFilter: "windows", TimeoutSec: 60},
+			{Name: "Review members of Administrators", Kind: "group_members", Params: seedParams(`{"group":"Administrators","allowed":["Administrator"],"mode":"subset"}`), Remediate: false, Severity: "warning", OSFilter: "windows", TimeoutSec: 60},
+			{Name: "No reboot pending for more than 72 hours", Kind: "reboot_pending", Params: seedParams(`{"max_hours":72,"allow_reboot":false}`), Remediate: false, Severity: "warning", OSFilter: "windows", TimeoutSec: 60},
+			{Name: "C: at least 10% free", Kind: "disk_free", Params: seedParams(`{"mount":"C:","min_free_pct":10}`), Remediate: false, Severity: "warning", OSFilter: "windows", TimeoutSec: 60},
+		},
+	},
+	{
+		Name:        "Linux server hygiene",
+		Description: "SSH, time sync, firewall, IP forwarding, unattended upgrades, free space and who is in sudo/wheel. Disabled and not enforced; the membership checks are report-only on purpose.",
+		Targets:     Targets{All: true, OS: "linux"},
+		IntervalSec: 3600,
+		Checks: []baselineCheckInput{
+			// The unit is ssh.service on Debian/Ubuntu and sshd.service on
+			// RHEL/SUSE. Both ship at severity info, which never opens an
+			// alert (A20), so the family that does not have the unit reports
+			// its error quietly instead of drift-alerting the whole fleet.
+			{Name: "SSH server running and enabled (Debian/Ubuntu: ssh)", Kind: "service", Params: seedParams(`{"name":"ssh","state":"running","start_type":"auto"}`), Remediate: false, Severity: "info", OSFilter: "linux", TimeoutSec: 60},
+			{Name: "SSH server running and enabled (RHEL/SUSE: sshd)", Kind: "service", Params: seedParams(`{"name":"sshd","state":"running","start_type":"auto"}`), Remediate: false, Severity: "info", OSFilter: "linux", TimeoutSec: 60},
+			{Name: "Time synchronisation on", Kind: "time_sync", Params: seedParams(`{"enabled":true}`), Remediate: true, Severity: "warning", OSFilter: "linux", TimeoutSec: 60},
+			{Name: "Firewall on where one is installed", Kind: "firewall", Params: seedParams(`{"enabled":true}`), Remediate: true, Severity: "warning", OSFilter: "linux", TimeoutSec: 60},
+			{Name: "IP forwarding off", Kind: "sysctl", Params: seedParams(`{"key":"net.ipv4.ip_forward","value":"0"}`), Remediate: true, Severity: "warning", OSFilter: "linux", TimeoutSec: 60},
+			{Name: "unattended-upgrades installed (Debian/Ubuntu)", Kind: "package", Params: seedParams(`{"name":"unattended-upgrades","state":"present"}`), Remediate: false, Severity: "info", OSFilter: "linux", TimeoutSec: 120},
+			{Name: "Root filesystem at least 10% free", Kind: "disk_free", Params: seedParams(`{"mount":"/","min_free_pct":10}`), Remediate: false, Severity: "warning", OSFilter: "linux", TimeoutSec: 60},
+			// Report only, with an EMPTY allowed list: a shipped allow-list
+			// over sudo/wheel plus one enforce toggle is a fleet-wide
+			// privilege-removal button. This reports who is there; the
+			// operator decides.
+			{Name: "Review members of sudo (report only)", Kind: "group_members", Params: seedParams(`{"group":"sudo","allowed":[],"mode":"subset"}`), Remediate: false, Severity: "info", OSFilter: "linux", TimeoutSec: 60},
+			{Name: "Review members of wheel (report only)", Kind: "group_members", Params: seedParams(`{"group":"wheel","allowed":[],"mode":"subset"}`), Remediate: false, Severity: "info", OSFilter: "linux", TimeoutSec: 60},
+		},
+	},
 }
 
 func seedScripts(db *DB) error {

@@ -7,6 +7,116 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 Nothing yet.
 
+## [0.2.0] - 2026-09-15
+
+**Baselines: desired state, drift detection and self-healing.**
+
+A baseline is a named list of checks that says how a device should look, assigned with the same
+target model as tasks and alert rules (all / agents / groups / tags / OS). Agents evaluate their
+assigned baselines on their own interval — **offline too** — and report every pass. When the
+baseline is *enforced* and the check allows remediation, the agent fixes the drift itself and
+reports the check as `fixed`. Nothing in this release changes behaviour for an existing
+installation until an operator creates or enables a baseline.
+
+### Added
+- **Twelve check kinds**: `service`, `package`, `registry`, `file`, `command`, `group_members`,
+  `firewall`, `time_sync`, `sysctl`, `windows_feature`, `reboot_pending`, `disk_free`. Each check
+  carries its own severity, OS filter, timeout and `remediate` flag, so one baseline can fix the
+  two things you trust it to fix and only report the rest. Parameter shapes, limits and validation
+  live in the new `internal/baselines` package and are the single definition both sides use: the
+  server rejects an invalid check with a 400 naming the field, the agent re-validates before it
+  runs anything.
+- **Agent engine** (`internal/agent/baseline*.go`). One goroutine per process, so passes never
+  overlap; the next pass is scheduled an interval after the previous one *finished*; the start-up
+  pass and config-change passes are jittered so a fleet-wide edit is not a thundering herd; every
+  check runs under its own deadline enforced by the engine, so a check wedged in a syscall cannot
+  stop the device evaluating. `baselines.json` beside `agent.json` (0600, tmp+rename) holds the
+  specs, the last report per baseline and the per-check fix hold-offs, and is loaded *before* the
+  first connection, so a device that reboots while the server is unreachable still evaluates and
+  reports what it saw when it reconnects.
+- **Drift alerts** with the dedupe key `drift:<baseline>:<check>:<agent>`, `rule_kind` `drift` and
+  a null `rule_id`, opened at the check's severity and resolved automatically when the check passes
+  again. Severity `info` reports without ever opening an alert. A check that is re-fixed on five
+  consecutive passes opens a second `keeps drifting back` alert instead of raising an event every
+  interval.
+- **Automation triggers** `drift_detected` and `drift_fixed`, carrying the baseline, the check, its
+  kind, severity, state, expected, observed and detail.
+- **Compliance** per device, per baseline and fleet-wide, on the dashboard and on a new device
+  **Compliance** tab that works for an offline device — reading its last known state is the point.
+- **Preview**: dry-run an unsaved draft on up to ten live devices. It never fixes, never writes to
+  the device and never stores a result.
+- **Console**: a Baselines page, an editor with typed forms per kind (plus raw JSON, validated
+  against the same shapes), a device × check status matrix with per-cell detail and history, and a
+  dashboard tile. The enforce toggle carries an explicit warning that the agent will change these
+  devices without asking.
+- **API**: `GET/POST /api/baselines`, `GET/PUT/DELETE /api/baselines/{id}`,
+  `/api/baselines/{id}/status`, `/evaluate`, `/remediate`, `/api/baselines/preview`,
+  `/api/agents/{id}/baselines`, `/api/agents/{id}/baselines/history` and `/api/compliance`; a new
+  `baseline` SSE event. Audit actions `baseline.create/update/delete/enable/disable/evaluate/
+  remediate/preview/command_check/reboot_check`.
+- **Two seeded baselines**, *Windows workstation hygiene* and *Linux server hygiene*, both shipped
+  **disabled and unenforced** with every destructive check report-only. They run from their own
+  `seeded_baselines` guard rather than the existing `seeded` key, so they appear on upgrade from
+  0.1.0 as well as on a fresh database.
+- Database migration 4: `baselines`, `baseline_checks`, `baseline_results`, `baseline_state`,
+  `baseline_history`. `baseline_history` is purged on the events retention setting.
+
+### Security
+- **An enforced baseline changes devices without asking, and the `command` kind is arbitrary
+  root/SYSTEM code.** Enforcement is opt-in and warned about; creating, editing **or previewing** a
+  baseline that contains a `command` check, a `file` check writing outside `/etc` or `ProgramData`,
+  or a `reboot_pending` check with `allow_reboot` requires the **admin** role and is audited by
+  name (a preview is on that list because it runs the draft on the devices it names); a
+  fleet-wide (`{"all":true}`) enforced reboot check is refused without an explicit
+  `confirm_fleet_reboot`. `command` runs through the existing script-runner path — a temp
+  directory, a 0700 file, `exec.Command` with arguments, never a shell string.
+- **The dangerous refusals are enforced on the device**, so they hold whatever the server was
+  talked into sending: never empty `Administrators`/`sudo`/`wheel`/`adm`/`root` or remove RID 500,
+  uid 0, the account the agent runs as, or a domain principal without `allow_domain`; never change
+  a `boot`/`system` service start type; never stop or disable the agent's own service; never write
+  to `/proc`, `/sys`, `/dev`, `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers`,
+  `C:\Windows\System32\config` or the agent's own configuration directory; never follow a symlink
+  in a managed path's parent chain; never remove a directory; never accept a setuid/setgid/sticky
+  mode; at most one baseline-initiated reboot per device per 24 h, and none while a script run or
+  shell session is live.
+- A member name that would be read as an option by `gpasswd` or `net localgroup` (leading `-` or
+  `/`) is reported as drift and never passed to either tool.
+- Windows `package` remediation stays refused from the service account unless the check sets
+  `allow_winget: true` *and* winget resolves, matching the existing patch-management decision
+  rather than quietly working around it.
+- Baseline check parameters are readable by every signed-in account, viewers included; the console
+  says so in the Add-check dialog. They are not a place for secrets.
+- A baseline set can no longer be frozen into the operator-editable `agent_defaults` settings blob
+  and pushed to every device regardless of targets: `agentConfig` resolves baselines after the
+  settings unmarshal, and the settings writer nulls the field.
+
+### Changed
+- `alertEngine` gained `openDrift`, which opens an alert with a null `rule_id`, `rule_kind`
+  `drift` and the check's severity while reusing the same dedupe, maintenance-window suppression,
+  SSE broadcast and `alert_opened` automation. `drift` is deliberately **not** a creatable alert
+  rule kind.
+- `PATCH /api/agents/{id}` now pushes a fresh agent config when `group_id`, `clear_group` or
+  `tags` change, not only when `monitored_services` does, so a device that gains or loses a
+  baseline through group or tag membership learns about it immediately. Deleting a group pushes to
+  its former members.
+- Drift email is a **digest**: at most one mail per (device, baseline) per report, only when the
+  baseline has `notify_email` and a newly-transitioned check is `critical`, and suppressed if one
+  went out for that pair in the last hour. A first evaluation of a seven-check baseline over
+  twenty devices would otherwise have sent up to 140 mails.
+- `internal/protocol` is unchanged on the wire. Its comments on `baseline.evaluate` and
+  `baseline.remediate` still say "reply `[]BaselineReport`"; the replies are in fact ACKs
+  (`{"accepted":true,…}`) and the results arrive as one unsolicited `baseline` frame, because a
+  reply carrying the report as well would double every transition, alert and automation. The
+  comments will be corrected when the file is next opened.
+- `web/e2e/smoke.mjs` fails fast, naming the binary, when the agent it was given predates the
+  baselines API, instead of timing out 200 lines later on a selector.
+- `tools/build.sh package` refuses a staged binary older than the Go sources or `web/dist` it was
+  built from, naming the offending file, instead of silently archiving whatever `dist/` still held
+  from an earlier build. The console is embedded in the server binary, so that mismatch is
+  invisible until someone runs the archive: a `package` run on its own produced archives carrying
+  `docs/BASELINES.md` and a server with no baselines API in it. `ALLOW_STALE_BUILD=1` packages it
+  anyway; `make package` was never affected, since it depends on `server agents`.
+
 ## [0.1.0] - 2026-09-15
 
 Initial release.
@@ -197,5 +307,6 @@ Initial release.
   checksums), GitHub Actions build and release workflow, Dockerfile (distroless, agents baked
   in) and docker-compose, deploy examples (systemd unit, Caddy, nginx, uninstall scripts).
 
-[Unreleased]: https://github.com/MonsterCouch/homelab-rmm/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/MonsterCouch/homelab-rmm/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/MonsterCouch/homelab-rmm/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MonsterCouch/homelab-rmm/releases/tag/v0.1.0

@@ -336,6 +336,8 @@ func (sc *scheduler) purge() {
 	// single statement never holds the one SQLite connection for long.
 	sc.s.db.purgeByTS("metrics", "ts", now()-int64(ret.MetricsDays)*day)
 	sc.s.db.purgeByTS("agent_events", "ts", now()-int64(ret.EventsDays)*day)
+	// Drift history follows the events retention, as docs/BASELINES.md says.
+	sc.s.db.purgeByTS("baseline_history", "ts", now()-int64(ret.EventsDays)*day)
 	sc.s.db.Exec(`DELETE FROM script_runs WHERE started_at < ? AND status NOT IN ('running','queued')`, now()-int64(ret.RunsDays)*day)
 	sc.s.db.Exec(`DELETE FROM audit WHERE ts < ?`, now()-int64(ret.AuditDays)*day)
 	// Alerts whose kind has no auto-resolve path (a failed run, a failed

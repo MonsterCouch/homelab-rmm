@@ -27,8 +27,10 @@ they fit together; the wire types in `internal/protocol/protocol.go` and the rou
 ```
 cmd/rmm-server, cmd/rmm-agent   entry points, flag parsing, service specs
 internal/protocol               wire types (envelope, requests, replies)
+internal/baselines              desired-state param types, validation and limits, shared by both sides
 internal/server                 config, TLS, db + migrations, auth, hub, api_*.go, runs, alerts,
-                                scheduler, patches, mail, relay (shell + desktop), static, install, seed
+                                scheduler, patches, baselines, mail, relay (shell + desktop), static,
+                                install, seed
 internal/agent                  agent core (agent.go, conn.go, config.go), per-feature files with
                                 _windows.go / _linux.go implementations; platform_other.go is the contract
 internal/agent/desktop          capture, tiling, input injection, session launch, helper TLS
@@ -86,8 +88,8 @@ Every frame is a JSON `Envelope`:
 {"t": "script.run", "id": "a1b2", "d": { ... }, "err": ""}
 ```
 
-- `t` — message type. Agent → server: `hello`, `inventory`, `metrics`, `event`, `pong`, `reply`,
-  `stream`. Server → agent: the request names below.
+- `t` — message type. Agent → server: `hello`, `inventory`, `metrics`, `event`, `baseline`,
+  `pong`, `reply`, `stream`. Server → agent: the request names below.
 - `id` — correlation id chosen by the server; the agent echoes it in every `stream` and in the
   final `reply`.
 - `d` — type-specific payload; `err` — error text in a reply instead of `d`.
@@ -103,13 +105,20 @@ Three interaction shapes, all implemented in the hub (`internal/server/hub.go`):
 Request catalogue (`protocol.Req*`): `ping`, `inventory.refresh`, `shell.open/input/resize/close`,
 `script.run`, `script.cancel`, `proc.list`, `proc.kill`, `svc.list`, `svc.action`, `updates.scan`,
 `updates.install`, `eventlog.query`, `fs.list/read/write/delete/mkdir/rename`, `power`,
-`desktop.start`, `wol`, `agent.update`, `agent.config`. The agent runs every request on its own
+`desktop.start`, `wol`, `agent.update`, `agent.config`, `baseline.evaluate`,
+`baseline.remediate`, `baseline.preview`. The agent runs every request on its own
 goroutine (`Agent.dispatch` → `handle`), so a long update scan never blocks a keystroke, and a
 handler panic is turned into an error reply.
 
 Timeouts on the server side: 30 s for quick requests, 2 min for inventory refresh, 15 min for a
 patch scan, 3 h for a patch install, 20 min for long file operations. Script timeouts are per
 script (default 300 s) and enforced by the agent, which kills the whole process tree.
+
+`baseline.evaluate` and `baseline.remediate` reply with an **ACK only**
+(`{"accepted":true,…}`): the pass itself arrives as exactly one unsolicited `baseline` frame, so a
+reply carrying the report as well would double every transition, alert and automation.
+`baseline.preview` is the one exception — its reply *is* the report, and no frame follows, because
+nothing about a preview is stored.
 
 `protocol.Version` (currently 1) is sent in `hello`; the server accepts older agents. The
 agent build version from `hello` is stored on the device and shown in the console.
@@ -118,7 +127,8 @@ agent build version from `hello` is stored on the device and shown in the consol
 
 ### Hub (`hub.go`)
 Owns every live agent socket, routes replies and stream chunks by id, and fans `hubEvent`s
-(`agent_online`, `agent_offline`, `metrics`, `inventory`, `event`, `alert`, `run`, `patches`)
+(`agent_online`, `agent_offline`, `metrics`, `inventory`, `event`, `alert`, `run`, `patches`,
+`baseline`)
 out to browser subscribers of `GET /api/events` (Server-Sent Events). Slow SSE consumers drop
 events rather than block the agent loop.
 
@@ -139,13 +149,23 @@ per condition; `auto_resolve` closes it when the condition clears; a device in m
 (`maintenance_until` in the future) opens nothing. Opening an alert broadcasts to the UI, emails
 (when `notify_email`) and fires `alert_opened` automations.
 
+Drift alerts come in through `openDrift`, not `open`: `rule_id` is NULL, `rule_kind` is `drift` and
+the severity is the check's, but the dedupe SELECT, the maintenance-window suppression, the SSE
+broadcast and the `alert_opened` automation are the same. `drift` is deliberately **not** in
+`validRuleKinds` — that map gates operator-created rows in `alert_rules`, and a drift alert has no
+rule. `openDrift` is always called with `notify = false` (the baseline engine sends one digest per
+(agent, baseline) instead of one mail per check), and nothing but the baseline code resolves a
+`drift` key: `purge` auto-closes only `script_failed`, `patch_failed` and `event`.
+
 ### Scheduler (`scheduler.go`)
 One `robfig/cron` table (5-field expressions plus `@hourly`-style descriptors, local time) rebuilt
 from `tasks` and `patch_policies` on every change. Task kinds: `script`, `patch_scan`,
 `patch_install`, `reboot`, `inventory`, each resolved against `Targets` (`all`, agent ids, group
 ids, tags, OS). Automations are evaluated by trigger (`agent_online`, `agent_offline`,
-`alert_opened`, `alert_resolved`, `enrolled`, `reboot_required`, `patch_installed`) with an
-optional target/rule/severity filter and run a script, send an email or POST a JSON webhook.
+`alert_opened`, `alert_resolved`, `enrolled`, `reboot_required`, `patch_installed`,
+`drift_detected`, `drift_fixed`) with an optional target/rule/severity filter and run a script,
+send an email or POST a JSON webhook. The two drift triggers carry no `rule_id`, so a `rule_ids`
+filter never matches one.
 
 `agent_online` fires from `scheduler.agentOnline` when a device's socket comes up (the same call
 that releases its queued runs); `agent_offline` fires when that device's **current** socket goes
@@ -163,8 +183,8 @@ that are safe to do on a flap. Each automation is capped at `maxAutomationFiresP
 fires a minute by `autoLimit`, and a skipped fire is logged at WARN, so neither a flapping fleet
 nor an `alert_opened` → `run_script` loop can run away.
 
-An hourly `purge` enforces retention (metrics 30 d, runs 90 d, events 30 d, audit and resolved
-alerts 365 d by default), expires tokens and sessions, and fails runs stuck in `running` for over
+An hourly `purge` enforces retention (metrics 30 d, runs 90 d, events and `baseline_history`
+30 d, audit and resolved alerts 365 d by default), expires tokens and sessions, and fails runs stuck in `running` for over
 six hours after a restart.
 
 ### Patches (`patches.go`)
@@ -178,6 +198,30 @@ scans, then approves according to `mode` (`approved` = only what you approved, `
 pacman), installs, and
 reboots per `reboot` (`never`, `if_required`, `always`). A device with no patch rows gets a scan
 20 s after its first connection.
+
+### Baselines (`baselines.go`, `baselines_db.go`, `api_baselines.go`)
+Desired state. `agentConfig` resolves the enabled baselines whose targets match a device and sends
+the **complete** set in every config push and in `welcome` — never a delta — after the
+`agent_defaults` settings blob is unmarshalled, so a baseline set can never be frozen into
+settings and pushed to the whole fleet. Every create/update/delete/enable/disable pushes to the
+union of the previously and newly matched online devices; so does a group, tag or group-delete
+change.
+
+Ingest arrives as `TypeBaseline` through `ac.enqueue` (the inventory/event path — 5 s push-back
+then a warning, never the droppable metrics path, because the frame is the only record of an
+offline pass). One `withTx` per report: version and monotonic-`TS` guards, membership re-read
+inside the transaction, results for unknown, negative or repeated check ids dropped, upsert,
+history rows for real transitions. Alert opens/resolves, `drift_detected`/`drift_fixed`
+automations, the digest mail and the `baseline` SSE event all run **after** the commit — the alert
+engine and `sched.automation` take the same single SQLite connection.
+
+`baselines.version` is bumped only by changes the agent can see and the bump, the check writes and
+the `stale = 1` marking of existing results happen in one transaction. A save is a **merge**:
+check ids are permanent (`AUTOINCREMENT`, so a deleted id never comes back and inherits the dead
+check's results and alerts), and a check dropped from the body takes its results and its open
+drift alerts with it. `internal/baselines` is the single definition of every kind's parameters,
+used by the server to validate a write (unknown keys are a 400) and by the agent to re-validate at
+evaluation time (unknown keys ignored, so an older agent keeps working).
 
 ### Relays (`relay.go`)
 - **Shell**: the browser WebSocket `/ws/shell/{id}` sends `open`/`in`/`resize`/`close`; the
@@ -238,6 +282,12 @@ Maintenance, Diagnostics, Updates, Security, Users), seven alert rules, the `Ser
 `Workstations` groups and a scan-only patch policy. It runs once (`settings.seeded = 1`) and only
 fills empty tables, so deleted defaults stay deleted.
 
+The two starter baselines run from their **own** guard (`settings.seeded_baselines` plus an empty
+`baselines` table), because every v0.1.0 database already has `seeded = 1` and reusing that key
+would mean the seeds never appeared on upgrade. Both ship disabled *and* unenforced, and every
+destructive check in them (`group_members`, the SMB1 registry value, service start-type changes,
+`reboot_pending`) ships `remediate = 0`.
+
 ## 5. Storage
 
 SQLite through `modernc.org/sqlite` (pure Go, so everything cross-compiles with `CGO_ENABLED=0`).
@@ -247,7 +297,7 @@ slice in `db.go`, applied in order and tracked in `PRAGMA user_version`.
 
 | Table | Purpose | Notable columns |
 |---|---|---|
-| `settings` | key/value config: `public_url`, `smtp`, `agent_defaults`, `retention`, `seeded`, `last_patch_scan:<agent>` | |
+| `settings` | key/value config: `public_url`, `smtp`, `agent_defaults`, `retention`, `seeded`, `seeded_baselines`, `last_patch_scan:<agent>` | |
 | `users`, `sessions` | operators and their cookies | `role`, `totp_secret`, `totp_enabled`, `expires_at` |
 | `groups` | device groups | unique `name` |
 | `enroll_tokens` | bootstrap tokens | `uses_left` (-1 unlimited), `expires_at`, `group_id` |
@@ -262,6 +312,11 @@ slice in `db.go`, applied in order and tracked in `PRAGMA user_version`.
 | `patch_policies` | scan/install schedules | `scan_schedule`, `install_schedule`, `mode`, `reboot` |
 | `audit` | who did what | `user`, `ip`, `action`, `target`, `details` |
 | `agent_events` | unsolicited agent events (service changes, patch progress, log lines) | `kind`, `message`, `fields` |
+| `baselines` | desired-state definitions | `targets` (JSON), `enforce`, `interval_sec`, `enabled`, `version` |
+| `baseline_checks` | the checks of a baseline | **`id INTEGER PRIMARY KEY AUTOINCREMENT`** (identity is permanent), `position` (presentation only), `kind`, `params` (JSON), `remediate`, `severity`, `os_filter`, `timeout_sec` |
+| `baseline_results` | current state per (device, check) | `state`, `expected`, `observed`, `detail`, `fixed`, `version`, `stale`, `checked_at` (device clock), `received_at` / `since` (server clock) |
+| `baseline_state` | per (device, baseline) ingest bookkeeping | `version`, `last_report_ts`, `last_received_at`, `last_trigger` |
+| `baseline_history` | every state transition | denormalised `check_name`; `agent_id` and `check_id` carry **no** FK, so history outlives a deleted device or check |
 
 Metric queries bucket by time in SQL (`MetricsRange`) so a 30-day chart never ships a million
 rows.
@@ -279,6 +334,17 @@ rows.
   interpreter (`pwsh` → `powershell.exe`; `cmd.exe /d /c`; `python3`/`python`/`py`; `bash` → `sh`)
   with parameters as positional arguments, sets `RMM_RUN_ID`, streams lines, enforces timeout and
   cancel by killing the process group / job.
+- `baseline*.go` — the desired-state engine. One goroutine per process: passes never overlap, the
+  next pass is scheduled an interval after the previous one *finished*, every check runs under its
+  own deadline enforced by the engine (so a check wedged in a syscall cannot stop the device), and
+  remediation is serialised by a process-wide mutex that `package`/`windows_feature`/
+  `reboot_pending` fixes share with `installUpdates`. `baselines.json` beside `agent.json`
+  (0600, tmp+rename) holds the specs, the last report per baseline and the per-check fix
+  hold-offs, and is loaded *before* the first connection so an offline device still evaluates; on
+  reconnect the cached reports are re-sent exactly once with their original timestamps.
+  `baseline_kinds.go` is the device-side layer over `internal/baselines`; the per-OS work lives in
+  `baseline_linux.go` / `baseline_windows.go`, with the pure parsers and planners split out
+  (`baseline_group.go`, `baseline_winparse.go`) so they are unit-tested on any build host.
 - `shell*.go` — pseudo-terminal sessions; `services_*.go`, `proc_*.go`, `eventlog_*.go`,
   `updates_*.go`, `power_*.go`, `files.go`, `wol.go` — the per-feature handlers;
   `platform_other.go` documents the contract each platform file fulfils.
@@ -296,7 +362,10 @@ Default data directory: `%ProgramData%\HomelabRMM` on Windows, `/var/lib/homelab
 `~/.homelab-rmm` otherwise.
 
 Agent: `agent.json` in `RMM_AGENT_DIR`, else `%ProgramData%\HomelabRMM` or `/etc/homelab-rmm`.
-Fields: `server_url`, `agent_id`, `key`, `enroll_token`, `fingerprint`.
+Fields: `server_url`, `agent_id`, `key`, `enroll_token`, `fingerprint`. `baselines.json` sits
+beside it and is written by the agent only — the desired-state specs, the last report per baseline
+and the fix hold-offs — so that a device that reboots while the server is unreachable still
+evaluates. A file that will not parse is logged and ignored, never fatal.
 
 ## 8. Versioning
 

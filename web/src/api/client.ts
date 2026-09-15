@@ -1,5 +1,7 @@
 import type {
   Agent,
+  AgentBaselineHistory,
+  AgentBaselines,
   AgentEvent,
   AgentPatches,
   AgentUpdate,
@@ -8,6 +10,15 @@ import type {
   AuditRow,
   AuthState,
   Automation,
+  Baseline,
+  BaselineDetail,
+  BaselineEvaluateResult,
+  BaselineInput,
+  BaselinePreview,
+  BaselinePreviewSpec,
+  BaselineRemediateResult,
+  BaselineStatus,
+  ComplianceSummary,
   Dashboard,
   EnrollCreate,
   EnrollCreated,
@@ -146,6 +157,16 @@ function normAgent(a: Agent): Agent {
   };
 }
 
+// params is a JSON object on the wire; a hand-edited row or an older server
+// can still produce null, and every kind form reads params.<field>.
+function normCheck<T extends { params?: unknown }>(c: T): T {
+  return { ...c, params: c.params && typeof c.params === 'object' ? (c.params as Record<string, unknown>) : {} };
+}
+
+function normBaselineDetail(b: BaselineDetail): BaselineDetail {
+  return { ...b, checks: arr(b.checks).map(normCheck) };
+}
+
 export const api = {
   // ---- auth ----
   authState: () => get<AuthState>('/api/auth/state', { noRedirect: true }),
@@ -250,6 +271,46 @@ export const api = {
   createPatchPolicy: (p: Partial<PatchPolicy>) => post<PatchPolicy>('/api/patch-policies', p),
   updatePatchPolicy: (id: number, p: Partial<PatchPolicy>) => put<PatchPolicy>(`/api/patch-policies/${id}`, p),
   deletePatchPolicy: (id: number) => del<Ok>(`/api/patch-policies/${id}`),
+
+  // ---- baselines ----
+  baselines: () => list(get<Baseline[] | null>('/api/baselines')),
+  baseline: (id: number) => get<BaselineDetail>(`/api/baselines/${id}`).then(normBaselineDetail),
+  createBaseline: (b: BaselineInput) => post<BaselineDetail>('/api/baselines', b).then(normBaselineDetail),
+  updateBaseline: (id: number, b: BaselineInput) => put<BaselineDetail>(`/api/baselines/${id}`, b).then(normBaselineDetail),
+  deleteBaseline: (id: number) => del<Ok>(`/api/baselines/${id}`),
+  baselineStatus: (id: number, limit = 200) =>
+    get<BaselineStatus>(`/api/baselines/${id}/status${qs({ limit })}`).then((r) => ({
+      ...r,
+      checks: arr(r.checks).map(normCheck),
+      devices: arr(r.devices).map((d) => ({ ...d, results: arr(d.results) })),
+    })),
+  // A fan-out: always 200, with a per-agent queued/offline/error status.
+  evaluateBaseline: (id: number, agent_ids?: string[]) =>
+    post<BaselineEvaluateResult>(`/api/baselines/${id}/evaluate`, { agent_ids: agent_ids ?? [] }).then((r) => ({ ...r, agents: arr(r.agents) })),
+  // 409 when the device is offline: a fix cannot be queued.
+  remediateBaseline: (id: number, agent_id: string, check_ids?: number[]) =>
+    post<BaselineRemediateResult>(`/api/baselines/${id}/remediate`, { agent_id, check_ids: check_ids ?? [] }).then((r) => ({
+      ...r,
+      accepted: arr(r.accepted),
+      refused: arr(r.refused),
+    })),
+  previewBaseline: (spec: BaselinePreviewSpec, agent_ids: string[]) =>
+    post<BaselinePreview>('/api/baselines/preview', { spec, agent_ids }).then((r) => ({
+      spec_checks: arr(r.spec_checks),
+      devices: arr(r.devices).map((d) => ({ ...d, results: arr(d.results) })),
+    })),
+  agentBaselines: (id: string) =>
+    get<AgentBaselines>(`/api/agents/${enc(id)}/baselines`).then((r) => ({
+      ...r,
+      baselines: arr(r.baselines).map((b) => ({ ...b, checks: arr(b.checks).map((c) => ({ ...normCheck(c), result: c.result ?? null })) })),
+    })),
+  // baselineId narrows the rows server-side. Filtering here instead would
+  // show an empty drawer whenever another baseline owns the newest `limit`
+  // transitions.
+  agentBaselineHistory: (id: string, limit = 100, baselineId?: number) =>
+    get<AgentBaselineHistory>(`/api/agents/${enc(id)}/baselines/history${qs({ limit, baseline_id: baselineId })}`).then((r) => ({ ...r, history: arr(r.history) })),
+  compliance: () =>
+    get<ComplianceSummary>('/api/compliance').then((r) => ({ ...r, worst_checks: arr(r.worst_checks), by_baseline: arr(r.by_baseline) })),
 
   // ---- admin ----
   settings: () => get<Settings>('/api/settings'),

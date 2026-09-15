@@ -22,20 +22,44 @@ import (
 )
 
 type Agent struct {
-	cfg    *Config
+	cfg *Config
+	// c is the live socket, or nil before the first connection. It is read
+	// from goroutines that outlive a session - the baseline engine runs for
+	// the whole process, online or not - so it is only ever touched through
+	// socket()/setConn.
 	c      *conn
+	cmu    sync.RWMutex
 	remote protocol.AgentConfig
 	rmu    sync.RWMutex
 	shells *shellManager
 	runs   *scriptRunner
+	// baselines is the desired-state engine: its own goroutine, its own
+	// on-disk state, running whether or not there is a server to talk to.
+	baselines *baselineEngine
 	// wake is signalled when the config changes so tickers restart
 	wake chan struct{}
+}
+
+// socket returns the live connection, or nil when the agent is offline. Every
+// caller outside the read loop has to handle nil: a send that cannot happen
+// is normal, not an error.
+func (a *Agent) socket() *conn {
+	a.cmu.RLock()
+	defer a.cmu.RUnlock()
+	return a.c
+}
+
+func (a *Agent) setConn(c *conn) {
+	a.cmu.Lock()
+	a.c = c
+	a.cmu.Unlock()
 }
 
 func New(cfg *Config) *Agent {
 	a := &Agent{cfg: cfg, wake: make(chan struct{}, 1)}
 	a.shells = newShellManager()
 	a.runs = newScriptRunner()
+	a.baselines = newBaselineEngine(a)
 	a.remote = protocol.AgentConfig{MetricsIntervalSec: 30, InventoryIntervalSec: 3600, PatchScanIntervalSec: 6 * 3600}
 	return a
 }
@@ -43,6 +67,11 @@ func New(cfg *Config) *Agent {
 // Run connects and reconnects until ctx ends. Backoff starts at 2s and caps
 // at 60s with jitter so a fleet does not hammer a restarting server.
 func (a *Agent) Run(ctx context.Context) error {
+	// The baseline engine starts before the first dial and keeps running
+	// between sessions: a device that boots with the server down still
+	// evaluates the baselines it was last told about, and reports them when
+	// the socket comes back.
+	a.baselines.start(ctx)
 	backoff := 2 * time.Second
 	for {
 		err := a.session(ctx)
@@ -97,7 +126,8 @@ func (a *Agent) session(ctx context.Context) error {
 	}
 	ws.SetReadLimit(64 << 20)
 	c := &conn{ws: ws}
-	a.c = c
+	a.setConn(c)
+	defer a.setConn(nil)
 	defer ws.Close()
 
 	if err := c.send(protocol.Envelope{T: protocol.TypeHello, D: protocol.Must(a.hello())}); err != nil {
@@ -130,6 +160,10 @@ func (a *Agent) session(ctx context.Context) error {
 	a.applyConfig(welcome.Config)
 	ws.SetReadDeadline(time.Time{})
 	slog.Info("connected", "server", a.cfg.ServerURL, "agent_id", a.cfg.AgentID)
+	// Catch-up is exactly one re-send of the cached last report per baseline,
+	// with its original timestamp and version; the start-up pass that follows
+	// supersedes it server-side (A14).
+	go a.baselines.resend()
 
 	sessCtx, stop := context.WithCancel(ctx)
 	defer stop()
@@ -165,6 +199,11 @@ func (a *Agent) applyConfig(cfg protocol.AgentConfig) {
 	a.rmu.Lock()
 	a.remote = cfg
 	a.rmu.Unlock()
+	// The pushed set is always complete: a baseline that is missing here was
+	// unassigned, disabled or deleted, and the engine stops it at once (A10).
+	if a.baselines != nil {
+		a.baselines.setSpecs(cfg.Baselines)
+	}
 	select {
 	case a.wake <- struct{}{}:
 	default:
@@ -212,18 +251,25 @@ func (a *Agent) sendInventory() {
 		slog.Warn("inventory", "err", err)
 		return
 	}
-	a.c.send(protocol.Envelope{T: protocol.TypeInventory, D: protocol.Must(inv)})
+	if c := a.socket(); c != nil {
+		c.send(protocol.Envelope{T: protocol.TypeInventory, D: protocol.Must(inv)})
+	}
 }
 
 func (a *Agent) sendMetrics() {
 	m := collectMetrics(a.config().MonitoredServices)
-	a.c.send(protocol.Envelope{T: protocol.TypeMetrics, D: protocol.Must(m)})
+	if c := a.socket(); c != nil {
+		c.send(protocol.Envelope{T: protocol.TypeMetrics, D: protocol.Must(m)})
+	}
 }
 
 // dispatch answers one server frame. Every request runs on its own goroutine
 // so a slow update scan never blocks shell keystrokes.
 func (a *Agent) dispatch(ctx context.Context, env protocol.Envelope) {
-	c := a.c
+	c := a.socket()
+	if c == nil {
+		return
+	}
 	switch env.T {
 	case protocol.ReqPing:
 		c.send(protocol.Envelope{T: protocol.TypePong, ID: env.ID})
@@ -265,7 +311,10 @@ func (a *Agent) dispatch(ctx context.Context, env protocol.Envelope) {
 }
 
 func (a *Agent) handle(ctx context.Context, env protocol.Envelope) {
-	c := a.c
+	c := a.socket()
+	if c == nil {
+		return
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("handler panicked", "type", env.T, "panic", r)
@@ -363,6 +412,26 @@ func (a *Agent) handle(ctx context.Context, env protocol.Envelope) {
 		var in protocol.DesktopStart
 		if err = json.Unmarshal(env.D, &in); err == nil {
 			out, err = a.startDesktop(in)
+		}
+	case protocol.ReqBaselineEvaluate:
+		// The reply is an ACK, never a report: the pass sends exactly one
+		// TypeBaseline frame when it finishes, and a reply carrying the same
+		// results would make the server ingest every transition twice (A6).
+		var in protocol.BaselineEvaluate
+		if err = json.Unmarshal(env.D, &in); err == nil {
+			out, err = a.baselines.requestEvaluate(in.BaselineIDs)
+		}
+	case protocol.ReqBaselineRemediate:
+		var in protocol.BaselineRemediate
+		if err = json.Unmarshal(env.D, &in); err == nil {
+			out, err = a.baselines.requestRemediate(in)
+		}
+	case protocol.ReqBaselinePreview:
+		// The one exception: a preview's reply IS the report, and no frame
+		// is sent, because nothing about it is ever stored.
+		var in protocol.BaselinePreview
+		if err = json.Unmarshal(env.D, &in); err == nil {
+			out, err = a.baselines.preview(ctx, in.Spec)
 		}
 	case protocol.ReqAgentUpdate:
 		var in protocol.AgentUpdate

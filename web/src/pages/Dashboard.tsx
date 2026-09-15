@@ -1,12 +1,13 @@
 import { useMemo } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
-import type { Agent, Task } from '../api/types';
+import type { Agent, ComplianceSummary, Task } from '../api/types';
 import { useAsync, useInterval, useLocalState } from '../hooks/useAsync';
 import { useLiveReload } from '../hooks/useEvents';
 import { describeCron } from '../lib/cron';
 import { duration, relTime } from '../lib/format';
 import { useAuth } from '../state/auth';
+import { ComplianceChip } from '../components/baselines/state';
 import { Bar, Button, Chip, Empty, ErrorBox, RunStatusChip, SeverityChip, Skeleton } from '../components/ui';
 
 export function Dashboard() {
@@ -17,10 +18,15 @@ export function Dashboard() {
   // version. It is the same call the devices page makes.
   const agents = useAsync(() => api.agents(), []);
   const tasks = useAsync(() => api.tasks(), []);
+  // Baselines are optional: a server that does not serve /api/compliance (an
+  // older one, or a failed query) simply hides the tile rather than painting
+  // an error across the dashboard.
+  const compliance = useAsync(() => api.compliance().catch(() => undefined), []);
   useLiveReload(['agent_online', 'agent_offline', 'alert', 'run', 'patches', 'inventory', 'hello'], d.reload, { debounceMs: 600 });
   // Not on 'metrics': that is one event per device every 30 s, and refetching
   // the whole fleet list that often is a lot of work for a disk gauge.
   useLiveReload(['agent_online', 'agent_offline', 'inventory', 'patches'], agents.reload, { debounceMs: 5000 });
+  useLiveReload(['baseline', 'hello'], compliance.reload, { debounceMs: 2000 });
   useInterval(d.reload, 60_000);
   useInterval(agents.reload, 120_000);
 
@@ -159,7 +165,7 @@ export function Dashboard() {
               </div>
             </div>
           </div>
-          <FleetWidgets agents={agents.data} tasks={tasks.data} />
+          <FleetWidgets agents={agents.data} tasks={tasks.data} compliance={compliance.data} />
         </>
       )}
     </>
@@ -198,7 +204,7 @@ interface DiskRow {
  * next, which agents are behind) and each hides itself when it has nothing to
  * say, rather than showing an empty box.
  */
-function FleetWidgets({ agents, tasks }: { agents: Agent[] | undefined; tasks: Task[] | undefined }) {
+function FleetWidgets({ agents, tasks, compliance: comp }: { agents: Agent[] | undefined; tasks: Task[] | undefined; compliance: ComplianceSummary | undefined }) {
   const offline = useMemo(() => (agents ?? []).filter((a) => !a.online).sort((x, y) => y.last_seen - x.last_seen).slice(0, 6), [agents]);
   const disks = useMemo(() => {
     const out: DiskRow[] = [];
@@ -223,6 +229,81 @@ function FleetWidgets({ agents, tasks }: { agents: Agent[] | undefined; tasks: T
   }, [agents]);
 
   const cards = [
+    comp && (comp.by_baseline.length > 0 || comp.devices_with_baselines > 0) && (
+      <div className="card" key="baselines" data-testid="tile-compliance">
+        <div className="card-head">
+          Baseline compliance
+          <div className="actions">
+            <Link to="/baselines" className="small">
+              Baselines
+            </Link>
+          </div>
+        </div>
+        <div className="card-body stack">
+          <div className="row between">
+            <span className="row" style={{ gap: 8 }}>
+              <ComplianceChip value={comp.score} />
+              {/* The fleet score is the mean over the devices that HAVE
+                  reported: a device with baselines and no report is in
+                  devices_with_baselines and in devices_unknown, and counting
+                  it here would read as "92% of all ten", which is the "no
+                  data is not data" mistake A25 exists to prevent. */}
+              <span className="muted small">
+                mean over {comp.devices_with_baselines - comp.devices_unknown} of {comp.devices_with_baselines} device{comp.devices_with_baselines === 1 ? '' : 's'} with baselines
+              </span>
+            </span>
+            <Link
+              to="/alerts"
+              className="small"
+              style={comp.open_drift_alerts > 0 ? { color: 'var(--chip-danger)', fontWeight: 600 } : undefined}
+              title="Open alerts raised by a baseline check"
+            >
+              {comp.open_drift_alerts} open drift alert{comp.open_drift_alerts === 1 ? '' : 's'}
+            </Link>
+          </div>
+          {/* A null score is "nothing applicable has reported", which is NOT
+              0% (A25): a zero-width bar under a "—" chip reads as a fleet
+              that is 0% compliant. Say what is actually missing instead. */}
+          {comp.score === null ? (
+            <span className="muted small">No applicable check has reported yet, so there is no fleet score.</span>
+          ) : (
+            <Bar value={comp.score} warn={101} danger={101} title={`Fleet compliance ${comp.score}%`} />
+          )}
+          <dl className="kv">
+            <dt>Devices drifted</dt>
+            <dd style={comp.devices_drifted > 0 ? { color: 'var(--chip-danger)', fontWeight: 600 } : undefined}>
+              {comp.devices_drifted} of {comp.devices_with_baselines}
+            </dd>
+            <dt>Not reported yet</dt>
+            <dd>{comp.devices_unknown}</dd>
+            <dt>Checks failing</dt>
+            <dd>
+              {comp.checks_failing} of {comp.checks_total}
+              {comp.checks_error > 0 ? ` · ${comp.checks_error} errored` : ''}
+            </dd>
+            <dt>Baselines</dt>
+            <dd>
+              {comp.baselines_enabled} enabled · {comp.baselines_enforcing} enforcing
+            </dd>
+          </dl>
+          {comp.worst_checks.length > 0 && (
+            <div className="stack" style={{ gap: 4 }}>
+              <span className="muted small">Worst checks</span>
+              {comp.worst_checks.slice(0, 3).map((w) => (
+                <div key={`${w.baseline_id}-${w.check_id}`} className="row between">
+                  <Link to={`/baselines/${w.baseline_id}`} className="truncate small">
+                    {w.check_name}
+                  </Link>
+                  <span className="muted small nowrap">
+                    {w.failing}/{w.applicable} failing
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    ),
     offline.length > 0 && (
       <div className="card" key="offline">
         <div className="card-head">

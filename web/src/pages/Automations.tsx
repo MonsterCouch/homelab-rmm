@@ -20,7 +20,12 @@ const TRIGGERS: { id: AutomationTrigger; label: string }[] = [
   { id: 'enrolled', label: 'Device enrolled' },
   { id: 'reboot_required', label: 'Reboot required' },
   { id: 'patch_installed', label: 'Patch installed' },
+  { id: 'drift_detected', label: 'Baseline drift detected' },
+  { id: 'drift_fixed', label: 'Baseline drift fixed' },
 ];
+
+/** Triggers that carry no alert rule, so a rule filter can never match them. */
+const RULELESS_TRIGGERS = new Set<AutomationTrigger>(['drift_detected', 'drift_fixed']);
 const ACTIONS: { id: AutomationAction; label: string }[] = [
   { id: 'run_script', label: 'Run a script' },
   { id: 'email', label: 'Send email' },
@@ -240,6 +245,14 @@ function AutomationEditor({ automation, onClose, onSaved }: { automation: Automa
         </Field>
       )}
 
+      {RULELESS_TRIGGERS.has(form.trigger) && (
+        <div className="banner info">
+          <span>
+            Baseline drift carries no alert rule, so an alert-rule filter can never match it. The data passed to the action is the baseline, the check, its kind, severity,
+            state, expected, observed and detail.
+          </span>
+        </div>
+      )}
       <h3 className="mb mt">Only when…</h3>
       {alertTrigger && (
         <div className="form-row">

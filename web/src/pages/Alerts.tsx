@@ -52,9 +52,19 @@ function AlertList() {
   const [q, setQ] = useState('');
   const dq = useDebounced(q);
   const [sev, setSev] = useState('');
+  // Drift alerts have no rule row: they come from a baseline check and are
+  // named "<baseline>: <check>". Operators triage them separately from
+  // threshold alerts, so the source is its own filter.
+  const [source, setSource] = useState('');
   const rows = useMemo(
-    () => (alerts.data ?? []).filter((a) => (!sev || a.severity === sev) && textMatch(dq, a.title, a.message, a.agent_name, a.rule_kind, a.rule_id ? ruleName.get(a.rule_id) : '')),
-    [alerts.data, dq, sev, ruleName],
+    () =>
+      (alerts.data ?? []).filter(
+        (a) =>
+          (!sev || a.severity === sev) &&
+          (!source || (source === 'drift' ? a.rule_kind === 'drift' : a.rule_kind !== 'drift')) &&
+          textMatch(dq, a.title, a.message, a.agent_name, a.rule_kind, a.rule_id ? ruleName.get(a.rule_id) : ''),
+      ),
+    [alerts.data, dq, sev, source, ruleName],
   );
 
   const act = async (fn: () => Promise<unknown>, label: string) => {
@@ -90,6 +100,21 @@ function AlertList() {
           <div className="muted small truncate" title={a.message}>
             {a.message}
           </div>
+          {a.rule_kind === 'drift' && a.agent_id && (
+            // A drift alert names its baseline and its check in the title
+            // ("<baseline>: <check>"); this is where the state behind it
+            // lives. Every row repeats the link text, so the device goes in
+            // the accessible name or a screen reader hears the same words
+            // over and over with nothing to tell them apart.
+            <Link
+              to={`/devices/${a.agent_id}/compliance`}
+              className="small"
+              aria-label={`Open the compliance tab for ${a.agent_name || a.agent_id}`}
+              onClick={(e) => e.stopPropagation()}
+            >
+              Open the device's compliance tab
+            </Link>
+          )}
         </div>
       ),
     },
@@ -108,6 +133,15 @@ function AlertList() {
         return n ? `${n} (${a.rule_kind})` : titleCase(a.rule_kind || '');
       },
       render: (a) => {
+        // A drift alert has no rule at all: the baseline and the check that
+        // raised it are in the title, and this says where it came from.
+        if (a.rule_kind === 'drift') {
+          return (
+            <span title="Raised by a baseline check, not by an alert rule">
+              <Chip tone="purple">drift</Chip> <span className="muted small">baseline check</span>
+            </span>
+          );
+        }
         // A rule that has since been deleted leaves the kind as the only label.
         const n = a.rule_id ? ruleName.get(a.rule_id) : undefined;
         return n ? (
@@ -162,6 +196,11 @@ function AlertList() {
             </button>
           ))}
         </div>
+        <select value={source} onChange={(e) => setSource(e.target.value)} style={{ width: 150 }} aria-label="Source">
+          <option value="">Any source</option>
+          <option value="drift">Baseline drift</option>
+          <option value="rules">Alert rules</option>
+        </select>
         <select value={sev} onChange={(e) => setSev(e.target.value)} style={{ width: 130 }} aria-label="Severity">
           <option value="">Any severity</option>
           <option value="critical">critical</option>

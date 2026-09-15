@@ -50,11 +50,24 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	// A group or tag change moves the device in and out of target sets, so
+	// the baselines it matches change with it. Snapshot before the write.
+	membership := in.GroupID != nil || in.ClearGroup || in.Tags != nil
+	var before map[int64]bool
+	if membership {
+		before = s.assignedBaselineIDs(id)
+	}
 	if err := s.db.UpdateAgent(id, in); err != nil {
 		fail(w, err)
 		return
 	}
-	if in.MonitoredServices != nil {
+	switch {
+	case membership:
+		// Cleans up the baselines the device no longer matches AND pushes the
+		// new config; a device that kept evaluating an unassigned baseline
+		// would keep reporting drift nothing can resolve.
+		s.agentMembershipChanged(id, before)
+	case in.MonitoredServices != nil:
 		s.pushAgentConfig(id)
 	}
 	s.audit(r, "agent.update", id, in)
@@ -68,6 +81,9 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	// Results, state and alerts cascade with the row; the baseline engine's
+	// in-memory counters for the device do not, so drop them here.
+	s.baselines.forgetAgent(id)
 	s.audit(r, "agent.delete", id, nil)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
@@ -493,7 +509,21 @@ func (s *Server) handleUpdateGroup(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
 	id, _ := pathInt(r, "id")
+	// agents.group_id is ON DELETE SET NULL, so every member leaves the group
+	// (and every baseline targeting it) the moment this runs. Snapshot what
+	// they were assigned first, then clean up and re-push.
+	members := map[string]map[int64]bool{}
+	if agents, err := s.db.ListAgents(); err == nil {
+		for _, a := range agents {
+			if a.GroupID != nil && *a.GroupID == id {
+				members[a.ID] = s.assignedBaselineIDs(a.ID)
+			}
+		}
+	}
 	s.db.Exec(`DELETE FROM groups WHERE id = ?`, id)
+	for agentID, before := range members {
+		s.agentMembershipChanged(agentID, before)
+	}
 	s.audit(r, "group.delete", strconv.FormatInt(id, 10), nil)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }

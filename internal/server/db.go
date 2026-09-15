@@ -305,6 +305,96 @@ CREATE INDEX IF NOT EXISTS idx_agent_events_ts ON agent_events(ts);
 CREATE INDEX IF NOT EXISTS idx_agents_key_hash ON agents(key_hash);
 CREATE INDEX IF NOT EXISTS idx_patches_agent_status ON patches(agent_id, status);
 `,
+	// 4: baselines (desired state, drift detection, self-healing).
+	//
+	// baseline_checks.id is the ONLY identity a result, a history row or a
+	// drift alert key ever uses, so it is AUTOINCREMENT: a bare INTEGER
+	// PRIMARY KEY lets SQLite reuse the largest free rowid after a DELETE,
+	// and the new check would inherit the dead one's results, its history and
+	// its still-open alert (dedupe key drift:<baseline>:<check>:<agent>).
+	//
+	// baseline_history.agent_id and .check_id deliberately carry NO foreign
+	// key: the audit trail has to survive the device or the check being
+	// deleted. Every other reference is a real FK, and foreign_keys(ON) is in
+	// the DSN, so an ingest for a check that vanished mid-report FAILS - the
+	// ingest path checks membership inside the same transaction.
+	//
+	// IF NOT EXISTS throughout, like migration 3: a database whose
+	// user_version was rewound (a downgrade, or a repair) re-runs the
+	// statements, and a migration that cannot be replayed onto its own result
+	// bricks the upgrade.
+	`
+CREATE TABLE IF NOT EXISTS baselines(
+	id INTEGER PRIMARY KEY,
+	name TEXT NOT NULL,
+	description TEXT NOT NULL DEFAULT '',
+	targets TEXT NOT NULL DEFAULT '{}',
+	enforce INTEGER NOT NULL DEFAULT 0,
+	interval_sec INTEGER NOT NULL DEFAULT 3600,
+	notify_email INTEGER NOT NULL DEFAULT 0,
+	enabled INTEGER NOT NULL DEFAULT 0,
+	version INTEGER NOT NULL DEFAULT 1,
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS baseline_checks(
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	baseline_id INTEGER NOT NULL REFERENCES baselines(id) ON DELETE CASCADE,
+	position INTEGER NOT NULL DEFAULT 0,
+	name TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	params TEXT NOT NULL DEFAULT '{}',
+	remediate INTEGER NOT NULL DEFAULT 0,
+	severity TEXT NOT NULL DEFAULT 'warning',
+	os_filter TEXT NOT NULL DEFAULT '',
+	timeout_sec INTEGER NOT NULL DEFAULT 60
+);
+CREATE INDEX IF NOT EXISTS idx_baseline_checks_baseline ON baseline_checks(baseline_id, position);
+
+CREATE TABLE IF NOT EXISTS baseline_results(
+	agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+	check_id INTEGER NOT NULL REFERENCES baseline_checks(id) ON DELETE CASCADE,
+	baseline_id INTEGER NOT NULL,
+	state TEXT NOT NULL,
+	expected TEXT NOT NULL DEFAULT '',
+	observed TEXT NOT NULL DEFAULT '',
+	detail TEXT NOT NULL DEFAULT '',
+	fixed INTEGER NOT NULL DEFAULT 0,
+	duration_ms INTEGER NOT NULL DEFAULT 0,
+	version INTEGER NOT NULL DEFAULT 0,
+	stale INTEGER NOT NULL DEFAULT 0,
+	checked_at INTEGER NOT NULL,
+	received_at INTEGER NOT NULL,
+	since INTEGER NOT NULL,
+	PRIMARY KEY(agent_id, check_id)
+);
+CREATE INDEX IF NOT EXISTS idx_baseline_results_baseline ON baseline_results(baseline_id, state);
+
+CREATE TABLE IF NOT EXISTS baseline_state(
+	agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+	baseline_id INTEGER NOT NULL,
+	version INTEGER NOT NULL DEFAULT 0,
+	last_report_ts INTEGER NOT NULL DEFAULT 0,
+	last_received_at INTEGER NOT NULL DEFAULT 0,
+	last_trigger TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY(agent_id, baseline_id)
+);
+
+CREATE TABLE IF NOT EXISTS baseline_history(
+	id INTEGER PRIMARY KEY,
+	agent_id TEXT NOT NULL,
+	baseline_id INTEGER NOT NULL,
+	check_id INTEGER NOT NULL,
+	check_name TEXT NOT NULL DEFAULT '',
+	ts INTEGER NOT NULL,
+	from_state TEXT NOT NULL DEFAULT '',
+	to_state TEXT NOT NULL,
+	detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_baseline_history_agent ON baseline_history(agent_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_baseline_history_ts ON baseline_history(ts);
+`,
 }
 
 // Close checkpoints the write-ahead log before closing, so a short-lived

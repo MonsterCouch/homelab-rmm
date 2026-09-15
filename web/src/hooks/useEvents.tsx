@@ -13,7 +13,9 @@ interface EventBus {
 
 const Ctx = createContext<EventBus | null>(null);
 
-const KINDS: EventKind[] = ['hello', 'agent_online', 'agent_offline', 'metrics', 'inventory', 'event', 'alert', 'run', 'patches'];
+// An EventSource only receives NAMED events it has a listener for, so every
+// server-side hubEvent kind has to be in this list or the console never sees it.
+const KINDS: EventKind[] = ['hello', 'agent_online', 'agent_offline', 'metrics', 'inventory', 'event', 'alert', 'run', 'patches', 'baseline'];
 
 /**
  * One EventSource for the whole app. Components subscribe through useEvents;
@@ -124,6 +126,15 @@ interface LiveReloadOpts {
   /** only react to events for this agent (events without agent_id always pass) */
   agentId?: string;
   debounceMs?: number;
+  /**
+   * Extra test an event must pass before it triggers a refetch. A `baseline`
+   * event is broadcast for every ingested report in the fleet, so a page
+   * showing ONE baseline refetches on other baselines' passes unless it says
+   * which ones it cares about. The predicate always sees the latest closure,
+   * like the handler does; events of a kind this page did not ask for never
+   * reach it.
+   */
+  filter?: (ev: HubEvent) => boolean;
 }
 
 /** Debounced "refetch when these kinds arrive". */
@@ -131,9 +142,12 @@ export function useLiveReload(kinds: EventKind[], reload: () => void, opts: Live
   const timer = useRef(0);
   const reloadRef = useRef(reload);
   reloadRef.current = reload;
-  const { agentId, debounceMs = 400 } = opts;
+  const { agentId, debounceMs = 400, filter } = opts;
+  const filterRef = useRef(filter);
+  filterRef.current = filter;
   useEvents(kinds, (ev) => {
     if (agentId && ev.agent_id && ev.agent_id !== agentId) return;
+    if (filterRef.current && !filterRef.current(ev)) return;
     window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => reloadRef.current(), debounceMs);
   });

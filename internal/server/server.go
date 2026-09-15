@@ -29,6 +29,7 @@ type Server struct {
 	db          *DB
 	hub         *Hub
 	alerts      *alertEngine
+	baselines   *baselineEngine
 	sched       *scheduler
 	mail        *mailer
 	runs        *runTracker
@@ -120,6 +121,7 @@ func New(cfg Config) (*Server, error) {
 	s.hub = newHub(s)
 	s.mail = newMailer(db)
 	s.alerts = newAlertEngine(s)
+	s.baselines = newBaselineEngine(s)
 	s.runs = newRunTracker(s)
 	s.desktops = newDesktopBroker()
 	s.sched = newScheduler(s)
@@ -338,8 +340,16 @@ func (s *Server) DB() *DB { return s.db }
 func (s *Server) agentConfig(agentID string) protocol.AgentConfig {
 	cfg := protocol.AgentConfig{MetricsIntervalSec: 30, InventoryIntervalSec: 3600, PatchScanIntervalSec: 6 * 3600}
 	s.db.SettingJSON("agent_defaults", &cfg)
+	// Baselines are resolved AFTER the settings blob is unmarshalled, and the
+	// field is cleared on the way into settings (handlePutSettings): the
+	// operator-editable agent_defaults row must never be able to freeze a
+	// baseline set and push it to every device regardless of targets.
+	cfg.Baselines = nil
 	if a, err := s.db.GetAgent(agentID); err == nil {
 		cfg.MonitoredServices = a.MonitoredServices
+		// Always the COMPLETE matching set: the agent replaces its whole set
+		// on every config, so anything left out is stopped on the device.
+		cfg.Baselines = s.baselineSpecsFor(a)
 	}
 	return cfg
 }
