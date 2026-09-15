@@ -125,9 +125,9 @@ the new version and fix the compare links at the bottom).
 - Every non-GET API call needs `X-Requested-With: fetch`; browser WebSockets are
   origin-checked; viewers get 403 on every mutation, including shell, desktop, downloads and
   enrolment tokens.
-- Gameplay of the roles: a `tech` can run scripts as root/SYSTEM by design; command-kind
+- Roles: a `tech` can run scripts as root/SYSTEM by design; command-kind
   baseline checks and sensitive file paths are admin-only, even for preview.
-- Balance of remediation safety lives in `internal/agent/baseline_group.go`
+- Remediation safety lives in `internal/agent/baseline_group.go`
   (`planGroupMembers`) and `internal/baselines` (path rules, limits). Tests assert the
   invariants, not the environment; keep it that way (the GitHub runner's `adm` group differs
   from a container's).
