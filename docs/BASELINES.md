@@ -182,6 +182,11 @@ refuses (state `error`) if any component of the parent chain is a symlink. Denie
 `/proc`, `/sys`, `/dev`, `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers` (and `/etc/sudoers.d` unless
 `state: present` with explicit `content`), the agent's own configuration directory,
 `C:\Windows\System32\config`, and the agent's ProgramData directory.
+A path is compared as the filesystem sees it, not as it was spelled: the server refuses any
+component in NTFS 8.3 short form (`HOMELA~1`, `PROGRA~1`) outright — it cannot see the device's
+filesystem, and such a name can stand for any directory at all, so it never counts as "inside
+ProgramData" for the admin gate either — and the agent resolves short names, case and symlinks on
+both sides before comparing with its own configuration directory.
 `C:\Windows\System32\drivers\etc\hosts` is allowed but **audited**. `state: absent` removes a
 **regular file** only — never a directory, never recursively. `mode` is a 3- or 4-digit octal
 ≤ 0777 with no setuid/setgid/sticky bit. Writes are tmp+rename in the same directory, preserving

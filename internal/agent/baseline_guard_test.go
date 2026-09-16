@@ -8,6 +8,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -328,5 +331,75 @@ func TestBaselineEvaluateRefusalIsAnErrorNotAnAck(t *testing.T) {
 	}
 	if _, err := e.requestRemediate(protocol.BaselineRemediate{BaselineID: 1}); err == nil {
 		t.Fatal("a refused remediate must come back as an error")
+	}
+}
+
+// A34's device-side backstop compared two SPELLINGS of a path, and a
+// filesystem has more than one name for the same directory: an NTFS 8.3 short
+// name (C:\ProgramData\HOMELA~1 is C:\ProgramData\HomelabRMM), a symlinked
+// install path, a different case. The agent is the only side that can resolve
+// them, so both sides of the comparison go through the filesystem first.
+func TestBaselineFilePathRefusesTheConfigDirUnderAnotherName(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real-config")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link-config")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("this platform will not let the test make a symlink: %v", err)
+	}
+	// The agent knows its directory by the link; the baseline names the same
+	// directory by its real path, whose own parents hold no symlink at all -
+	// so nothing but the canonicalised comparison can refuse it.
+	t.Setenv(EnvConfigDir, link)
+	err := blFilePathSafe(baselines.FileParams{Path: filepath.Join(real, "agent.json"), State: "present", Content: "{}"})
+	if err == nil {
+		t.Fatal("a baseline reached the agent's own configuration directory by another name")
+	}
+	if !strings.Contains(err.Error(), "configuration directory") {
+		t.Errorf("the refusal must name the reason, got %v", err)
+	}
+	// A neighbour that merely starts with the same characters is not inside
+	// it and stays manageable.
+	if err := blFilePathSafe(baselines.FileParams{Path: real + "-notes.txt", State: "present", Content: "x"}); err != nil {
+		t.Errorf("a file beside the configuration directory is a legitimate target: %v", err)
+	}
+}
+
+func TestBlCanonPath(t *testing.T) {
+	// The longest existing ancestor is resolved and the rest is appended, so
+	// a file a baseline is about to CREATE is still compared by its real
+	// parent directory.
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := blCanonPath(filepath.Join(sub, "not-yet.txt")), filepath.Join(resolved, "not-yet.txt"); got != want {
+		t.Errorf("blCanonPath = %q, want %q", got, want)
+	}
+
+	// The resolver's answer is used for the part that exists, whatever the
+	// caller spelled (this is what expands an 8.3 short name on Windows).
+	fake := func(p string) (string, error) {
+		if filepath.Base(p) == "HOMELA~1" {
+			return filepath.Join(filepath.Dir(p), "HomelabRMM"), nil
+		}
+		return "", errors.New("does not exist")
+	}
+	got := blCanonPathWith(filepath.Join("C:", "ProgramData", "HOMELA~1", "agent.json"), fake)
+	if want := filepath.Join("C:", "ProgramData", "HomelabRMM", "agent.json"); got != want {
+		t.Errorf("blCanonPathWith = %q, want %q", got, want)
+	}
+	// A path nothing can resolve is returned untouched rather than mangled
+	// into something that would compare equal to the wrong thing.
+	never := func(string) (string, error) { return "", errors.New("no") }
+	if got := blCanonPathWith("/no/such/place/file.txt", never); got != "/no/such/place/file.txt" {
+		t.Errorf("an unresolvable path must come back unchanged, got %q", got)
 	}
 }

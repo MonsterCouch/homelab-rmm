@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1188,4 +1189,90 @@ func TestShellRelayClosesWithACode(t *testing.T) {
 	if ce.Code != websocket.CloseInternalServerErr {
 		t.Errorf("a terminal that could not open reported code %d (%q), want %d", ce.Code, ce.Text, websocket.CloseInternalServerErr)
 	}
+}
+
+// ---- inst-04/inst-05/inst-06: the rendered Windows script aborted on every
+// server with no certificate fingerprint (PowerShell drops an empty argument,
+// so the agent saw a bare "--fingerprint"), both scripts downloaded the agent
+// before checking they had a hash to verify it against, and any unrecognised
+// ?os= value was answered with the Linux bash script. ----
+
+func TestInstallScriptHandlesAServerWithNoFingerprint(t *testing.T) {
+	_, ts, b := newTestServerWith(t, Config{})
+	var tok struct{ Token string }
+	b.mustJSON("POST", "/api/enroll", map[string]any{"name": "lab"}, &tok)
+
+	_, ps, _ := get(t, ts.URL+"/install/"+tok.Token+"?os=windows")
+	// PowerShell drops an empty string when it builds a native command's
+	// argument list, so "--fingerprint $fp" with no fingerprint reaches the
+	// agent as a bare flag (exit 2, "flag needs an argument") - or eats
+	// whatever follows it as its value.
+	if strings.Contains(ps, "& $exe install ") {
+		t.Errorf("the Windows script still passes --fingerprint unconditionally:\n%s", lastLines(ps, 6))
+	}
+	if !strings.Contains(ps, "if ($fp) {") {
+		t.Errorf("the Windows script does not make the fingerprint optional:\n%s", lastLines(ps, 6))
+	}
+	// The Linux script always passes a word, empty or not, so it is fine.
+	_, sh, _ := get(t, ts.URL+"/install/"+tok.Token+"?os=linux")
+	if !strings.Contains(sh, `--fingerprint "$FP"`) {
+		t.Errorf("the Linux script no longer passes the fingerprint:\n%s", lastLines(sh, 4))
+	}
+}
+
+func TestInstallScriptRefusesBeforeDownloadingWithNoHash(t *testing.T) {
+	_, ts, b := newTestServerWith(t, Config{})
+	var tok struct{ Token string }
+	b.mustJSON("POST", "/api/enroll", map[string]any{"name": "lab"}, &tok)
+
+	// This server ships no agent binaries at all, so neither script has a
+	// hash. Refusing after the download leaves an unverified file (a 404
+	// body, here) in C:\Program Files\HomelabRMM or /opt/homelab-rmm.
+	_, ps, _ := get(t, ts.URL+"/install/"+tok.Token+"?os=windows")
+	if !strings.Contains(ps, "$sum = ''") {
+		t.Fatalf("this fixture was supposed to have no agent binary:\n%s", firstLines(ps, 8))
+	}
+	if i, j := strings.Index(ps, "to verify the download against"), strings.Index(ps, "DownloadFile"); i < 0 || j < 0 || i > j {
+		t.Errorf("the Windows script downloads before it checks it has a hash (guard at %d, download at %d)", i, j)
+	}
+	if i, j := strings.Index(ps, "to verify the download against"), strings.Index(ps, "New-Item -ItemType Directory"); i < 0 || j < 0 || i > j {
+		t.Error(`the Windows script creates C:\Program Files\HomelabRMM before it checks it has a hash`)
+	}
+	_, sh, _ := get(t, ts.URL+"/install/"+tok.Token+"?os=linux")
+	if i, j := strings.Index(sh, "to verify the download against"), strings.Index(sh, "mkdir -p"); i < 0 || j < 0 || i > j {
+		t.Error("the Linux script creates /opt/homelab-rmm and downloads before it checks it has a hash")
+	}
+}
+
+func TestInstallScriptRefusesAnOSItDoesNotShip(t *testing.T) {
+	_, ts, b := newTestServerWith(t, Config{})
+	var tok struct{ Token string }
+	b.mustJSON("POST", "/api/enroll", map[string]any{"name": "lab", "uses": 9}, &tok)
+
+	// A Mac, a typo and a shell metacharacter used to be answered with the
+	// Linux script: bash on a Windows box, and a Linux ELF binary downloaded
+	// as root on a Mac before systemctl finally complained.
+	for _, bad := range []string{"macos", "freebsd", "windwos", "WINDOWS ", "linux;id"} {
+		st, body, _ := get(t, ts.URL+"/install/"+tok.Token+"?os="+url.QueryEscape(bad))
+		if st != http.StatusBadRequest {
+			t.Errorf("os %q should be 400, got %d", bad, st)
+		}
+		if strings.Contains(body, "rmm-agent install") || strings.Contains(body, "#!/bin/bash") {
+			t.Errorf("os %q was served a script anyway", bad)
+		}
+	}
+	// The documented spellings, including the default, still render.
+	for _, q := range []string{"", "?os=", "?os=linux", "?os=windows"} {
+		if st, body, _ := get(t, ts.URL+"/install/"+tok.Token+q); st != http.StatusOK {
+			t.Errorf("install script %q: %d %s", q, st, body)
+		}
+	}
+}
+
+func lastLines(s string, n int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }

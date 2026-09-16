@@ -404,8 +404,11 @@ rows.
   wevtutil warns that it could not render a record, because `/f:RenderedXml` drops such records
   while still exiting 0. Page sizes, the fixed search window and the level vocabulary are the
   cross-platform contract in [API.md](API.md#event-log).
-- `update.go` — `agent.update` downloads a binary over the pinned TLS client, verifies SHA-256,
-  swaps it next to the running one and exits so the service manager restarts it (no server-side
+- `update.go` — `agent.update` **requires** a 64-hex SHA-256 and a URL that is `https`, or plain
+  `http` only against the configured server's own host, and refuses both before it fetches
+  anything: what this installs runs as SYSTEM/root, and the TLS client pins nothing when the
+  agent has no fingerprint. It then downloads over that client, verifies the hash, swaps the
+  binary next to the running one and exits so the service manager restarts it (no server-side
   trigger exists yet).
 - `desktop/` — see `docs/DESKTOP-PROTOCOL.md`.
 

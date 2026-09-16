@@ -118,13 +118,28 @@ _Coming soon: dashboard, device overview, remote desktop, script run with live o
    anyone creates a user and it prints a new one; once the admin exists the code is neither
    minted nor asked for again.
 6. **Devices → Enrol**: create an enrolment token (name, optional group, number of uses, expiry),
-   copy the Windows or Linux one-liner and run it on each machine you want to manage:
-   - Windows, elevated PowerShell:
-     `[Net.ServicePointManager]::ServerCertificateValidationCallback={$true}; iex ((New-Object Net.WebClient).DownloadString('https://rmm.lan:8443/install/<token>?os=windows'))`
-     (append `&arch=arm64` for Windows on ARM)
+   then on each machine you want to manage:
+   - Windows, elevated PowerShell — save the script, read it, run it:
+
+     ```powershell
+     [Net.ServicePointManager]::SecurityProtocol = 'Tls12'
+     [Net.ServicePointManager]::ServerCertificateValidationCallback = {$true}
+     Invoke-WebRequest 'https://rmm.lan:8443/install/<token>?os=windows' -UseBasicParsing -OutFile "$env:TEMP\rmm-install.ps1"
+     notepad "$env:TEMP\rmm-install.ps1"    # optional, and worth doing once
+     & "$env:TEMP\rmm-install.ps1"
+     ```
+
+     (append `&arch=arm64` to the URL for Windows on ARM)
    - Linux, any shell: `curl -fsSk 'https://rmm.lan:8443/install/<token>?os=linux' | sudo bash`
 
-   The device appears in the console within seconds. The one-liners are explained under
+   The console also prints a one-line `iex` form of the Windows command. It fetches the same
+   script, but **antivirus commonly blocks it**: `New-Object Net.WebClient` + `DownloadString` +
+   `iex` on one line, with certificate validation turned off first, is a signature every
+   AMSI-aware scanner knows — Bitdefender refuses it as `ScriptContainedMaliciousContent` before
+   a line of it runs. The download-then-run form above is the one to reach for; see
+   [Troubleshooting](#troubleshooting) if the agent binary or the service is blocked too.
+
+   The device appears in the console within seconds. The commands are explained under
    [Enrolling devices](#enrolling-devices).
 7. Optional: *Settings → Email* for alert notifications, *Settings → Retention*, *Alerts → Alert rules*
    (seven sensible rules are created for you), *Scripts* (a starter library is there).
@@ -185,9 +200,15 @@ group. The console prints two commands per token:
   `/opt/homelab-rmm/rmm-agent`, config at `/etc/homelab-rmm/agent.json`, systemd unit
   **HomelabRMMAgent**. The architecture (amd64, arm64, armv7) is detected from `uname -m`.
 
-The script is served only for a **live enrolment token** — anything else is a 404 — and only for
-an architecture this project ships, so the URL cannot be used to push arbitrary text into the
-root shell it is piped to.
+The script is served only for a **live enrolment token** — anything else is a 404 — for an
+architecture this project ships and for an operating system it ships (`windows` or `linux`;
+anything else is a 400, so a typo cannot hand a Windows box a bash script), so the URL cannot be
+used to push arbitrary text into the root shell it is piped to.
+
+On Windows, prefer downloading the script to a file and running it, as in
+[Quick start](#quick-start-windows-server): the console's one-line `iex` form is what antivirus
+blocks, not the script it fetches. If the download or the service is blocked as well, see
+[Troubleshooting](#troubleshooting).
 
 Both commands skip certificate validation for the **one fetch of the install script**, because
 the device has never seen the server's self-signed certificate. Everything after that is pinned:
@@ -398,6 +419,22 @@ stopping the service, putting the files back and starting it. More in
   (Linux) on PATH. PowerShell scripts prefer `pwsh` and fall back to Windows PowerShell 5.1.
 - **A Linux device shows no patches.** No supported package manager was found (apt-get, dnf,
   yum, pacman, zypper); the scan result carries the reason.
+- **Antivirus blocks the Windows enrolment.** Expect it; nothing here is signed. Three separate
+  things can be stopped:
+  - *The one-liner itself* (`ScriptContainedMaliciousContent`, Bitdefender and friends): the
+    `DownloadString` + `iex` shape is what trips AMSI, not the script. Use the four-line form in
+    [Quick start](#quick-start-windows-server) — `Invoke-WebRequest -OutFile`, then run the `.ps1` with
+    `powershell -NoProfile -ExecutionPolicy Bypass -File` (a default `Restricted` execution policy
+    refuses `& script.ps1`) — which also lets you read the script first.
+  - *The downloaded `rmm-agent.exe`* (SmartScreen, "unrecognised app", a quarantine): the release
+    binaries carry no Authenticode signature, so reputation-based blocks are normal on a fresh
+    machine. Add an exclusion for `C:\Program Files\HomelabRMM` and
+    `%ProgramData%\HomelabRMM` on the devices you manage.
+  - *The agent at runtime*: it runs scripts as SYSTEM and reads the event log, which behavioural
+    engines score highly. The same two exclusions cover it.
+
+  The **manual install** under [Enrolling devices](#enrolling-devices) needs none of the first
+  two: copy the binary to the device yourself and run `rmm-agent install`.
 - **TOTP codes are rejected.** Clock drift: sync time on the server and on your phone.
 
 ## Security model (summary)

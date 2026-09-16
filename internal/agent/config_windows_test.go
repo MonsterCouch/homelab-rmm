@@ -26,10 +26,9 @@ func sddl(t *testing.T, path string) (*windows.SECURITY_DESCRIPTOR, string) {
 	return sd, sd.String()
 }
 
-// unprotect hands the directory back to everyone so the test's own cleanup can
-// delete it: after secureDir, a test running as a plain user is no longer on
-// the ACL. Only the owner right to rewrite a DACL makes this possible, which
-// is also why secureDir works for the installer in the first place.
+// unprotect drops the protection again so the test's own cleanup can delete
+// the directory: secureDir hands ownership to Administrators, and a test
+// running as a plain user keeps only the entry secureDir wrote for it.
 func unprotect(t *testing.T, path string) {
 	t.Helper()
 	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,

@@ -5,14 +5,21 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
 )
+
+// sha256HexRE is a whole SHA-256 in hex and nothing else.
+var sha256HexRE = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 
 // selfUpdate downloads a new binary, verifies its hash and swaps it in next
 // to the running one. The service manager restarts the agent afterwards
@@ -21,14 +28,32 @@ func selfUpdate(ctx context.Context, cfg *Config, req protocol.AgentUpdate) erro
 	return doSelfUpdate(ctx, cfg, req.URL, req.SHA256)
 }
 
-func doSelfUpdate(ctx context.Context, cfg *Config, url, sum string) error {
+func doSelfUpdate(ctx context.Context, cfg *Config, binURL, sum string) error {
+	// What this installs runs as SYSTEM/root on the next restart, so the hash
+	// is not optional: an empty one used to skip verification altogether and
+	// leave the download as the only thing standing - over a TLS config that
+	// pins nothing when the agent has no fingerprint.
+	if !sha256HexRE.MatchString(sum) {
+		return errors.New("agent update: sha256 must be 64 hex characters")
+	}
+	if err := checkUpdateURL(cfg.ServerURL, binURL); err != nil {
+		return err
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	exe, _ = filepath.EvalSymlinks(exe)
+	// EvalSymlinks returns ("", err) on failure, and swallowing that left exe
+	// empty: the binary was downloaded to a stray ".new" in whatever the
+	// service's working directory happens to be, and the swap then failed on
+	// a rename with no path in the message.
+	resolved, err := filepath.EvalSymlinks(exe)
+	if err != nil {
+		return fmt.Errorf("resolve %s: %w", exe, err)
+	}
+	exe = resolved
 	client := &http.Client{Timeout: 10 * time.Minute, Transport: &http.Transport{TLSClientConfig: TLSConfig(cfg.Fingerprint)}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, binURL, nil)
 	if err != nil {
 		return err
 	}
@@ -52,17 +77,26 @@ func doSelfUpdate(ctx context.Context, cfg *Config, url, sum string) error {
 		return err
 	}
 	f.Close()
-	if sum != "" && hex.EncodeToString(h.Sum(nil)) != sum {
+	if !strings.EqualFold(hex.EncodeToString(h.Sum(nil)), sum) {
 		os.Remove(tmp)
 		return errors.New("checksum mismatch")
 	}
 	old := exe + ".old"
-	os.Remove(old)
+	// A previous generation's image can still be mapped - on Windows the
+	// desktop helper runs from the same file and outlives a service restart -
+	// and Windows refuses to delete or overwrite a mapped executable. Ignoring
+	// that failure left the rename below to hit the same refusal and wedge
+	// every future update, so move aside to a name nothing can be holding.
+	if err := os.Remove(old); err != nil && !os.IsNotExist(err) {
+		old = fmt.Sprintf("%s.old.%d", exe, time.Now().UnixNano())
+	}
 	if err := os.Rename(exe, old); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, exe); err != nil {
 		os.Rename(old, exe)
+		os.Remove(tmp)
 		return err
 	}
 	go func() {
@@ -70,4 +104,30 @@ func doSelfUpdate(ctx context.Context, cfg *Config, url, sum string) error {
 		os.Exit(0) // the service manager restarts us on the new binary
 	}()
 	return nil
+}
+
+// checkUpdateURL bounds where a new binary may come from. https is accepted
+// (the fingerprint the agent pins is applied to it when there is one), and
+// plain http only from the server the agent is already configured to talk to,
+// which is the documented --insecure deployment behind a TLS-terminating
+// proxy. Anything else - a file://, an ftp://, an http:// host of the
+// sender's choosing - is refused before a byte is fetched.
+func checkUpdateURL(serverURL, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("agent update: %w", err)
+	}
+	if u.Host == "" {
+		return errors.New("agent update: the url has no host")
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		if s, err := url.Parse(serverURL); err == nil && s.Host != "" && strings.EqualFold(u.Host, s.Host) {
+			return nil
+		}
+		return errors.New("agent update: a plain http url is only accepted from the configured server")
+	}
+	return fmt.Errorf("agent update: unsupported url scheme %q", u.Scheme)
 }

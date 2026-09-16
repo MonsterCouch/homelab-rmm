@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
+	"github.com/MonsterCouch/homelab-rmm/internal/winsec"
 )
 
 // Version is stamped by the build (-ldflags "-X ...server.Version=v1.2.3").
@@ -102,6 +103,15 @@ func (s *Server) waitJobs(d time.Duration) {
 func New(cfg Config) (*Server, error) {
 	if err := os.MkdirAll(cfg.DataDir, 0o750); err != nil {
 		return nil, fmt.Errorf("data dir: %w", err)
+	}
+	// 0o750 is a no-op on Windows, where the default data directory is a child
+	// of %ProgramData% and inherits "BUILTIN\Users: read and execute" - which
+	// would make rmm.db (sessions, password hashes, every script and baseline
+	// parameter) and server.key (the certificate every agent pins) readable by
+	// any local account. A directory that cannot be secured is a warning, not
+	// a failure: the server still has to run (acl-01).
+	if err := winsec.SecureDir(cfg.DataDir); err != nil {
+		slog.Warn("cannot restrict permissions on the data directory", "dir", cfg.DataDir, "err", err)
 	}
 	db, err := openDB(cfg.path("rmm.db"))
 	if err != nil {

@@ -46,6 +46,10 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	if err := in.Validate(); err != nil {
+		fail(w, err)
+		return
+	}
 	if _, err := s.db.GetAgent(id); err != nil {
 		fail(w, err)
 		return
@@ -160,6 +164,10 @@ func (s *Server) handleProcKill(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
 	defer cancel()
 	if err := s.hub.Request(ctx, r.PathValue("id"), protocol.ReqProcKill, in, nil); err != nil {
+		// A refusal is audited too. "Nobody tried" and "someone tried and the
+		// device said no" are different answers to the question this log is
+		// read to answer, and the attempt is fully attributed right here.
+		s.audit(r, "process.kill", r.PathValue("id"), auditFailure(map[string]any{"pid": in.PID}, err))
 		fail(w, err)
 		return
 	}
@@ -193,11 +201,24 @@ func (s *Server) handleServiceAction(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	var out protocol.Service
 	if err := s.hub.Request(ctx, r.PathValue("id"), protocol.ReqSvcAction, in, &out); err != nil {
+		// Audited on the way out as well: a stop the SCM denied is exactly
+		// what somebody probing which security services they can turn off
+		// looks like, and only the failure path sees it.
+		s.audit(r, "service."+in.Action, r.PathValue("id"), auditFailure(map[string]any{"name": in.Name}, err))
 		fail(w, err)
 		return
 	}
 	s.audit(r, "service."+in.Action, r.PathValue("id"), in.Name)
 	writeJSON(w, 200, out)
+}
+
+// auditFailure labels an audit detail as an attempt that did not happen and
+// says why. Successful entries keep their existing shape; the "outcome" key
+// is what tells the two apart.
+func auditFailure(details map[string]any, err error) map[string]any {
+	details["outcome"] = "failed"
+	details["error"] = err.Error()
+	return details
 }
 
 // ---- event log ----
