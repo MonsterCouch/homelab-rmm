@@ -297,8 +297,14 @@ neither the script nor the download.
   read-and-execute from `%ProgramData%`, which would expose `rmm.db` and `server.key` to every
   local account). The directory's **owner** is set as well: an owner keeps `WRITE_DAC` whatever
   the DACL says, so a standard user who pre-created the directory could otherwise hand the
-  permissions straight back. Anyone with administrative rights on the server host still has
-  everything, as they always do.
+  permissions straight back. One more entry is written when — and only when — the process doing
+  the locking is neither SYSTEM nor an elevated administrator, which is what `rmm-server run
+  --data-dir <dir>` from an ordinary shell is: **its own account**. Without that entry the other
+  two deny it the database it is about to open, on a directory it has just protected and can no
+  longer use. It is the directory's owner, so the entry grants it nothing it could not take
+  anyway, and `BUILTIN\Users` stays out either way; the service and an elevated install get the
+  SYSTEM + Administrators DACL unchanged. Anyone with administrative rights on the server host
+  still has everything, as they always do.
 - **Enrolment re-uses an offline device record** with the same hostname and OS. A rogue machine
   that knows a valid token and a victim's hostname could take over that record while the victim
   is offline (it would receive the victim's group/tags and queued runs, and the victim's own key

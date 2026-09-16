@@ -18,6 +18,14 @@ import (
 // Windows' own tools spell out.
 const fileAllAccess = windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1FF
 
+// grant is one entry of the DACL SecureDir writes. The trustee type is
+// informational once the form is TRUSTEE_IS_SID, but it is what the entry
+// means, so it travels with the SID.
+type grant struct {
+	sid *windows.SID
+	typ windows.TRUSTEE_TYPE
+}
+
 // SecureDir locks down a directory the service owns. Unix modes are a no-op on
 // Windows, so a child of %ProgramData% is created with %ProgramData%'s own
 // inherited ACL, which grants BUILTIN\Users read-and-execute: every local
@@ -30,6 +38,10 @@ const fileAllAccess = windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0
 //
 // Windows propagates the new inheritable entries to the existing children,
 // so a file written before this landed is re-secured too.
+//
+// The account this process runs as is granted the same access when those two
+// entries would not cover it - see uncoveredCaller - so that securing a
+// directory never costs the caller the use of it.
 //
 // The DACL alone is not enough. %ProgramData% lets any local user create a
 // directory and stamps them as its CREATOR OWNER, and an owner holds
@@ -46,23 +58,33 @@ func SecureDir(path string) error {
 	if err != nil {
 		return fmt.Errorf("Administrators sid: %w", err)
 	}
+	grants := []grant{
+		{sid: system, typ: windows.TRUSTEE_IS_WELL_KNOWN_GROUP},
+		{sid: admins, typ: windows.TRUSTEE_IS_WELL_KNOWN_GROUP},
+	}
+	caller, err := uncoveredCaller([]*windows.SID{system, admins})
+	if err != nil {
+		return fmt.Errorf("the account this process runs as: %w", err)
+	}
+	if caller != nil {
+		grants = append(grants, grant{sid: caller, typ: windows.TRUSTEE_IS_USER})
+	}
+
 	// The SIDs are Go-heap allocations and the TRUSTEE only holds their
 	// addresses; pin them for as long as the entries are read.
 	var pinner runtime.Pinner
-	pinner.Pin(system)
-	pinner.Pin(admins)
 	defer pinner.Unpin()
-
-	entries := make([]windows.EXPLICIT_ACCESS, 0, 2)
-	for _, sid := range []*windows.SID{system, admins} {
+	entries := make([]windows.EXPLICIT_ACCESS, 0, len(grants))
+	for _, g := range grants {
+		pinner.Pin(g.sid)
 		entries = append(entries, windows.EXPLICIT_ACCESS{
 			AccessPermissions: fileAllAccess,
 			AccessMode:        windows.GRANT_ACCESS,
 			Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 			Trustee: windows.TRUSTEE{
 				TrusteeForm:  windows.TRUSTEE_IS_SID,
-				TrusteeType:  windows.TRUSTEE_IS_WELL_KNOWN_GROUP,
-				TrusteeValue: windows.TrusteeValueFromSID(sid),
+				TrusteeType:  g.typ,
+				TrusteeValue: windows.TrusteeValueFromSID(g.sid),
 			},
 		})
 	}
@@ -80,6 +102,71 @@ func SecureDir(path string) error {
 	// not, and a caller that cannot take ownership (a non-elevated developer
 	// run) should still get the DACL rather than neither.
 	return secureOwner(path, admins)
+}
+
+// uncoveredCaller returns the account this process runs as when a DACL that
+// grants only sids would lock it out, and nil when one of those entries covers
+// it already.
+//
+// SYSTEM + Administrators covers the two ways this code is meant to run: the
+// installed service, whose token user is SYSTEM, and an elevated install. It
+// does not cover `rmm-server run --data-dir <dir>` from an ordinary shell, or
+// `go test ./internal/server/` on a developer machine - and there the lockout
+// is not something the next line recovers from. The DACL write itself succeeds
+// (the caller created the directory, and an owner keeps WRITE_DAC), and then
+// the open of rmm.db inside it fails with "Access is denied" on a directory
+// that is now protected and, as far as that process can tell, unusable.
+//
+// Granting the caller its own entry gives nothing away: it is the directory's
+// owner, so it could grant itself that access at any moment anyway. Everyone
+// else - BUILTIN\Users above all - stays just as excluded, and on the two
+// installs that matter the DACL is exactly the one it was before.
+func uncoveredCaller(sids []*windows.SID) (*windows.SID, error) {
+	token := windows.GetCurrentProcessToken()
+	user, err := token.GetTokenUser()
+	if err != nil {
+		return nil, fmt.Errorf("token user: %w", err)
+	}
+	groups, err := token.GetTokenGroups()
+	if err != nil {
+		return nil, fmt.Errorf("token groups: %w", err)
+	}
+	if tokenCovered(user.User.Sid, groups.AllGroups(), sids) {
+		return nil, nil
+	}
+	// Copy it out of the token information buffer, which the ACE built from
+	// this SID outlives.
+	sid, err := user.User.Sid.Copy()
+	if err != nil {
+		return nil, fmt.Errorf("copy the token user sid: %w", err)
+	}
+	return sid, nil
+}
+
+// tokenCovered reports whether an access token with this user and these groups
+// is granted anything by an ACE for one of sids.
+//
+// Only a group with SE_GROUP_ENABLED counts. A token can carry
+// BUILTIN\Administrators as SE_GROUP_USE_FOR_DENY_ONLY - a UAC-filtered shell,
+// or a restricted token - where it is present but can match deny entries only,
+// and that is exactly the token this has to answer "no" for. Asking the group
+// itself is what stays right for both: windows.Token.IsElevated() answers true
+// for a restricted token whose Administrators group is deny-only.
+func tokenCovered(user *windows.SID, groups []windows.SIDAndAttributes, sids []*windows.SID) bool {
+	for _, sid := range sids {
+		if user != nil && user.Equals(sid) {
+			return true
+		}
+		for _, g := range groups {
+			if g.Attributes&windows.SE_GROUP_ENABLED == 0 {
+				continue
+			}
+			if g.Sid != nil && g.Sid.Equals(sid) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // secureOwner makes SYSTEM or Administrators the owner of path, and says so

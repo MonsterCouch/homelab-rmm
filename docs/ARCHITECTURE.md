@@ -348,8 +348,11 @@ rows.
 - `shell*.go` — pseudo-terminal sessions; `services_*.go`, `proc_*.go`, `eventlog_*.go`,
   `updates_*.go`, `power_*.go`, `files.go`, `wol.go` — the per-feature handlers;
   `platform_other.go` documents the contract each platform file fulfils.
-- `update.go` — `agent.update` downloads a binary over the pinned TLS client, verifies SHA-256,
-  swaps it next to the running one and exits so the service manager restarts it (no server-side
+- `update.go` — `agent.update` **requires** a 64-hex SHA-256 and a URL that is `https`, or plain
+  `http` only against the configured server's own host, and refuses both before it fetches
+  anything: what this installs runs as SYSTEM/root, and the TLS client pins nothing when the
+  agent has no fingerprint. It then downloads over that client, verifies the hash, swaps the
+  binary next to the running one and exits so the service manager restarts it (no server-side
   trigger exists yet).
 - `desktop/` — see `docs/DESKTOP-PROTOCOL.md`.
 
