@@ -160,7 +160,7 @@ What to keep (all in the data directory):
 | File | Why |
 |---|---|
 | `rmm.db` | every device, user, script, run, alert, setting |
-| `server.crt`, `server.key` | the identity agents pin; without the key every agent must re-enrol |
+| `server.crt`, `server.key` | the identity agents and the phone pin; without the key every agent must re-enrol (§6) |
 | `agents/` | only if you placed agent binaries there |
 
 **Cold backup** (simplest, always consistent): stop the service, copy the directory, start it.
@@ -247,29 +247,139 @@ install` prints a warning when `--server` is an `http://` URL and the agent logs
 network wants `https://`, whether from the server's own certificate or from a proxy in front
 of it.
 
-## 6. Custom certificates
+## 6. Certificates: names, custom files, rotation
+
+### The names on the generated certificate
+
+The self-signed pair is written **once** — on the first start that finds no `server.crt` in the
+data directory — is valid for ten years, and is never re-issued. That long life is deliberate: a
+certificate nobody has to renew is a pin nobody has to rotate. Its names are frozen at the moment
+it is written:
+
+| Source | What it puts in the certificate |
+|---|---|
+| always | `localhost`, `127.0.0.1` |
+| `os.Hostname()` | the machine's **short** name (`RMM-HOST`), never an FQDN, and never a name only DNS knows |
+| network interfaces | every non-loopback **IPv4** address the host had at that instant; IPv6 is filtered out entirely, so a tailnet `fd7a:…` address is never covered and a `100.x.y.z` one only if Tailscale was already up |
+| `--public-url` / `RMM_PUBLIC_URL` | its host — **but only on the run that generates the certificate** |
+
+That last row is the one that catches people. The flag seeds the `public_url` *setting* on first
+run and the certificate is generated from the seeded value in the same start. Setting Public URL
+afterwards from *Settings*, or adding the flag to an installation that already has a certificate,
+changes what install commands and alert mail say and nothing on disk. The server does say so: it
+logs `certificate name mismatch` at startup with the certificate's actual names, and
+*Settings → System* carries a banner naming the host that is not covered.
+
+**A name mismatch here is normal, and on its own it is not a fault.** Browsing to
+`https://rmm.example.ts.net:8443` when the certificate says `localhost, 127.0.0.1, RMM-HOST,
+192.168.1.12` gets you two complaints rather than one: an untrusted issuer *and*
+a name that does not match (`ERR_CERT_COMMON_NAME_INVALID` in Chrome). Importing `server.crt`
+into a trust store clears the first and never the second. Everything that pins — the agents, the
+install scripts, the Android app — decides on the leaf's SHA-256 and on nothing else, so a pinned
+client that ignores the hostname is behaving as designed; `docs/SECURITY.md` and `docs/ANDROID.md`
+§2.2 rule 1 say why, before someone files it as a bug.
+
+If a name has to be covered, it has to be there when the certificate is made: pass
+`--public-url https://<the name you will actually use>` on the very first start, or regenerate
+deliberately (below).
+
+### Custom certificates (`--cert`/`--key`)
 
 `--cert FILE --key FILE` (or `RMM_CERT_FILE`/`RMM_KEY_FILE`) replaces the generated certificate;
-PEM, any key type Go's `tls` accepts. The server pins **exactly this leaf certificate's**
-SHA-256 in every install command, so:
+PEM, any key type Go's `tls` accepts. `install` resolves both to absolute paths, refuses one
+without the other, and refuses a pair it cannot load. The server reports **this leaf's** SHA-256
+as the fingerprint and puts it in every install command, so everything under "Rotating" below
+applies to replacing these files too.
 
-- Rotating the certificate changes the fingerprint. Every enrolled agent then logs
-  `server certificate fingerprint mismatch` and stays offline until its `agent.json`
-  `fingerprint` is updated (re-run the enrolment one-liner, or edit the file and restart the
-  service). Plan certificate changes before enrolling a fleet, or enrol with an empty fingerprint
-  and a certificate the devices trust through their system store.
-- The generated self-signed certificate lasts ten years for exactly this reason.
-- To add names to the generated certificate, set `--public-url`, stop the server, delete
-  `server.crt` and `server.key`, start it (new fingerprint; re-enrol agents).
+They are read **once**, at start, into a static TLS configuration: there is no `GetCertificate`
+callback, no SIGHUP and no file watcher. Renewing a certificate in place therefore does nothing
+at all until `rmm-server restart` — put the restart in whatever does the renewing.
 
-The console itself can use whichever certificate your browser trusts; only the agents care about
-the pin.
+### Rotating the certificate — every pin breaks at the same instant
+
+To regenerate the built-in certificate (to cover a new name, or because the key is suspect):
+
+1. Note the current fingerprint (*Settings → System*), so afterwards you can prove it changed.
+2. Put the name you want covered into the **Public URL** *before* stopping: the certificate takes
+   its extra name from the effective public URL, and the value saved in *Settings* wins over
+   `--public-url` (the flag only seeds the setting on first run, and the server warns when the
+   two disagree). Only if the setting has never been filled in does the flag decide.
+3. `rmm-server stop`.
+4. Move `server.crt` and `server.key` out of the data directory — keep them until the fleet is
+   back, because putting them back is the only undo.
+5. `rmm-server start`. The pair is regenerated on the way up, with the new name in it.
+6. Read the new fingerprint from the startup line `listening … fingerprint=…`, or from
+   *Settings → System*, and confirm the startup `certificate name mismatch` warning is gone.
+7. Re-pin every client, below. Until you do, they are all broken.
+
+The failure shapes differ, which is why a rotation done by accident is expensive:
+
+- **Agents fail quietly.** Each logs `session ended err=… server certificate fingerprint
+  mismatch: got <hex>` to `agent.log` and retries with a backoff capped at a minute, indefinitely.
+  Nothing reaches the server, so there is no server-side log line and no audit entry — the devices
+  just go offline in the console, and an `offline` alert rule is the only thing that will actively
+  tell you. Fix per device: re-run the enrolment one-liner from the console (the identity survives
+  because `server_url` is unchanged), or edit `fingerprint` in `agent.json` and restart the
+  service. **You cannot push that as a script**: running a script needs the agent connected, and
+  it is not. Budget for reaching each device some other way.
+- **The phone fails loudly.** The Android app refuses the connection and shows its pin-mismatch
+  screen with the expected and the presented fingerprint; there is no "proceed anyway". Fix:
+  *Server detail → Rotate pin*, then confirm the new fingerprint through Trust review, out of
+  band, the same way it was added. The app never learns a pin from the connection it is
+  verifying, so this step is deliberately human.
+- **Browsers** warn again — new issuer, and possibly a new name mismatch. Re-import `server.crt`
+  wherever it was imported.
+- **New enrolments are fine.** The console renders install commands from the live fingerprint, so
+  anything enrolled after the restart pins the new certificate.
+
+Rotate before enrolling a fleet, or at a time when you can reach the devices. Do **not** rotate to
+make a name mismatch go away: the mismatch is normal (above), and the regeneration costs a
+re-pinning of everything.
+
+### Not rotating: a certificate the clients already trust
+
+If the reason to regenerate is a name, consider the other direction — give the server a
+certificate the clients trust on their own and stop pinning. On a tailnet that is two commands:
+
+```
+tailscale cert --cert-file server.crt --key-file server.key <host>.<tailnet>.ts.net
+rmm-server install --cert <dir>/server.crt --key <dir>/server.key \
+  --public-url https://<host>.<tailnet>.ts.net:8443
+```
+
+Put the pair where the service account can read it — the data directory is the obvious place, and
+on Windows `tailscale cert` writes to the working directory of the elevated shell you ran it in,
+which is usually not where you want it left.
+
+The result is a publicly trusted leaf carrying the MagicDNS name, so browsers, Android and every
+system trust store accept it with no warning, no mismatch and no pin to manage — the Android app
+holds such a server with an empty fingerprint (system trust). Three costs, all real:
+
+- **Every agent must be re-enrolled with an empty pin** (`rmm-agent install --server … --token …
+  --fingerprint ""`). The certificate is renewed about every 90 days and the fingerprint changes
+  with it; as §5 puts it, pinning only makes sense for a long-lived certificate.
+- **Every renewal needs a restart.** `tailscale cert` rewrites the files and the server reads them
+  once (above), so renew and restart together, on a schedule you control. Every agent reconnects.
+- **The two models are mutually exclusive.** One listener, one certificate, one fingerprint: you
+  cannot serve a pinned self-signed certificate to the agents and a publicly trusted one to the
+  phone.
+
+`tailscale serve --bg https / http://127.0.0.1:8080` in front of `rmm-server --insecure --listen
+127.0.0.1:8080 --trusted-proxies 127.0.0.1 --public-url https://<host>.<tailnet>.ts.net` gets to
+the same place with tailscaled owning the renewal, so there are no restarts — at the price of the
+`--insecure` caveats in §5: the fingerprint is empty everywhere (install commands carry no pin)
+and the session cookie is issued without `Secure`.
+
+The console itself can use whichever certificate your browser trusts; the pin is what the agents
+and the Android app care about.
 
 ## 7. Settings that affect operations
 
 *Settings* (admin only) → stored in the `settings` table:
 
-- **Public URL** — overrides the hostname guess; used in install commands and alert emails.
+- **Public URL** — overrides the hostname guess; used in install commands and alert emails. The
+  value saved here wins over `--public-url`, which only seeds it on first run (the server logs a
+  warning when the two disagree), and it is what §6 reads when a certificate is generated.
 - **Email** — SMTP host, port, `starttls` (587) / `tls` (465) / `none`, credentials, from,
   recipients; *Send test* verifies it.
 - **Agent defaults** — metrics interval (minimum 5 s), inventory interval (minimum 60 s); pushed
@@ -296,8 +406,8 @@ time (suppresses new alerts and policy-driven patch installs).
    (`Restart-Service HomelabRMMAgent` / `systemctl restart HomelabRMMAgent`), or re-run the
    enrolment one-liner from the new server on each device (the identity survives when the
    `server_url` matches, so pick the DNS approach when you can).
-4. The certificate moves with the data directory, so the pin stays valid. If you generate a new
-   one, re-enrol.
+4. The certificate moves with the data directory, so the pin stays valid and the phone keeps
+   working. If you generate a new one, re-pin everything — §6.
 
 ## 9. Housekeeping checklist
 
@@ -321,4 +431,8 @@ time (suppresses new alerts and policy-driven patch installs).
   is all anyone needs to add a device of their own.
 - After upgrading the server, replace the `agents/` folder too so newly enrolled devices get the
   matching agent.
+- Leave the certificate alone unless you mean it. Regenerating `server.crt`/`server.key`
+  invalidates every agent's pin and the phone's at the same moment, and a hostname mismatch — the
+  usual reason someone reaches for it — is normal here and not what it is for. §6 has both the
+  names the certificate actually carries and the rotation procedure.
 - Keep the server itself patched: it is a device like any other and can run the agent.
