@@ -66,7 +66,10 @@ See `routes()` in `internal/server/api.go`. Highlights:
   `GET .../eventlog?log=System&level=error&limit=200&search=`, `GET .../fs?path=`,
   `GET .../fs/download?path=` (binary), `POST .../fs/upload?path=` (raw body),
   `POST .../fs/delete|mkdir {path}`, `POST .../fs/rename {from,to}`,
-  `POST .../power {action: reboot|shutdown|lock|logoff, delay_sec, message}`, `POST .../wol`,
+  `POST .../power {action: reboot|shutdown|lock|logoff, delay_sec, message}` — `poweroff` and
+  `halt` are accepted as aliases of `shutdown`, `logout` as an alias of `logoff`; `delay_sec` is a
+  grace period honoured for reboot, shutdown and logoff, while lock is always immediate,
+  `POST .../wol`,
   `POST .../run {script_id | language+body, args, timeout_sec}` → `{run_id}`,
   `GET .../patches` → `{patches, last_scan}`, `POST .../patches/scan`,
   `POST .../patches/install {ids | all:true, reboot_if_required}` (202, follow `patches` events),
