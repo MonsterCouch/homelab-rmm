@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/user"
 	"strings"
@@ -77,6 +78,7 @@ func winServiceCheck(ctx context.Context, c *checkCtx) kindResult {
 		return blError("valid parameters", "invalid parameters", err.Error())
 	}
 	want := p.State + " / " + orText(p.StartType, "any")
+	c.setExpected(want)
 	if !winValidServiceName(p.Name) {
 		return blError(want, "refused", fmt.Sprintf("%q is not a valid service name", p.Name))
 	}
@@ -194,6 +196,7 @@ func winPackageCheck(ctx context.Context, c *checkCtx) kindResult {
 	if p.MinVersion != "" {
 		want = "present >= " + p.MinVersion
 	}
+	c.setExpected(want)
 	present, version, source := winPackagePresent(ctx, p.Name)
 	observed := "absent"
 	if present {
@@ -288,6 +291,7 @@ func winRegistryCheck(ctx context.Context, c *checkCtx) kindResult {
 		return blError("valid parameters", "invalid parameters", err.Error())
 	}
 	want := p.Type + " " + wantVal.Display()
+	c.setExpected(want)
 	root, sub, err := winRegRoot(p.Path)
 	if err != nil {
 		return blError(want, "refused", err.Error())
@@ -316,42 +320,125 @@ func winRegistryCheck(ctx context.Context, c *checkCtx) kindResult {
 	return blFail(want, observed, "")
 }
 
-// winRegRead reads one value with the type the check declares. An
-// expand_string is read UNEXPANDED so the comparison is against what is
+// winRegRead reads one value with the type the check declares, and refuses a
+// value that is STORED as a different type. The x/sys getters are deliberately
+// generous - GetIntegerValue answers for REG_DWORD and REG_QWORD alike,
+// GetStringValue for REG_SZ and REG_EXPAND_SZ - so without this a `dword`
+// check against a REG_QWORD compared the low 32 bits of a 64-bit number and
+// reported `pass` for a value that is neither the type nor the number it
+// asserts, while its remediation would rewrite the value as a REG_DWORD.
+//
+// An expand_string is read UNEXPANDED so the comparison is against what is
 // stored, not against what it happens to expand to today.
 func winRegRead(k registry.Key, name, kind string) (baselines.RegistryValue, error) {
 	v := baselines.RegistryValue{Kind: kind}
+	want, ok := winRegValueType(kind)
+	if !ok {
+		return v, fmt.Errorf("unknown registry type %q", kind)
+	}
 	switch kind {
-	case "dword":
-		n, _, err := k.GetIntegerValue(name)
+	case "dword", "qword":
+		n, valtype, err := k.GetIntegerValue(name)
 		if err != nil {
 			return v, err
+		}
+		if err := winRegTypeMismatch(kind, want, valtype); err != nil {
+			return v, err
+		}
+		if kind == "qword" {
+			v.QWord = n
+			return v, nil
+		}
+		if n > math.MaxUint32 {
+			return v, fmt.Errorf("the value does not fit a dword: %d", n)
 		}
 		v.DWord = uint32(n)
 		return v, nil
-	case "qword":
-		n, _, err := k.GetIntegerValue(name)
+	case "string", "expand_string":
+		s, valtype, err := k.GetStringValue(name)
 		if err != nil {
 			return v, err
 		}
-		v.QWord = n
-		return v, nil
-	case "string", "expand_string":
-		s, _, err := k.GetStringValue(name)
-		if err != nil {
+		if err := winRegTypeMismatch(kind, want, valtype); err != nil {
 			return v, err
 		}
 		v.String = s
 		return v, nil
 	case "multi_string":
-		ss, _, err := k.GetStringsValue(name)
+		ss, valtype, err := k.GetStringsValue(name)
 		if err != nil {
+			return v, err
+		}
+		if err := winRegTypeMismatch(kind, want, valtype); err != nil {
 			return v, err
 		}
 		v.Multi = ss
 		return v, nil
 	}
 	return v, fmt.Errorf("unknown registry type %q", kind)
+}
+
+// winRegValueType maps a check's declared type onto the REG_* type the value
+// has to be stored as. The two are the same contract: docs/BASELINES.md says
+// the declared type fixes both the JSON type of `value` and the kind read
+// from the device.
+func winRegValueType(kind string) (uint32, bool) {
+	switch kind {
+	case "dword":
+		return registry.DWORD, true
+	case "qword":
+		return registry.QWORD, true
+	case "string":
+		return registry.SZ, true
+	case "expand_string":
+		return registry.EXPAND_SZ, true
+	case "multi_string":
+		return registry.MULTI_SZ, true
+	}
+	return 0, false
+}
+
+// winRegTypeMismatch is the error for a value stored as something else. It
+// names both types, because "unexpected key value type" - what the x/sys
+// getters say when they refuse a type outright - does not tell an operator
+// which way round the mismatch is or what to change.
+func winRegTypeMismatch(kind string, want, got uint32) error {
+	if got == want {
+		return nil
+	}
+	return fmt.Errorf("the check declares %s (%s) but the value is stored as %s",
+		kind, winRegTypeName(want), winRegTypeName(got))
+}
+
+// winRegTypeName names a REG_* constant for an operator-facing message.
+func winRegTypeName(valtype uint32) string {
+	switch valtype {
+	case registry.NONE:
+		return "REG_NONE"
+	case registry.SZ:
+		return "REG_SZ"
+	case registry.EXPAND_SZ:
+		return "REG_EXPAND_SZ"
+	case registry.BINARY:
+		return "REG_BINARY"
+	case registry.DWORD:
+		return "REG_DWORD"
+	case registry.DWORD_BIG_ENDIAN:
+		return "REG_DWORD_BIG_ENDIAN"
+	case registry.LINK:
+		return "REG_LINK"
+	case registry.MULTI_SZ:
+		return "REG_MULTI_SZ"
+	case registry.RESOURCE_LIST:
+		return "REG_RESOURCE_LIST"
+	case registry.FULL_RESOURCE_DESCRIPTOR:
+		return "REG_FULL_RESOURCE_DESCRIPTOR"
+	case registry.RESOURCE_REQUIREMENTS_LIST:
+		return "REG_RESOURCE_REQUIREMENTS_LIST"
+	case registry.QWORD:
+		return "REG_QWORD"
+	}
+	return fmt.Sprintf("registry type %d", valtype)
 }
 
 func winRegistryFix(ctx context.Context, c *checkCtx) (string, error) {
@@ -434,6 +521,7 @@ func winGroupCheck(ctx context.Context, c *checkCtx) kindResult {
 		return blError("valid parameters", "invalid parameters", err.Error())
 	}
 	want := groupExpectedLabel(p)
+	c.setExpected(want)
 	members, err := winLocalGroupMembers(ctx, p.Group)
 	if err != nil {
 		return blError(want, "unknown", err.Error())
@@ -481,6 +569,7 @@ func winFirewallCheck(ctx context.Context, c *checkCtx) kindResult {
 		return blError("valid parameters", "invalid parameters", err.Error())
 	}
 	want := "domain/private/public: " + strings.Join([]string{onOff(p.Want()), onOff(p.Want()), onOff(p.Want())}, "/")
+	c.setExpected(want)
 	stdout, stderr, err := runHidden(ctx, "netsh.exe", "advfirewall", "show", "allprofiles")
 	profiles, complete := blWinFirewallProfiles(stdout)
 	if !complete {
@@ -519,6 +608,7 @@ func winTimeSyncCheck(ctx context.Context, c *checkCtx) kindResult {
 		return blError("valid parameters", "invalid parameters", err.Error())
 	}
 	want := "time sync " + onOff(p.Want())
+	c.setExpected(want)
 	state, _, err := winServiceState("w32time")
 	if err != nil {
 		if errors.Is(err, errServiceNotFound) {
@@ -573,9 +663,19 @@ func winTimeSyncFix(ctx context.Context, c *checkCtx) (string, error) {
 // ---- windows_feature ----
 
 // winFeatureQueryScript prints one JSON object for one optional feature.
+//
+// A name no optional feature has is NOT an error to Get-WindowsOptionalFeature:
+// it returns $null. Reading $f.State on that reported "You cannot call a
+// method on a null-valued expression" as the check's detail, which names
+// neither the feature nor the mistake, so the missing feature is answered
+// here instead - the way the `service` kind answers "service does not exist".
 const winFeatureQueryScript = `param([string]$Name)
 $ErrorActionPreference = 'Stop'
 $f = Get-WindowsOptionalFeature -Online -FeatureName $Name
+if ($null -eq $f) {
+  [Console]::Error.WriteLine("there is no optional feature named '" + $Name + "' on this device")
+  exit 1
+}
 [pscustomobject]@{ name = $f.FeatureName; state = $f.State.ToString() } | ConvertTo-Json -Compress
 `
 
@@ -597,10 +697,12 @@ func winFeatureCheck(ctx context.Context, c *checkCtx) kindResult {
 		return blError("valid parameters", "invalid parameters", err.Error())
 	}
 	want := p.Name + " " + p.State
+	c.setExpected(want)
 	stdout, stderr, err := runPowerShellScript(ctx, winFeatureQueryScript, p.Name)
 	state, ok := blWinFeatureState(stdout)
 	if !ok {
-		return blError(want, "unknown", winFirstLine(stderr, stdout, errString(err), "Get-WindowsOptionalFeature returned nothing"))
+		return blError(want, "unknown", winFirstLine(stderr, stdout, errString(err),
+			fmt.Sprintf("Get-WindowsOptionalFeature returned nothing for %q", p.Name)))
 	}
 	observed := p.Name + " " + state
 	if blWinFeatureEnabled(state) == (p.State == "enabled") {

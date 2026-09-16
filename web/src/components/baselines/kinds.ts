@@ -358,9 +358,53 @@ export function checkFilePath(p: string, state: string, content: string): string
   return null;
 }
 
-const REG_PATH_RE = /^(HKLM|HKCU)\\[A-Za-z0-9 ._-]+(\\[A-Za-z0-9 ._-]+)*$/;
+// regPathRE's twin. It is deliberately permissive about KEY NAMES, because
+// Windows is: a key name may hold anything but a backslash, and GUID-named
+// keys (HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-…}, CLSID keys,
+// network interfaces) are ordinary keys and are much of what a Windows
+// hardening baseline targets. What stays refused is a root other than
+// HKLM/HKCU, an empty component (a doubled or trailing backslash), a wildcard
+// and a control character.
+const REG_PATH_RE = /^(HKLM|HKCU)(\\[^\\*?\x00-\x1f\x7f]+)+$/;
+
+/** Go's %q, near enough: quoted, with the unprintable parts escaped. */
+const q = (s: string): string => JSON.stringify(s);
+
+/** One code point Go refuses as a control character. */
+const CTRL_RE = /[\x00-\x1f\x7f]/;
+
+/**
+ * regPathReason's twin: name the offending part of the path, because "with no
+ * wildcards" does not explain a doubled backslash or a bad root to the
+ * operator staring at the message. null means the shape is fine, and the
+ * caller keeps the other answer — the deny list or a length limit.
+ */
+function regPathReason(p: string): string | null {
+  if (!p || blen(p) > 1024) return null; // those two messages already say it
+  const cut = p.indexOf('\\');
+  const rest = cut < 0 ? '' : p.slice(cut + 1);
+  if (!rest) return 'must look like HKLM\\SOFTWARE\\… : a root and at least one key name';
+  const root = p.slice(0, cut);
+  if (root !== 'HKLM' && root !== 'HKCU') return `only HKLM and HKCU are accepted, not ${q(root)}`;
+  for (const c of rest.split('\\')) {
+    if (!c) return 'a key name is empty: a doubled or trailing backslash is not a registry path';
+    const w = c.search(/[*?]/);
+    if (w >= 0) return `a registry path has no wildcards, and ${q(c)} contains ${q(c[w])}`;
+    if (CTRL_RE.test(c)) return `${q(c)} contains a control character`;
+  }
+  return null;
+}
 
 export function checkRegistryPath(p: string): string | null {
+  const err = regPathShape(p);
+  if (!err) return null;
+  // validateRegistry answers with regPathReason when it is the SHAPE that is
+  // wrong, and with CheckRegistryPath's own message otherwise.
+  return regPathReason(p) ?? err;
+}
+
+/** CheckRegistryPath's twin, in internal/baselines/values.go. */
+function regPathShape(p: string): string | null {
   if (!p) return 'a registry path is required';
   if (blen(p) > 1024) return 'too long';
   if (!REG_PATH_RE.test(p)) return 'must look like HKLM\\SOFTWARE\\… or HKCU\\SOFTWARE\\… with no wildcards';
@@ -376,6 +420,7 @@ export function checkRegistryPath(p: string): string | null {
 // ---- validation, mirrored from internal/baselines/kinds.go ----
 
 const SERVICE_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9@._\-\\:]{0,255}$/;
+/** The strict spelling a package manager or a winget id uses; see packageNameOK. */
 const PKG_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9+._:@-]{0,255}$/;
 const GROUP_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9 ._-]{0,63}$/;
 const MEMBER_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9 ._\-\\@$]{0,255}$/;
@@ -384,6 +429,36 @@ const WIN_FEATURE_RE = /^[A-Za-z0-9\-.]{1,128}$/;
 const MODE_RE = /^[0-7]{3,4}$/;
 const SHA256_RE = /^[0-9a-fA-F]{64}$/;
 const OWNER_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}(:[A-Za-z0-9_][A-Za-z0-9._-]{0,63})?$/;
+
+/** One code point Go's unicode.IsSpace — so strings.TrimSpace — trims. */
+const SPACE_RE = /^[\t\n\v\f\r \x85\xa0\u{1680}\u{2000}-\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}]$/u;
+
+/**
+ * packageNameOK's twin: two spellings are legal, because the two platforms
+ * match on different things — the strict package-manager / winget-id form
+ * above, and a Windows program name as the Uninstall keys hold it ("7-Zip
+ * 26.03 (x64)", "GitHub CLI"). Nearly every DisplayName on a real device
+ * contains a space or a parenthesis, so without the second spelling the
+ * Uninstall half of the Windows `package` kind cannot be named at all.
+ */
+function packageNameOK(name: string): boolean {
+  return PKG_NAME_RE.test(name) || winDisplayNameOK(name);
+}
+
+/**
+ * winDisplayNameOK's twin: one line of printable text, at most 256
+ * characters, no leading or trailing space, starting with a letter or a digit
+ * so it can never be read as an option by the winget command line it is
+ * passed to. Non-ASCII is allowed on purpose: "Intel® Chipset Device
+ * Software" is how the device spells it.
+ */
+function winDisplayNameOK(name: string): boolean {
+  const runes = [...name];
+  if (!runes.length || runes.length > 256) return false;
+  if (SPACE_RE.test(runes[0]) || SPACE_RE.test(runes[runes.length - 1])) return false;
+  if (!/^[\p{L}\p{Nd}]$/u.test(runes[0])) return false;
+  return !CTRL_RE.test(name);
+}
 
 function oneOf(field: string, v: string, ...allowed: string[]): string | null {
   return allowed.includes(v) ? null : `${field}: must be one of ${allowed.join(', ')}`;
@@ -432,7 +507,7 @@ export function validateParams(kind: string, p: BaselineParams): string | null {
     }
     case 'package': {
       const name = str(p, 'name');
-      if (!PKG_NAME_RE.test(name)) return 'name: a package name or winget id is required';
+      if (!packageNameOK(name)) return 'name: a package name, a winget id or a Windows program name is required';
       if (name.endsWith('-') || name.endsWith(':')) return "name: a package name cannot end with '-' or ':'";
       const st = oneOf('state', str(p, 'state'), 'present', 'absent');
       if (st) return st;

@@ -9,6 +9,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -402,4 +405,92 @@ func TestBlCanonPath(t *testing.T) {
 	if got := blCanonPathWith("/no/such/place/file.txt", never); got != "/no/such/place/file.txt" {
 		t.Errorf("an unresolvable path must come back unchanged, got %q", got)
 	}
+}
+
+// The kinds live behind build tags - a Windows test binary cannot call
+// lnxSysctlCheck and a Linux one cannot call winFeatureCheck - so the only
+// way to hold every kind to the same rule from either GOOS is to read the
+// source. The rule is the one probe depends on: a check publishes the label
+// it would have reported before it starts work, so that a check the engine
+// abandons at its deadline still tells the operator what it was waiting for
+// instead of leaving an empty cell in the status matrix and in the drift
+// alert.
+func TestEveryBaselineKindPublishesItsExpectedLabel(t *testing.T) {
+	for _, name := range []string{"baseline_kinds.go", "baseline_linux.go", "baseline_windows.go"} {
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", name, err)
+		}
+		found := 0
+		for _, d := range f.Decls {
+			fn, ok := d.(*ast.FuncDecl)
+			if !ok || fn.Recv != nil || fn.Body == nil || !isKindCheckFunc(fn) {
+				continue
+			}
+			found++
+			if !publishesExpected(fn.Body) {
+				t.Errorf("%s: %s never calls c.setExpected, so a run abandoned at the engine's deadline reports an empty expected", name, fn.Name.Name)
+			}
+		}
+		if found == 0 {
+			t.Errorf("%s: found no kind check functions - has the signature changed?", name)
+		}
+	}
+}
+
+// isKindCheckFunc reports whether fn has kindImpl.check's signature:
+// func(context.Context, *checkCtx) kindResult.
+func isKindCheckFunc(fn *ast.FuncDecl) bool {
+	res := fn.Type.Results
+	if res == nil || len(res.List) != 1 || len(res.List[0].Names) != 0 || astTypeName(res.List[0].Type) != "kindResult" {
+		return false
+	}
+	var params []string
+	for _, p := range fn.Type.Params.List {
+		n := len(p.Names)
+		if n == 0 {
+			n = 1
+		}
+		for i := 0; i < n; i++ {
+			params = append(params, astTypeName(p.Type))
+		}
+	}
+	return len(params) == 2 && params[0] == "context.Context" && params[1] == "*checkCtx"
+}
+
+// publishesExpected reports whether the body calls c.setExpected as a
+// statement of its own, not inside a branch: the label has to be published on
+// every path that goes on to touch the OS.
+func publishesExpected(body *ast.BlockStmt) bool {
+	for _, st := range body.List {
+		expr, ok := st.(*ast.ExprStmt)
+		if !ok {
+			continue
+		}
+		call, ok := expr.X.(*ast.CallExpr)
+		if !ok {
+			continue
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "setExpected" {
+			continue
+		}
+		if recv, ok := sel.X.(*ast.Ident); ok && recv.Name == "c" {
+			return true
+		}
+	}
+	return false
+}
+
+func astTypeName(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return "*" + astTypeName(t.X)
+	case *ast.SelectorExpr:
+		return astTypeName(t.X) + "." + t.Sel.Name
+	}
+	return ""
 }

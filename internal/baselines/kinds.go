@@ -21,6 +21,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Limits. Every one of them is enforced by the server when a baseline is
@@ -426,16 +428,99 @@ var (
 	// Win32 service name. The device-side code re-validates with its own
 	// platform pattern before the name reaches a command line.
 	serviceNameRE = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9@._\-\\:]{0,255}$`)
-	pkgNameRE     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9+._:@-]{0,255}$`)
-	groupNameRE   = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9 ._\-]{0,63}$`)
-	memberNameRE  = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9 ._\-\\@$]{0,255}$`)
-	sysctlKeyRE   = regexp.MustCompile(`^[a-z0-9_]+(\.[a-z0-9_\-]+)*$`)
-	winFeatureRE  = regexp.MustCompile(`^[A-Za-z0-9\-\.]{1,128}$`)
-	regPathRE     = regexp.MustCompile(`^(HKLM|HKCU)\\[A-Za-z0-9 ._\-]+(\\[A-Za-z0-9 ._\-]+)*$`)
-	modeRE        = regexp.MustCompile(`^[0-7]{3,4}$`)
-	sha256RE      = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
-	ownerRE       = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._\-]{0,63}(:[A-Za-z0-9_][A-Za-z0-9._\-]{0,63})?$`)
+	// pkgNameRE is the strict spelling a package manager or a winget id uses.
+	// It is not the only way to name a package: see packageNameOK.
+	pkgNameRE    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9+._:@-]{0,255}$`)
+	groupNameRE  = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9 ._\-]{0,63}$`)
+	memberNameRE = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9 ._\-\\@$]{0,255}$`)
+	sysctlKeyRE  = regexp.MustCompile(`^[a-z0-9_]+(\.[a-z0-9_\-]+)*$`)
+	winFeatureRE = regexp.MustCompile(`^[A-Za-z0-9\-\.]{1,128}$`)
+	// regPathRE is deliberately permissive about KEY NAMES, because Windows
+	// is: a key name may hold anything but a backslash, and GUID-named keys
+	// (HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-…}, CLSID keys,
+	// network interfaces) are ordinary keys and are much of what a Windows
+	// hardening baseline targets. The path reaches registry.OpenKey, never a
+	// command line. What stays refused is a root other than HKLM/HKCU, an
+	// empty component (a doubled or trailing backslash), a wildcard and a
+	// control character; regPathReason says which one it was.
+	regPathRE = regexp.MustCompile(`^(HKLM|HKCU)(\\[^\\*?\x00-\x1f\x7f]+)+$`)
+	modeRE    = regexp.MustCompile(`^[0-7]{3,4}$`)
+	sha256RE  = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+	ownerRE   = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._\-]{0,63}(:[A-Za-z0-9_][A-Za-z0-9._\-]{0,63})?$`)
 )
+
+// packageNameOK reports whether name is a package this fleet can name at all.
+// Two spellings are legal, because the two platforms match on different
+// things: the strict package-manager / winget-id form above, and a Windows
+// program name as the Uninstall keys hold it - "7-Zip 26.03 (x64)",
+// "GitHub CLI", "Microsoft Visual C++ v14 Redistributable (x64)". Nearly
+// every DisplayName on a real device contains a space or a parenthesis, so
+// without the second spelling the Uninstall half of the Windows `package`
+// kind was unreachable for almost every installed program.
+//
+// The device re-validates with its own platform rule - validPkgID on Linux -
+// so a name dpkg could never hold is reported as `error` on that device
+// rather than as a 400 that stops a Windows baseline being written at all.
+func packageNameOK(name string) bool {
+	return pkgNameRE.MatchString(name) || winDisplayNameOK(name)
+}
+
+// winDisplayNameOK accepts an Uninstall DisplayName: one line of printable
+// text, at most 256 characters, no leading or trailing space, starting with a
+// letter or a digit so it can never be read as an option by the winget
+// command line it is passed to (as a single argument, never a shell string).
+// Non-ASCII is allowed on purpose: "Intel® Chipset Device Software" is how
+// the device spells it.
+func winDisplayNameOK(name string) bool {
+	if name == "" || !utf8.ValidString(name) || utf8.RuneCountInString(name) > 256 {
+		return false
+	}
+	if name != strings.TrimSpace(name) {
+		return false
+	}
+	first, _ := utf8.DecodeRuneInString(name)
+	if !unicode.IsLetter(first) && !unicode.IsDigit(first) {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// regPathReason explains a registry path the syntax rule refused, so the 400
+// names the offending part instead of restating the shape. It returns nil for
+// a path that satisfies the syntax, and the caller then keeps
+// CheckRegistryPath's own answer - the deny list or the length limit.
+func regPathReason(p string) error {
+	if p == "" || len(p) > 1024 {
+		// "a registry path is required" and "too long" already say it.
+		return nil
+	}
+	root, rest, ok := strings.Cut(p, `\`)
+	if !ok || rest == "" {
+		return errors.New(`must look like HKLM\SOFTWARE\… : a root and at least one key name`)
+	}
+	if root != "HKLM" && root != "HKCU" {
+		return fmt.Errorf("only HKLM and HKCU are accepted, not %q", root)
+	}
+	for _, c := range strings.Split(rest, `\`) {
+		if c == "" {
+			return errors.New("a key name is empty: a doubled or trailing backslash is not a registry path")
+		}
+		if i := strings.IndexAny(c, "*?"); i >= 0 {
+			return fmt.Errorf("a registry path has no wildcards, and %q contains %q", c, c[i:i+1])
+		}
+		for _, r := range c {
+			if r < 0x20 || r == 0x7f {
+				return fmt.Errorf("%q contains a control character", c)
+			}
+		}
+	}
+	return nil
+}
 
 func oneOf(field, v string, allowed ...string) error {
 	for _, a := range allowed {
@@ -473,8 +558,8 @@ func validatePackage(raw json.RawMessage, dec decodeFunc) error {
 	if err := dec(raw, &p); err != nil {
 		return err
 	}
-	if !pkgNameRE.MatchString(p.Name) {
-		return errors.New("name: a package name or winget id is required")
+	if !packageNameOK(p.Name) {
+		return errors.New("name: a package name, a winget id or a Windows program name is required")
 	}
 	switch p.Name[len(p.Name)-1] {
 	case '-', ':':
@@ -503,6 +588,13 @@ func validateRegistry(raw json.RawMessage, dec decodeFunc) error {
 		return err
 	}
 	if err := CheckRegistryPath(p.Path); err != nil {
+		// CheckRegistryPath states the shape; when it is the SHAPE that was
+		// wrong, say which part of the path and why, because "with no
+		// wildcards" does not explain a doubled backslash or a bad root to
+		// the operator staring at the 400.
+		if why := regPathReason(p.Path); why != nil {
+			return fmt.Errorf("path: %w", why)
+		}
 		return fmt.Errorf("path: %w", err)
 	}
 	if len(p.Name) > 255 {

@@ -103,6 +103,31 @@ type checkCtx struct {
 	// (reboot_pending remembers when a pending restart was first seen) reads
 	// it and stays read-only, because a preview persists nothing (A8).
 	preview bool
+
+	// mu guards want, which a kind publishes as soon as it has read its
+	// params and before it touches the OS. probe reads it when the check is
+	// abandoned at its deadline: a timed-out result with an empty `expected`
+	// is an empty cell in the status matrix and in the drift alert, with no
+	// clue what the check was waiting for. The lock is what makes it safe to
+	// read from the engine goroutine while the abandoned check goroutine is
+	// still running.
+	mu   sync.Mutex
+	want string
+}
+
+// setExpected records the label this check would have reported. Every kind
+// calls it once, with the same string it puts in kindResult.expected.
+func (c *checkCtx) setExpected(want string) {
+	c.mu.Lock()
+	c.want = want
+	c.mu.Unlock()
+}
+
+// expectedSoFar is that label, or "" if the check never got as far as one.
+func (c *checkCtx) expectedSoFar() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.want
 }
 
 // params decodes the check's parameters leniently: an unknown key is the
@@ -799,7 +824,10 @@ func (e *baselineEngine) probe(ctx context.Context, fn func(context.Context, *ch
 		done <- fn(cctx, c)
 	}()
 	timedOut := func(r kindResult) kindResult {
-		return blError(r.expected, orText(r.observed, "no answer"), fmt.Sprintf("timed out after %ds", int(timeout.Seconds())))
+		// The kind published its expected label before it started work, so a
+		// check that is abandoned here still reports what it was waiting for.
+		return blError(orText(r.expected, c.expectedSoFar()), orText(r.observed, "no answer"),
+			fmt.Sprintf("timed out after %ds", int(timeout.Seconds())))
 	}
 	select {
 	case r := <-done:

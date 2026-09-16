@@ -27,6 +27,9 @@ type fakeKind struct {
 	delay    time.Duration
 	noFix    bool
 	veto     string
+	// label is what a real kind publishes with setExpected before it starts
+	// work, so a check abandoned at its deadline still reports it.
+	label string
 }
 
 func (f *fakeKind) impl() *kindImpl {
@@ -41,6 +44,9 @@ func (f *fakeKind) impl() *kindImpl {
 }
 
 func (f *fakeKind) doCheck(ctx context.Context, c *checkCtx) kindResult {
+	if f.label != "" {
+		c.setExpected(f.label)
+	}
 	f.mu.Lock()
 	if f.delay > 0 {
 		d := f.delay
@@ -294,7 +300,7 @@ func TestBaselineOSFilterAndUnknownKindAreSkipped(t *testing.T) {
 }
 
 func TestBaselineCheckTimeoutIsAnError(t *testing.T) {
-	f := &fakeKind{delay: 2 * time.Second}
+	f := &fakeKind{delay: 2 * time.Second, label: "running / auto"}
 	e, _ := testEngine(t, map[string]*fakeKind{"fake": f})
 	ck := check(7, "fake")
 	ck.TimeoutSec = 5 // clamped up from anything smaller
@@ -306,6 +312,14 @@ func TestBaselineCheckTimeoutIsAnError(t *testing.T) {
 	r := onlyResult(t, e.runPass(context.Background(), sp, baselines.TriggerSchedule, passOpts{}))
 	if r.State != baselines.StateError || !strings.Contains(r.Detail, "timed out after 5s") {
 		t.Fatalf("expected a 5 s timeout error, got %+v", r)
+	}
+	// A timed-out check still says what it was waiting for: an empty
+	// `expected` is an empty cell in the status matrix and in the drift alert.
+	if r.Expected != "running / auto" {
+		t.Fatalf("the timeout must keep the check's expected label, got %q", r.Expected)
+	}
+	if r.Observed != "no answer" {
+		t.Fatalf("a check that never answered observes nothing, got %q", r.Observed)
 	}
 	if d := time.Since(start); d > 10*time.Second {
 		t.Fatalf("the timeout did not bound the check (%s)", d)
