@@ -171,8 +171,12 @@ along with `setup.refused` (a wrong setup code), `agent.enrolled`, `agent.rekeye
 `agent.duplicate_hostname`.
 
 **Agent hardening.** Helper tools are resolved by absolute path in `System32` on Windows so a
-writable directory on PATH cannot shadow `shutdown.exe`; commands never go through a shell;
-command output is capped (32 MB / 10 MB) so a runaway process cannot exhaust memory; script
+writable directory on PATH cannot shadow `shutdown.exe`. The same rule covers every PowerShell the
+agent starts as SYSTEM — the console terminal and the Windows Update scripts alike: `pwsh` is taken
+from `%ProgramFiles%\PowerShell\7`, or from PATH only when that entry is itself inside `Program
+Files` or `%SystemRoot%`, and otherwise the absolute `System32` `powershell.exe` is used.
+Commands never go through a shell; command output is capped (32 MB / 10 MB) so a runaway
+process cannot exhaust memory; script
 processes are killed as a tree on timeout or cancel. Script bodies are written to a private temp
 directory (0700) and removed afterwards.
 

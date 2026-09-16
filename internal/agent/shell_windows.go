@@ -67,7 +67,7 @@ const psUTF8Prelude = `try{$u=[Text.UTF8Encoding]::new();[Console]::OutputEncodi
 func shellCommandLine(shell string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(shell)) {
 	case "", "powershell", "pwsh":
-		return syscall.EscapeArg(interactivePowerShell()) + " -NoLogo -NoExit -Command " + syscall.EscapeArg(psUTF8Prelude), nil
+		return syscall.EscapeArg(trustedPowerShell()) + " -NoLogo -NoExit -Command " + syscall.EscapeArg(psUTF8Prelude), nil
 	case "cmd":
 		// chcp by absolute path for the same reason as the shell itself, and
 		// with its "Active code page: 65001" line suppressed so the operator
@@ -80,12 +80,16 @@ func shellCommandLine(shell string) (string, error) {
 	return "", fmt.Errorf("unsupported shell %q on Windows (use powershell or cmd)", shell)
 }
 
-// interactivePowerShell picks the PowerShell the terminal launches: pwsh 7
-// when it is installed in a place only administrators can write, Windows
-// PowerShell in System32 otherwise. The shell runs as SYSTEM, so this must
-// not be a bare PATH search - the same rule systemExe applies to the helper
-// tools and docs/SECURITY.md states for the agent as a whole.
-func interactivePowerShell() string {
+// trustedPowerShell picks the PowerShell the agent launches: pwsh 7 when it
+// is installed in a place only administrators can write, Windows PowerShell
+// in System32 otherwise. Both callers run it as SYSTEM - the console
+// terminal below and the hidden Windows Update scripts in
+// updates_windows.go - so this must not be a bare PATH search. systemExe,
+// which every hidden command goes through, returns an absolute path
+// unchanged, so a pwsh.exe found on PATH here would be launched verbatim.
+// It is the same rule systemExe applies to the helper tools and
+// docs/SECURITY.md states for the agent as a whole.
+func trustedPowerShell() string {
 	if p := pwshPath(); p != "" {
 		return p
 	}

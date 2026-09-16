@@ -84,6 +84,18 @@ func TestShellCommandLineIgnoresPwshFromAnUntrustedPath(t *testing.T) {
 	if !strings.Contains(strings.ToLower(got), `system32\windowspowershell\v1.0\powershell.exe`) {
 		t.Errorf("fallback is not the absolute Windows PowerShell in System32:\n%s", got)
 	}
+
+	// The same binary drives the hidden Windows Update scripts
+	// (runPowerShellScriptLines), which also run as SYSTEM and whose
+	// absolute path systemExe passes through untouched - that call site kept
+	// a bare LookPath after the terminal was fixed.
+	ps := trustedPowerShell()
+	if strings.Contains(strings.ToLower(ps), strings.ToLower(untrusted)) {
+		t.Errorf("the update scripts would run under the PATH pwsh as SYSTEM: %s", ps)
+	}
+	if !strings.Contains(strings.ToLower(ps), `system32\windowspowershell\v1.0\powershell.exe`) {
+		t.Errorf("trustedPowerShell() = %q, want the absolute Windows PowerShell in System32", ps)
+	}
 }
 
 // pwsh 7 installed where it belongs is still preferred, and so is one an

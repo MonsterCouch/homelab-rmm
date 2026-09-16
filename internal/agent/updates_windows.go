@@ -143,14 +143,16 @@ func runPowerShellScript(ctx context.Context, body string, args ...string) (stdo
 // runPowerShellScriptLines is runPowerShellScript for a long install: every
 // stdout line is handed to onLine as it appears (so PROGRESS lines reach
 // the operator live) and the full stdout is also returned for the RESULT
-// parse.
+// parse. The interpreter is trustedPowerShell (shell_windows.go), not a
+// PATH search: this script runs as SYSTEM, and runHiddenCP hands an absolute
+// path straight through systemExe.
 func runPowerShellScriptLines(ctx context.Context, body string, onLine func(string), args ...string) (stdout, stderr string, err error) {
 	path, cleanup, err := writeTempScript(body)
 	if err != nil {
 		return "", "", err
 	}
 	defer cleanup()
-	return runHiddenLines(ctx, onLine, powershellPath(), powershellArgs(path, args)...)
+	return runHiddenLines(ctx, onLine, trustedPowerShell(), powershellArgs(path, args)...)
 }
 
 // writeTempScript writes a UTF-8-BOM .ps1 (so Windows PowerShell reads
@@ -167,19 +169,6 @@ func writeTempScript(body string) (path string, cleanup func(), err error) {
 		return "", func() {}, err
 	}
 	return path, func() { os.RemoveAll(dir) }, nil
-}
-
-// powershellPath prefers pwsh 7 and falls back to Windows PowerShell, which
-// is always present. Callers pass this through systemExe.
-func powershellPath() string {
-	if p, err := exec.LookPath("pwsh.exe"); err == nil {
-		return p
-	}
-	root := os.Getenv("SystemRoot")
-	if root == "" {
-		root = `C:\Windows`
-	}
-	return filepath.Join(root, `System32\WindowsPowerShell\v1.0\powershell.exe`)
 }
 
 func powershellArgs(script string, args []string) []string {
