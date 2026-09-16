@@ -105,12 +105,100 @@ func TestWinDedupeSoftware(t *testing.T) {
 	}
 }
 
-func TestWinDates(t *testing.T) {
-	if got := winInstallDate("20240115"); got != "2024-01-15" {
-		t.Errorf("winInstallDate = %q", got)
+// The Uninstall hives are writable by every user without elevation, so
+// neither a field's length nor the number of entries may be theirs to choose:
+// the inventory travels over one WebSocket frame the server caps at 16 MiB.
+func TestWinSoftwareIsBounded(t *testing.T) {
+	blob := strings.Repeat("A", 60000)
+	s, keep := winSoftwareFromUninstall(winUninstallEntry{Name: blob, Version: blob, Publisher: blob, InstallDate: "20240115"})
+	if !keep {
+		t.Fatal("a long name is still an entry")
 	}
-	if got := winInstallDate("1/15/2024"); got != "1/15/2024" {
-		t.Errorf("winInstallDate passthrough = %q", got)
+	for name, field := range map[string]string{"name": s.Name, "version": s.Version, "publisher": s.Publisher} {
+		if n := len([]rune(field)); n > winMaxSoftwareField+1 { // +1 for the ellipsis
+			t.Errorf("%s kept %d runes, cap is %d", name, n, winMaxSoftwareField)
+		}
+	}
+	var list []protocol.Software
+	for i := winMaxSoftware + 9; i >= 0; i-- {
+		list = append(list, protocol.Software{Name: fmt.Sprintf("app-%06d", i)})
+	}
+	got := winCapSoftware(list)
+	if len(got) != winMaxSoftware {
+		t.Fatalf("capped list has %d entries, want %d", len(got), winMaxSoftware)
+	}
+	if got[0].Name != "app-000000" {
+		t.Errorf("the cap should keep a sorted prefix, first entry is %q", got[0].Name)
+	}
+	if short := winCapSoftware(list[:3]); len(short) != 3 {
+		t.Errorf("a short list must survive whole, got %d", len(short))
+	}
+}
+
+// Per-user installs live in the loaded HKEY_USERS hives. Entra ID accounts
+// key theirs by an S-1-12-1 SID, which a hard-coded S-1-5-21 prefix skipped.
+func TestWinIsUserHive(t *testing.T) {
+	for _, n := range []string{
+		"S-1-5-21-4285530640-3368155222-4143832586-1001",
+		"S-1-12-1-1234567890-1234567890-1234567890-1234567890",
+	} {
+		if !winIsUserHive(n) {
+			t.Errorf("%s is an interactive user hive", n)
+		}
+	}
+	for _, n := range []string{
+		".DEFAULT", "S-1-5-18", "S-1-5-19", "S-1-5-20",
+		"S-1-5-21-4285530640-3368155222-4143832586-1001_Classes",
+		"S-1-12-1-1234567890-1234567890-1234567890-1234567890_Classes",
+	} {
+		if winIsUserHive(n) {
+			t.Errorf("%s must not be enumerated", n)
+		}
+	}
+}
+
+// Win32_Processor is the physical-core source; gopsutil reports the logical
+// count on Windows, which made cpu_cores equal cpu_threads on every device.
+func TestWinCPUCounts(t *testing.T) {
+	cores, threads := winCPUCounts([]winProcessor{{NumberOfCores: 14, NumberOfLogicalProcessors: 20}})
+	if cores != 14 || threads != 20 {
+		t.Errorf("one socket = %dc/%dt, want 14c/20t", cores, threads)
+	}
+	cores, threads = winCPUCounts([]winProcessor{
+		{NumberOfCores: 8, NumberOfLogicalProcessors: 16},
+		{NumberOfCores: 8, NumberOfLogicalProcessors: 16},
+	})
+	if cores != 16 || threads != 32 {
+		t.Errorf("two sockets = %dc/%dt, want 16c/32t", cores, threads)
+	}
+	if cores, threads = winCPUCounts(nil); cores != 0 || threads != 0 {
+		t.Errorf("no rows = %dc/%dt, want zeros so the caller keeps its own", cores, threads)
+	}
+}
+
+func TestWinDates(t *testing.T) {
+	// `installed` is an ISO date or nothing: the console renders and sorts
+	// it, so an installer's free text must never travel in it.
+	for in, want := range map[string]string{
+		"20240115":     "2024-01-15", // MSI
+		" 20240115 ":   "2024-01-15",
+		"1/15/2024":    "2024-01-15", // en-US short date
+		"15/01/2024":   "2024-01-15", // a first component over 12 is the day
+		"15.01.2024":   "2024-01-15",
+		"2024-01-15":   "2024-01-15",
+		"2024/1/5":     "2024-01-05",
+		"not-a-date":   "",
+		"":             "",
+		"2024":         "",
+		"1/15/24":      "",
+		"20241301":     "", // month 13
+		"20240230":     "", // 30 February
+		"99999999":     "",
+		"soon/ish/yyy": "",
+	} {
+		if got := winInstallDate(in); got != want {
+			t.Errorf("winInstallDate(%q) = %q want %q", in, got, want)
+		}
 	}
 	if got := winCIMDate("20230512000000.000000+000"); got != "2023-05-12" {
 		t.Errorf("winCIMDate = %q", got)
@@ -240,6 +328,21 @@ func TestWinAVAndLicense(t *testing.T) {
 	}
 	if got := winAVState(0x60100); got != "disabled, up to date" {
 		t.Errorf("disabled = %q", got)
+	}
+	// The `antivirus` field is one line and the console shows nothing else:
+	// the product actually protecting the machine leads, and every name says
+	// whether it is running. SecurityCenter2's own order puts a switched-off
+	// Defender first.
+	got := winAntivirusSummary([]winAVProduct{
+		{Name: "Windows Defender", State: 0x060100},
+		{Name: " Bitdefender Antivirus ", State: 0x041000},
+		{Name: "   "},
+	})
+	if want := "Bitdefender Antivirus (active); Windows Defender (disabled)"; got != want {
+		t.Errorf("winAntivirusSummary = %q want %q", got, want)
+	}
+	if got := winAntivirusSummary(nil); got != "" {
+		t.Errorf("no products = %q, want empty", got)
 	}
 	if winLicenseStatus(1) != "licensed" || winLicenseStatus(0) != "unlicensed" || !strings.HasPrefix(winLicenseStatus(42), "unknown") {
 		t.Error("license status mapping wrong")

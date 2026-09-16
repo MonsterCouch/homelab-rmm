@@ -4,6 +4,8 @@ package agent
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -35,6 +37,29 @@ func TestPowershellArgs(t *testing.T) {
 	want := []string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", `C:\Temp\wua.ps1`, "guid1", "guid2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("powershellArgs = %v", got)
+	}
+}
+
+// The logged-in-users fallback exists for builds without the Terminal
+// Services stack - and query.exe is part of that same stack, so Home
+// editions ship none. Launching it by name there only produces "is not
+// recognized" while the real WTS error goes unreported, so the tool is
+// probed in System32 first and PATH is never consulted.
+func TestQueryUserExe(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("SystemRoot", dir)
+	if got := queryUserExe(); got != "" {
+		t.Fatalf("query.exe is absent but resolved to %q", got)
+	}
+	want := filepath.Join(dir, "System32", "query.exe")
+	if err := os.MkdirAll(filepath.Dir(want), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(want, []byte("MZ"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := queryUserExe(); got != want {
+		t.Fatalf("queryUserExe = %q want %q", got, want)
 	}
 }
 

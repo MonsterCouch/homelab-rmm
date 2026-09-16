@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
+	"github.com/shirou/gopsutil/v4/cpu"
 	"github.com/shirou/gopsutil/v4/host"
 	"github.com/yusufpapurcu/wmi"
 	"golang.org/x/sys/windows"
@@ -27,6 +29,7 @@ const (
 	regLogonUI        = `SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI`
 	regUninstall      = `SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`
 	regUninstall32    = `SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall`
+	regTimeZone       = `SYSTEM\CurrentControlSet\Control\TimeZoneInformation`
 )
 
 // ---- registry helpers ----
@@ -229,6 +232,28 @@ func platformInventory(inv *protocol.Inventory) {
 		consoleUser = winCleanUser(c.UserName)
 	}
 
+	// Win32_Processor is the only source of the physical core count: gopsutil
+	// fills cpu.Info().Cores from the package affinity mask on Windows, which
+	// is the logical count, so the shared collector had cpu_cores == cpu_threads
+	// on every device. The rows are per socket and both counts are summed.
+	cores, threads := 0, 0
+	if rows, err := wmiQuery[winProcessor]("", "SELECT NumberOfCores, NumberOfLogicalProcessors FROM Win32_Processor", wmiTimeout); err != nil {
+		slog.Warn("inventory: Win32_Processor", "err", err)
+	} else {
+		cores, threads = winCPUCounts(rows)
+	}
+	if cores == 0 {
+		// WMI is unavailable, but GetLogicalProcessorInformationEx still
+		// knows how many cores the packages hold.
+		cores, _ = cpu.Counts(false)
+	}
+	if cores > 0 {
+		inv.CPUCores = cores
+	}
+	if threads > 0 {
+		inv.CPUThreads = threads
+	}
+
 	if rows, err := wmiQuery[win32BIOS]("", "SELECT SerialNumber, SMBIOSBIOSVersion, Manufacturer, ReleaseDate FROM Win32_BIOS", wmiTimeout); err != nil {
 		slog.Warn("inventory: Win32_BIOS", "err", err)
 	} else if len(rows) > 0 {
@@ -269,16 +294,17 @@ func platformInventory(inv *protocol.Inventory) {
 	if rows, err := wmiQuery[antiVirusProduct](`root\SecurityCenter2`, "SELECT displayName, productState FROM AntiVirusProduct", wmiTimeout); err != nil {
 		slog.Debug("inventory: AntiVirusProduct", "err", err)
 	} else {
-		var names, states []string
+		var products []winAVProduct
+		var states []string
 		for _, av := range rows {
 			name := strings.TrimSpace(av.DisplayName)
 			if name == "" {
 				continue
 			}
-			names = append(names, name)
+			products = append(products, winAVProduct{Name: name, State: av.ProductState})
 			states = append(states, name+": "+winAVState(av.ProductState))
 		}
-		inv.AntivirusName = strings.Join(names, ", ")
+		inv.AntivirusName = winAntivirusSummary(products)
 		if len(states) > 0 {
 			inv.Extra["antivirus_state"] = strings.Join(states, "; ")
 		}
@@ -316,6 +342,12 @@ func platformInventory(inv *protocol.Inventory) {
 	if ts, ok := regUint(registry.LOCAL_MACHINE, regCurrentVersion, "InstallDate"); ok && ts > 0 {
 		inv.Extra["windows_install_date"] = time.Unix(int64(ts), 0).UTC().Format("2006-01-02")
 	}
+	// inv.Timezone carries the abbreviation and the current offset; the zone
+	// id ("Eastern Standard Time") is what survives a DST change, so a fleet
+	// can be grouped or scheduled by it.
+	if v := regString(registry.LOCAL_MACHINE, regTimeZone, "TimeZoneKeyName"); v != "" {
+		inv.Extra["timezone_id"] = v
+	}
 
 	// Activation is one WQL query with a WHERE clause; it costs a second or
 	// two, which an hourly inventory can afford.
@@ -330,7 +362,10 @@ func platformInventory(inv *protocol.Inventory) {
 // WOW6432Node machine views, the service's own HKCU (nearly empty for
 // SYSTEM, but the contract asks for it) and every loaded user hive under
 // HKEY_USERS, which is where per-user installers such as VS Code and Teams
-// register themselves.
+// register themselves. Those user hives are writable by their owner without
+// any elevation, so the result is capped (winCapSoftware) and every field is
+// clipped: what a standard user writes must not decide how big the frame the
+// agent sends is.
 func installedSoftware() []protocol.Software {
 	type hive struct {
 		root registry.Key
@@ -345,7 +380,7 @@ func installedSoftware() []protocol.Software {
 		names, _ := users.ReadSubKeyNames(-1)
 		users.Close()
 		for _, n := range names {
-			if strings.HasPrefix(n, "S-1-5-21-") && !strings.HasSuffix(n, "_Classes") {
+			if winIsUserHive(n) {
 				hives = append(hives, hive{registry.USERS, n + `\` + regUninstall}, hive{registry.USERS, n + `\` + regUninstall32})
 			}
 		}
@@ -354,7 +389,7 @@ func installedSoftware() []protocol.Software {
 	for _, h := range hives {
 		all = append(all, readUninstallHive(h.root, h.path)...)
 	}
-	return winDedupeSoftware(all)
+	return winCapSoftware(winDedupeSoftware(all))
 }
 
 func readUninstallHive(root registry.Key, path string) []protocol.Software {
@@ -369,6 +404,12 @@ func readUninstallHive(root registry.Key, path string) []protocol.Software {
 	}
 	var out []protocol.Software
 	for _, n := range names {
+		// One hive alone cannot fill the list: everything past the cap would
+		// be thrown away anyway, and reading it is work an unprivileged user
+		// could ask for at will.
+		if len(out) >= winMaxSoftware {
+			break
+		}
 		sk, err := registry.OpenKey(k, n, registry.QUERY_VALUE|registry.WOW64_64KEY)
 		if err != nil {
 			continue
@@ -459,8 +500,7 @@ func loggedInUsers() []string {
 	hostname, _ := os.Hostname()
 	sessions, err := wtsSessions()
 	if err != nil {
-		slog.Debug("logged-in users: WTS enumeration failed, using query user", "err", err)
-		return queryUserFallback()
+		return queryUserFallback(err)
 	}
 	var users []string
 	seen := map[string]bool{}
@@ -480,13 +520,61 @@ func loggedInUsers() []string {
 	return users
 }
 
-func queryUserFallback() []string {
+// queryUserFallback runs "query user" after the WTS API itself failed.
+// query.exe belongs to the same Terminal Services stack, so on the SKUs this
+// fallback exists for it is often not installed at all - Windows 11 Home has
+// no query.exe, quser.exe or qwinsta.exe - and running it by name would only
+// produce a confusing "is not recognized" error. It is therefore only
+// launched when it is really there, and either way wtsErr is logged: an empty
+// user list is otherwise indistinguishable from "nobody is logged in".
+func queryUserFallback(wtsErr error) []string {
+	exe := queryUserExe()
+	if exe == "" {
+		warnSessions("logged-in users: WTS enumeration failed and query.exe is not installed on this Windows edition", "err", wtsErr)
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	// "query user" exits 1 with "No User exists for *" when nobody is logged
 	// in, so the exit status is not an error signal here.
-	out, _, _ := runHidden(ctx, "query.exe", "user")
-	return winParseQueryUser(out)
+	out, _, err := runHidden(ctx, exe, "user")
+	users := winParseQueryUser(out)
+	if len(users) == 0 {
+		warnSessions("logged-in users: WTS enumeration failed and query user listed nobody", "wts_err", wtsErr, "query_err", err)
+	}
+	return users
+}
+
+// loggedInUsers runs with every metrics sample and a machine whose WTS stack
+// is broken stays broken, so the fallback's warning is rate-limited to one an
+// hour and the repeats go to Debug.
+const sessionWarnEvery = time.Hour
+
+var lastSessionWarn atomic.Int64
+
+func warnSessions(msg string, args ...any) {
+	now := time.Now().Unix()
+	if last := lastSessionWarn.Load(); last != 0 && now-last < int64(sessionWarnEvery/time.Second) {
+		slog.Debug(msg, args...)
+		return
+	}
+	lastSessionWarn.Store(now)
+	slog.Warn(msg, args...)
+}
+
+// queryUserExe is the full path of query.exe, or "" when this Windows
+// edition does not ship it. Only System32 counts: the agent runs as SYSTEM
+// and must not pick up a query.exe someone dropped on PATH.
+func queryUserExe() string {
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		root = `C:\Windows`
+	}
+	p := filepath.Join(root, "System32", "query.exe")
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
 }
 
 // ---- pending reboot ----
