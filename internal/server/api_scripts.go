@@ -151,9 +151,18 @@ func (s *Server) handleRunScriptOnAgent(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.audit(r, "script.run", id, map[string]any{"script_id": in.ScriptID, "language": in.Language})
+	// startRuns encodes each agent's outcome in the map value, and only a real
+	// run id may leave here as one: a caller that follows the documented
+	// POST .../run -> {run_id} contract would otherwise poll a run that was
+	// never created. There is one target, so every other outcome is this
+	// request's own error.
 	runID := out[id]
-	if strings.HasPrefix(runID, "error: ") {
-		writeErr(w, 409, strings.TrimPrefix(runID, "error: "))
+	if msg, skipped := strings.CutPrefix(runID, "skipped: "); skipped {
+		writeErr(w, 409, "run skipped: "+msg)
+		return
+	}
+	if msg, failed := strings.CutPrefix(runID, "error: "); failed {
+		writeErr(w, 409, msg)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"run_id": runID})
