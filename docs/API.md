@@ -89,12 +89,18 @@ See `routes()` in `internal/server/api.go`. Highlights:
   applied only when both dimensions are 1..1000 on Windows (1..65535 on Linux); anything else —
   including the `0x0` a viewer sends while its container is hidden — is refused by the device and
   the session keeps the size it had. The socket is capped at 1 MiB per frame (a bigger one ends
-  it with `1009`), and the server pings every 30 s and ends the session with `1001` when the
+  it with `1009`), and the server pings every 25 s and ends the session with `1001` when the
   viewer has not answered for 90 s, so a browser that vanished without closing the connection
-  cannot leave a shell running on the device. On Windows the shell is started on code page 65001
+  cannot leave a shell running on the device. Answering the ping is the whole of the contract:
+  every browser does so automatically, and a client must **not** send `{"t":"in","data":""}` as
+  a keepalive — that types into the shell. On Windows the shell is started on code page 65001
   and with `TERM=xterm-256color` / `COLORTERM=truecolor`, so its output is byte-accurate UTF-8
   exactly as on Linux (where the shell gets `LANG=C.UTF-8`).
-- Remote desktop: WebSocket `/ws/desktop/{id}?quality=60` — see `docs/DESKTOP-PROTOCOL.md`.
+- Remote desktop: WebSocket `/ws/desktop/{id}?quality=60` — see `docs/DESKTOP-PROTOCOL.md`. The
+  viewer socket is bounded exactly like the terminal's: 1 MiB per frame, a ping every 25 s, and
+  the session ends when the viewer has not answered for 90 s. The device's helper is then closed
+  with `1001` and the reason `the viewer stopped answering`, so a phone that slept mid-session
+  does not leave the operator's screen being captured for nobody.
 - Groups `/api/groups`, enrolment `/api/enroll` (POST returns `{token, windows, linux}` install
   commands; GET returns `{tokens, public_url, fingerprint}`). `GET /install/{token}?os=windows|linux&arch=`
   renders the install script and is unauthenticated, but only for a token that could still enrol

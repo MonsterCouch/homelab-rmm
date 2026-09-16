@@ -25,24 +25,65 @@ import (
 //   {"t":"in","data":"ls\r"}  {"t":"resize","cols":..,"rows":..}
 // and receives {"t":"out","data":...}, {"t":"opened","session":..}, {"t":"closed"}.
 
-// A terminal socket is bounded the way its two siblings are - the agent
-// socket (hub.go) and the desktop viewer both cap a frame and drop a peer
-// that stops answering. An interactive SYSTEM shell is the most valuable
-// thing this server hands out, so one operator must not be able to make it
-// buffer arbitrary input frames, and a viewer that vanished without a TCP
-// FIN (a closed lid, a dropped VPN, a killed VM) must not leave a shell
-// running on the device for ever. Liveness tracks PONGS, not traffic, for
-// the same reason Hub.keepalive does.
+// Both browser-side relay sockets - the terminal at /ws/shell and the
+// desktop viewer at /ws/desktop - are bounded the way their siblings are:
+// the agent socket (Hub.keepalive) and the desktop helper
+// (internal/agent/desktop) each cap a frame and drop a peer that stops
+// answering. An interactive SYSTEM shell is the most valuable thing this
+// server hands out, so one operator must not be able to make it buffer
+// arbitrary input frames; and a viewer that vanished without a TCP FIN - a
+// closed lid, a dropped VPN, a killed VM, a phone that slept behind a NAT
+// which then forgot the flow - must not leave a shell running, or a screen
+// being captured, on the device for ever. Liveness tracks PONGS, not
+// traffic, for the same reason Hub.keepalive does: a peer that floods
+// frames but never answers a ping is exactly the one to drop.
+//
+// The period is 25 s rather than the agent socket's 30 s because this peer
+// is a phone. Mobile NAT idle timeouts start at about 30 s, and 25 s is
+// what the SSE stream at /api/events already uses for its comment ping, so
+// one radio wake serves both.
 //
 // These are variables rather than constants so the test can compress the
 // clock; nothing else writes them.
 var (
 	// shellFrameLimit is what the desktop viewer uses: a keystroke or a
 	// paste is small.
-	shellFrameLimit  int64 = 1 << 20
-	shellPingPeriod        = 30 * time.Second
-	shellIdleTimeout       = 90 * time.Second
+	shellFrameLimit   int64 = 1 << 20
+	viewerPingPeriod        = 25 * time.Second
+	viewerIdleTimeout       = 90 * time.Second
 )
+
+// keepViewerAlive bounds one browser-side socket: the peer is pinged every
+// viewerPingPeriod and must answer within viewerIdleTimeout, or its next read
+// fails with a timeout. The returned func stops the pinger; defer it after the
+// socket's own Close so the ticker goes first, and register the handlers here
+// before anything starts reading the socket.
+//
+// WriteControl is documented as safe alongside the other write methods, so
+// this deliberately does not take the wsWriter's lock: a ping must not queue
+// behind a tile write parked on its 15 s deadline.
+func keepViewerAlive(c *websocket.Conn) func() {
+	c.SetReadDeadline(time.Now().Add(viewerIdleTimeout))
+	c.SetPongHandler(func(string) error {
+		return c.SetReadDeadline(time.Now().Add(viewerIdleTimeout))
+	})
+	stop := make(chan struct{})
+	go func() {
+		t := time.NewTicker(viewerPingPeriod)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				if err := c.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+					return // the socket is gone; the reader reports it
+				}
+			}
+		}
+	}()
+	return func() { close(stop) }
+}
 
 // sameOrigin rejects cross-site WebSocket hijacking: browsers always send
 // Origin on WebSocket upgrades, and a legitimate viewer's origin host is the
@@ -75,34 +116,13 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ws.Close()
 	ws.SetReadLimit(shellFrameLimit)
-	ws.SetReadDeadline(time.Now().Add(shellIdleTimeout))
-	ws.SetPongHandler(func(string) error {
-		return ws.SetReadDeadline(time.Now().Add(shellIdleTimeout))
-	})
-	sw := &wsWriter{c: ws}
-	send := func(v any) { sw.json(v) }
-
 	// Ping the viewer so a browser that went away without closing the socket
 	// is noticed within the idle timeout instead of holding the shell open.
-	// WriteControl is documented as safe alongside the other write methods,
-	// so this does not take the writer's lock. Registered after
-	// defer ws.Close(), so the ticker stops before the socket goes.
-	stopPings := make(chan struct{})
-	defer close(stopPings)
-	go func() {
-		t := time.NewTicker(shellPingPeriod)
-		defer t.Stop()
-		for {
-			select {
-			case <-stopPings:
-				return
-			case <-t.C:
-				if err := ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
-					return
-				}
-			}
-		}
-	}()
+	// Registered after defer ws.Close(), so the ticker stops before the
+	// socket goes.
+	defer keepViewerAlive(ws)()
+	sw := &wsWriter{c: ws}
+	send := func(v any) { sw.json(v) }
 
 	// Same as the desktop viewer: the terminal used to end by dropping the
 	// socket, so every ending - a closed tab, an agent that went away, a shell
@@ -356,6 +376,13 @@ func closeCodeFor(err error, who string) (int, string) {
 			return ce.Code, ce.Text // a real close: forward it verbatim
 		}
 	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		// The read deadline keepViewerAlive keeps pushing out. This peer did
+		// not disconnect - it stopped answering pings - and that is the only
+		// fact that explains a session ending while nothing looked wrong.
+		return websocket.CloseGoingAway, who + " stopped answering"
+	}
 	return websocket.CloseInternalServerErr, who + " disconnected without closing the session"
 }
 
@@ -421,6 +448,12 @@ func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer viewer.Close()
 	viewer.SetReadLimit(1 << 20)
+	// The same bound as the terminal. Without it a phone that slept mid
+	// session left this handler bridging into a socket nobody would ever
+	// read again, with the helper still capturing the screen on the device.
+	// Registered before pumpFrames, so the pong handler that refreshes the
+	// read deadline is installed before anything reads this socket.
+	defer keepViewerAlive(viewer)()
 	vw := &wsWriter{c: viewer}
 	// Read the viewer from the moment it is upgraded. The waits below need to
 	// know when the viewer goes away, and r.Context() cannot tell them: after
