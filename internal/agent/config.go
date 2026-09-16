@@ -10,8 +10,16 @@ import (
 	"strings"
 )
 
-// Config is persisted at ConfigPath() with mode 0600. The key is issued at
-// enrolment and never shown again; losing it means re-enrolling.
+// Config is persisted at ConfigPath() with mode 0600 - on Windows the mode is
+// ignored entirely and the protected DACL EnsureConfigDir puts on the
+// directory is what keeps other accounts out. The key is issued at enrolment
+// and never shown again; losing it means re-enrolling.
+//
+// EnrollToken stays in the file after enrolment on purpose: it is how a device
+// whose key the server revoked re-enrols without anyone visiting it (the 401
+// path in Agent.session). That makes agent.json a fleet credential and not
+// only a device one, for as long as the token has uses and has not expired -
+// "The token stays on the device" in docs/SECURITY.md says what that costs.
 type Config struct {
 	ServerURL   string `json:"server_url"`
 	AgentID     string `json:"agent_id,omitempty"`
@@ -161,6 +169,32 @@ func (c *Config) Save() error {
 		return err
 	}
 	return os.Rename(tmp, ConfigPath())
+}
+
+// Plaintext reports whether the agent will reach the server over an
+// unencrypted socket. It asks WSURL rather than re-testing the scheme so the
+// two cannot drift: whatever WSURL turns ServerURL into is what the agent
+// actually dials, and a ws:// dial never consults TLSConfig - not the system
+// trust store, and not the pinned fingerprint either.
+func (c *Config) Plaintext() bool { return strings.HasPrefix(c.WSURL(""), "ws://") }
+
+// PlaintextWarning is the warning `install` prints and the agent logs at every
+// start when the configured server URL gives the connection no protection at
+// all, or "" when it does. docs/SECURITY.md promises the operator that agents
+// pin the server certificate; a server_url of http:// silently opts out of
+// that, and nothing said so before.
+func (c *Config) PlaintextWarning() string {
+	if !c.Plaintext() {
+		return ""
+	}
+	msg := "WARNING: server_url is " + c.ServerURL + ", so this agent talks to the server in\n" +
+		"         clear text: the device key, script bodies, shell traffic and file\n" +
+		"         transfers can be read and rewritten by anyone on the network path.\n" +
+		"         Use an https:// URL unless the server is on this machine."
+	if c.Fingerprint != "" {
+		msg += "\n         The configured fingerprint pins nothing over http://."
+	}
+	return msg
 }
 
 // WSURL converts https://host:port into wss://host:port/<path>.

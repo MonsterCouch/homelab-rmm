@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -112,17 +113,28 @@ const (
 // setupLogging installs the process-wide slog handler and returns the file it
 // also writes to, or "" when only stderr is open.
 func setupLogging(dest logDest) string {
-	var w io.Writer = os.Stderr
-	var opened string
-	if f, path := openLog(dest); f != nil {
-		w, opened = io.MultiWriter(os.Stderr, f), path
+	f, path := openLog(dest)
+	setupHandler(os.Stderr, f)
+	return path
+}
+
+// setupHandler installs the handler over the sinks the caller opened, and is
+// separate from setupLogging because the console is the sink that is not
+// there: a process the Windows Service Control Manager started has no standard
+// handles, so every write to os.Stderr fails for the whole life of the
+// service. svc.LogWriter is what stops that taking the log file down with it -
+// see its comment - and naming both sinks here is what lets a test stand a
+// broken stderr up.
+func setupHandler(stderr io.Writer, file *os.File) {
+	sinks := []io.Writer{stderr}
+	if file != nil {
+		sinks = append(sinks, file)
 	}
 	level := slog.LevelInfo
 	if os.Getenv("RMM_DEBUG") != "" {
 		level = slog.LevelDebug
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})))
-	return opened
+	slog.SetDefault(slog.New(slog.NewTextHandler(svc.LogWriter(sinks...), &slog.HandlerOptions{Level: level})))
 }
 
 // openLog opens the log file for dest. It returns nil when dest has no file
@@ -180,8 +192,13 @@ const (
 )
 
 const (
-	startSettle  = 3 * time.Second  // watch this long before believing a "running"
-	startTimeout = 20 * time.Second // give up waiting for it to reach "running"
+	startSettle = 3 * time.Second // watch this long before believing a "running"
+	// Give up waiting for it to reach "running" - but only after the service
+	// manager itself has made up its mind. The Windows SCM waits 30 s for a
+	// service to connect to it and only then reports the failure (System event
+	// 7009), so a shorter deadline here returned "it never said stopped
+	// either" for a service the SCM was about to call dead.
+	startTimeout = 45 * time.Second
 	startPoll    = 300 * time.Millisecond
 )
 
@@ -281,6 +298,19 @@ func confirmStarted(logPath string, from int64, status func() (service.Status, e
 	}
 }
 
+// startFailureHint names every place a failed start left a reason, because the
+// operator reading it has nothing else to go on. The agent's own log comes
+// first; the service manager's record is the fallback for a process that died
+// before it could log anything at all, and on Windows the service is
+// registered with SERVICE_ERROR_NORMAL precisely so that record exists.
+func startFailureHint(logPath, goos string) string {
+	hint := "the install did not succeed; check " + logPath
+	if goos == "windows" {
+		return hint + ", and the System event log for Service Control Manager entries about " + agent.ServiceName
+	}
+	return hint + ", and `journalctl -u " + agent.ServiceName + "` (or /var/log/" + agent.ServiceName + ".err without systemd)"
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -301,6 +331,12 @@ func main() {
 		if err != nil {
 			slog.Error(msgConfigLoadFailed, "path", agent.ConfigPath(), "err", err)
 			os.Exit(1)
+		}
+		// Not only at install time: a config edited by hand, or copied from
+		// another device, has to say so on every start of the service.
+		if cfg.Plaintext() {
+			slog.Warn("server URL is plaintext: the device key and everything this agent sends travel unencrypted",
+				"server_url", cfg.ServerURL, "fingerprint_ignored", cfg.Fingerprint != "")
 		}
 		err = svc.Run(spec(), func(ctx context.Context) error { return agent.New(cfg).Run(ctx) })
 		if err != nil {
@@ -329,8 +365,19 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("config written to", agent.ConfigPath())
+		// Warnings, not refusals: a loopback server without TLS and an agent
+		// run out of its own build tree are both normal while developing, and
+		// an install that could not be completed would only be worked around.
+		if w := cfg.PlaintextWarning(); w != "" {
+			fmt.Fprintln(os.Stderr, w)
+		}
 		if *noService {
 			return
+		}
+		if exe, err := os.Executable(); err == nil {
+			if w := svc.ImagePathWarning(exe); w != "" {
+				fmt.Fprintln(os.Stderr, w)
+			}
 		}
 		// Read the log's length before the service touches it, so the
 		// check below only ever reads what this start wrote.
@@ -342,7 +389,7 @@ func main() {
 		}
 		if err := confirmStarted(logPath, from, serviceStatus, startSettle, startTimeout); err != nil {
 			fmt.Fprintln(os.Stderr, "the service was registered but is not running:", err)
-			fmt.Fprintln(os.Stderr, "the install did not succeed; check", logPath)
+			fmt.Fprintln(os.Stderr, startFailureHint(logPath, runtime.GOOS))
 			os.Exit(1)
 		}
 		fmt.Println("service installed and started")

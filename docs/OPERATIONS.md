@@ -23,13 +23,23 @@ when in doubt, `rmm-server` and `rmm-agent` print their usage with no arguments.
 |---|---|---|
 | Executable | `C:\Program Files\HomelabRMM\rmm-agent.exe` | `/opt/homelab-rmm/rmm-agent` |
 | Config directory (`RMM_AGENT_DIR`) | `%ProgramData%\HomelabRMM` | `/etc/homelab-rmm` |
-| Config | `agent.json` (0600): `server_url`, `agent_id`, `key`, `enroll_token`, `fingerprint` | same |
+| Config | `agent.json`: `server_url`, `agent_id`, `key`, `enroll_token`, `fingerprint` | same |
+| Config protection | a protected DACL on the config directory: `NT AUTHORITY\SYSTEM` and `BUILTIN\Administrators` only (see below) | mode `0700` on the directory, `0600` on `agent.json`, owned by root |
 | Log | `agent.log`, rotated to `agent.log.1` at 10 MB | same |
 | Service | `HomelabRMMAgent`, runs as LocalSystem, automatic start, restart on failure after 5 s | `HomelabRMMAgent.service`, runs as root, `Restart=always`, `RestartSec=5` |
 | Script temp files | `%TEMP%\rmm-script-*` (deleted after the run) | `/tmp/rmm-script-*` |
 
 On a Windows box that runs both the server and an agent they share `%ProgramData%\HomelabRMM`;
 the file names do not collide.
+
+**How the agent's files are protected on Windows.** Not by a Unix mode — Go's `0600` is ignored
+there. The agent replaces the DACL of `%ProgramData%\HomelabRMM` at every start with a
+*protected* one (inheritance from `%ProgramData%`, which grants `BUILTIN\Users` read, is
+dropped), granting full control to `NT AUTHORITY\SYSTEM` and `BUILTIN\Administrators` and
+inheritable by everything inside, so `agent.json` and `agent.log` are covered too. Check it with
+`icacls C:\ProgramData\HomelabRMM`, not with a mode: the console's own file browser reports a
+meaningless POSIX `-rw-rw-rw-` for Windows paths. A failure to apply it is logged as
+`cannot restrict permissions on the agent directory`.
 
 ## 2. Service control
 
@@ -45,6 +55,18 @@ rmm-agent  uninstall | start | stop | restart | status
 by opening the data directory, database and certificate, and starts the service with the flags
 you gave it. Change flags by running `install` again with the new set. Native tools work too:
 `sc query HomelabRMMServer`, `systemctl status HomelabRMMServer`, `journalctl -u HomelabRMMAgent -f`.
+
+**Where the binary sits is part of the install.** `install` registers the image it was run from
+and copies nothing, and the service manager starts that exact file as LocalSystem (Windows) or
+root (Linux) at every boot. It therefore has to live where only administrators can write —
+`C:\Program Files\HomelabRMM`, `/opt/homelab-rmm` — or whoever can replace it owns the machine.
+The install command the console prints already puts it there; a manual install (copy the binary,
+run `install` by hand) must do it too. `rmm-agent install` inspects the location it is about to
+register — the directory *and* the binary itself, by DACL on Windows and by owner and mode on
+Linux — and prints a warning naming what is unprotected, the accounts that can write it and
+where the binary belongs instead. It warns rather than refuses:
+running the agent out of a build tree is normal while developing. `rmm-server install` does not
+check, and the same rule applies to it.
 
 Running in the foreground for a test: `rmm-server run --data ./tmp --listen :8443`. Every flag
 has an environment twin (`RMM_LISTEN`, `RMM_DATA_DIR`, `RMM_PUBLIC_URL`, `RMM_CERT_FILE`,
@@ -111,8 +133,20 @@ directly and can run while the service is up (SQLite WAL with a 5 s busy timeout
   connects/disconnects, enrolments, alerts opened and tasks run are logged at info. Two `WARN`
   lines are worth alerting on: `agent record re-keyed by enrolment` (a device took over an
   existing, offline device record — see the audit note below) and `first-run setup refused`.
-- **Agent**: `agent.log`. `connected server=… agent_id=…` means all is well; `session ended
-  err=… retry_in=…` shows why it is reconnecting.
+- **Agent**: `agent.log` in the config directory, on Windows as on Linux. `connected server=…
+  agent_id=…` means all is well; `session ended err=… retry_in=…` shows why it is reconnecting.
+  Two `WARN` lines matter: `agent key rejected, re-enrolling with stored token` (the server no
+  longer knows this device's key — pair it with the server's `agent record re-keyed by
+  enrolment`) and `server URL is plaintext` (the connection to the server is not encrypted; see
+  `--insecure` below). `RMM_DEBUG=1` in the service's environment adds debug lines.
+  On Windows the agent runs under the Service Control Manager, which gives the process **no
+  standard handles at all** — stderr goes nowhere, so `agent.log` is the only copy. When the
+  service dies before it can write anything, the SCM's own record is the fallback: the service
+  is registered with `ERROR_CONTROL = NORMAL`, so a failed start is in the **System** event log
+  as a Service Control Manager event 7000/7009 naming `HomelabRMMAgent` (`sc qc HomelabRMMAgent`
+  shows the setting). On Linux the same lines also reach the journal
+  (`journalctl -u HomelabRMMAgent`), and `/var/log/HomelabRMMAgent.err` on a host without
+  systemd.
 - **In the console**: *Settings → System* (`/api/system`) shows version, public URL,
   fingerprint, data directory, database size and connected agents; *Audit* lists every action
   with user and IP.
@@ -201,6 +235,17 @@ box, and with a private CA only after its root is installed on every device (Win
 `update-ca-trust`). Alternatively pass the proxy certificate's fingerprint to `rmm-agent install
 --fingerprint` by hand, remembering that it changes at every renewal (Let's Encrypt: every 60–90
 days), which would strand the agents. Pinning only makes sense for a long-lived certificate.
+
+**`--insecure` with no proxy in front is plain HTTP, all the way to the agent.** The one-liner a
+server started that way prints carries an `http://` URL, and an agent configured with one dials
+`ws://`: no TLS, no certificate check, no pin — a `fingerprint` in `agent.json` is not consulted
+at all. Everything then travels in clear text, starting with the device key in the
+`Authorization` header and including script bodies, shell traffic and file transfers. `rmm-agent
+install` prints a warning when `--server` is an `http://` URL and the agent logs
+`server URL is plaintext` at every start; neither refuses, because a loopback server
+(`http://127.0.0.1:…`, a development rig) is a legitimate use of it. Anything reachable over a
+network wants `https://`, whether from the server's own certificate or from a proxy in front
+of it.
 
 ## 6. Custom certificates
 

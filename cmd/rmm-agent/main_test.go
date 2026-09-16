@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -202,5 +204,91 @@ func TestConfirmStartedFailsWhenSystemdSaysFailed(t *testing.T) {
 	}, 20*time.Millisecond, time.Second)
 	if err == nil {
 		t.Fatal("a failed unit passed the install check")
+	}
+}
+
+// ---- the log the service actually writes ----
+
+// brokenStderr is os.Stderr in a process the Windows Service Control Manager
+// started: GetStdHandle hands back 0 and every write fails.
+type brokenStderr struct{ writes int }
+
+func (b *brokenStderr) Write(p []byte) (int, error) {
+	b.writes++
+	return 0, errors.New("write /dev/stderr: The handle is invalid.")
+}
+
+// TestLoggingReachesTheFileOverABrokenStderr pins svc-01: the handler was
+// io.MultiWriter(os.Stderr, f), which returns on the first writer's error and
+// never reaches the file, and slog throws that error away - so agent.log was
+// created and then left at 0 bytes on every Windows service install, taking
+// every diagnostic the agent has with it.
+func TestLoggingReachesTheFileOverABrokenStderr(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent.log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	stderr := &brokenStderr{}
+	setupHandler(stderr, f)
+	// The service never closes its log; this test must, or Windows will not
+	// let the temporary directory go.
+	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil))) })
+
+	slog.Info("connected", "server", "https://rmm.lan:8443", "agent_id", "5f022bf5de64ee0d")
+	slog.Warn("agent key rejected, re-enrolling with stored token")
+	f.Close()
+
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"msg=connected", "re-enrolling with stored token"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("agent.log is missing %q; it has:\n%s", want, b)
+		}
+	}
+	if stderr.writes == 0 {
+		t.Error("stderr was dropped from the handler even before it failed")
+	}
+}
+
+func TestLoggingStillWorksWithNoFileAtAll(t *testing.T) {
+	// openLog returns nil when nothing writable was found; the process still
+	// runs, and logging must not panic.
+	setupHandler(io.Discard, nil)
+	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil))) })
+	slog.Info("still here")
+}
+
+// TestStartTimeoutOutlastsTheServiceControlManager: the Windows SCM waits 30 s
+// for a service to connect to it before it calls the start a failure, so a
+// deadline shorter than that returns "it never said stopped either" for a
+// service the SCM is about to declare dead.
+func TestStartTimeoutOutlastsTheServiceControlManager(t *testing.T) {
+	const scmStartTimeout = 30 * time.Second
+	if startTimeout <= scmStartTimeout {
+		t.Fatalf("startTimeout = %s, want more than the SCM's %s", startTimeout, scmStartTimeout)
+	}
+	if startSettle >= startTimeout {
+		t.Fatalf("startSettle = %s does not fit inside startTimeout = %s", startSettle, startTimeout)
+	}
+}
+
+// The remediation line is the last thing the operator reads, so it has to name
+// every place the reason could be - the agent's log, and the service manager's
+// own record of a process that died before it could log anything.
+func TestStartFailureHintNamesWhereToLook(t *testing.T) {
+	win := startFailureHint(`C:\ProgramData\HomelabRMM\agent.log`, "windows")
+	if !strings.Contains(win, `C:\ProgramData\HomelabRMM\agent.log`) {
+		t.Errorf("the Windows hint does not name the log: %q", win)
+	}
+	if !strings.Contains(win, "event log") || !strings.Contains(win, agent.ServiceName) {
+		t.Errorf("the Windows hint does not name the event log: %q", win)
+	}
+	unix := startFailureHint("/etc/homelab-rmm/agent.log", "linux")
+	if !strings.Contains(unix, "/etc/homelab-rmm/agent.log") || !strings.Contains(unix, "journalctl") {
+		t.Errorf("the Linux hint does not name the log and the journal: %q", unix)
 	}
 }

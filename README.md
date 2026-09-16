@@ -216,11 +216,19 @@ worth knowing before you choose the token's *Uses* and expiry.
   `agent.enrolled` / `agent.rekeyed`.
 
 **Manual install** (no download step): copy `agents/rmm-agent-<os>-<arch>[.exe]` from the
-release archive to the device and run, elevated:
+release archive to the device — into a directory **only administrators can write**,
+`C:\Program Files\HomelabRMM` or `/opt/homelab-rmm`, which is where the rendered installer puts
+it — and run, elevated, from there:
 
 ```
 rmm-agent install --server https://rmm.lan:8443 --token <token> --fingerprint <sha256 hex>
 ```
+
+`install` registers the image path it was run from and copies nothing, and the service manager
+launches that exact file as LocalSystem (Windows) or root (Linux) at every boot — so a binary
+left in `Downloads`, on the Desktop or in a build tree hands SYSTEM to anyone who can replace
+it. `install` inspects the directory and the binary itself and warns, naming the accounts that
+can write them, but it does not refuse.
 
 The fingerprint is shown on the Enrol page and printed in `server.log` at startup. Omit
 `--fingerprint` only when the server certificate is signed by a CA the device already trusts.
