@@ -12,9 +12,9 @@ self-signed setup is safe.
 
 - **Monitoring** — CPU, memory, disk, network, load and process count every 30 s (configurable),
   charted per device with 30 days of history; monitored services with state alerts.
-- **Inventory** — OS and kernel, hardware (CPU, memory, manufacturer/model/serial, BIOS), disks,
-  network interfaces with MACs, installed software, GPUs, logged-in users, pending reboot,
-  antivirus, public IP.
+- **Inventory** — OS and kernel, hardware (CPU cores/threads, memory, manufacturer/model/serial,
+  BIOS), disks, network interfaces with MACs, installed software, GPUs, logged-in users, pending
+  reboot, antivirus, timezone.
 - **Alerting with email** — rules for CPU, memory, disk, offline, service state, reboot required,
   script and patch failures and event-log patterns; sustained thresholds, auto-resolve,
   acknowledge, maintenance mode per device, SMTP notifications (STARTTLS, implicit TLS or plain).

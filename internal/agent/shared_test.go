@@ -155,4 +155,31 @@ func TestCollectMetricsAndInventory(t *testing.T) {
 	if inv.Hostname == "" || inv.CPUThreads == 0 || inv.MemTotal == 0 {
 		t.Fatalf("inventory incomplete: host=%q threads=%d mem=%d", inv.Hostname, inv.CPUThreads, inv.MemTotal)
 	}
+	// A package never holds more physical cores than logical processors.
+	if inv.CPUCores <= 0 || inv.CPUCores > inv.CPUThreads {
+		t.Errorf("cpu counts are impossible: %dc/%dt", inv.CPUCores, inv.CPUThreads)
+	}
+	// The timezone must place the device, so it always carries the offset.
+	if !strings.Contains(inv.Timezone, "UTC") {
+		t.Errorf("timezone %q has no UTC offset", inv.Timezone)
+	}
+}
+
+func TestTimezoneLabel(t *testing.T) {
+	cases := map[string]struct {
+		name   string
+		offset int
+		want   string
+	}{
+		"dst abbreviation": {"EDT", -4 * 3600, "EDT (UTC-04:00)"},
+		"half hour":        {"IST", 5*3600 + 30*60, "IST (UTC+05:30)"},
+		"utc":              {"UTC", 0, "UTC+00:00"},
+		"numeric zone":     {"+0545", 5*3600 + 45*60, "UTC+05:45"},
+		"unnamed zone":     {"", -30 * 60, "UTC-00:30"},
+	}
+	for label, c := range cases {
+		if got := timezoneLabel(c.name, c.offset); got != c.want {
+			t.Errorf("%s: timezoneLabel(%q, %d) = %q want %q", label, c.name, c.offset, got, c.want)
+		}
+	}
 }

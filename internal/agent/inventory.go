@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"fmt"
 	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/cpu"
@@ -75,9 +77,7 @@ func collectInventory() (*protocol.Inventory, error) {
 			inv.Network = append(inv.Network, ni)
 		}
 	}
-	if tz, _ := time.Now().Zone(); tz != "" {
-		inv.Timezone = tz
-	}
+	inv.Timezone = timezoneLabel(time.Now().Zone())
 	inv.LoggedInUsers = loggedInUsers()
 	inv.PendingReboot = pendingReboot()
 	platformInventory(inv)
@@ -92,6 +92,26 @@ func collectInventory() (*protocol.Inventory, error) {
 		inv.Software = []protocol.Software{}
 	}
 	return inv, nil
+}
+
+// timezoneLabel pairs the seasonal abbreviation with the current UTC offset,
+// "EDT (UTC-04:00)". The abbreviation alone is not enough to place a device:
+// CST is US Central, China Standard and Cuba Standard, IST is India, Ireland
+// and Israel, and the same machine reports two different ones over a year.
+// A zone Go has no name for reports itself numerically ("+0545"), and then
+// the offset alone says everything the name would. The platform files add
+// the stable zone id (Windows: TimeZoneKeyName) to Extra.
+func timezoneLabel(name string, offsetSec int) string {
+	sign := "+"
+	if offsetSec < 0 {
+		sign, offsetSec = "-", -offsetSec
+	}
+	offset := fmt.Sprintf("UTC%s%02d:%02d", sign, offsetSec/3600, offsetSec%3600/60)
+	name = strings.TrimSpace(name)
+	if name == "" || name == "UTC" || strings.HasPrefix(name, "+") || strings.HasPrefix(name, "-") {
+		return offset
+	}
+	return name + " (" + offset + ")"
 }
 
 // platformName is a human label such as "Windows 11 Pro" or "Ubuntu 24.04".

@@ -209,6 +209,28 @@ func winParseQueryUser(out string) []string {
 	return users
 }
 
+// ---- cpu ----
+
+// winProcessor is one Win32_Processor row, i.e. one socket. The field names
+// are the WMI property names.
+type winProcessor struct {
+	NumberOfCores             uint32
+	NumberOfLogicalProcessors uint32
+}
+
+// winCPUCounts sums physical cores and logical processors across the sockets
+// Win32_Processor reports. gopsutil cannot be used for the core count on
+// Windows: its cpu.Info().Cores is the number of bits in the package
+// affinity mask, i.e. the logical count, so a 14c/20t machine reports 20c/20t.
+// A count of 0 means WMI had nothing to say and the caller keeps its own value.
+func winCPUCounts(rows []winProcessor) (cores, threads int) {
+	for _, p := range rows {
+		cores += int(p.NumberOfCores)
+		threads += int(p.NumberOfLogicalProcessors)
+	}
+	return cores, threads
+}
+
 // winDomainRole names Win32_ComputerSystem.DomainRole.
 func winDomainRole(role uint16) string {
 	switch role {
@@ -232,10 +254,9 @@ func winDomainRole(role uint16) string {
 // byte says whether real-time protection is on (0x10/0x11) and the low byte
 // whether definitions are current (0x00) or stale (0x10).
 func winAVState(state uint32) string {
-	enabled := (state>>8)&0xff == 0x10 || (state>>8)&0xff == 0x11
 	stale := state&0xff == 0x10
 	s := "disabled"
-	if enabled {
+	if winAVEnabled(state) {
 		s = "enabled"
 	}
 	if stale {
@@ -244,6 +265,45 @@ func winAVState(state uint32) string {
 		s += ", up to date"
 	}
 	return s
+}
+
+// winAVEnabled reports whether productState says real-time protection is on:
+// the middle byte is 0x10 or 0x11 for an enabled product.
+func winAVEnabled(state uint32) bool {
+	switch (state >> 8) & 0xff {
+	case 0x10, 0x11:
+		return true
+	}
+	return false
+}
+
+// winAVProduct is one SecurityCenter2 AntiVirusProduct row.
+type winAVProduct struct {
+	Name  string
+	State uint32
+}
+
+// winAntivirusSummary builds the single `antivirus` line. SecurityCenter2
+// lists every product ever registered, in its own order, so a machine whose
+// Defender has been switched off by a third-party suite would otherwise be
+// reported as "Windows Defender, Bitdefender Antivirus" - the disabled
+// product first and nothing saying which one is actually protecting it.
+// Active products come first and every name carries its state:
+// "Bitdefender Antivirus (active); Windows Defender (disabled)".
+func winAntivirusSummary(products []winAVProduct) string {
+	var active, inactive []string
+	for _, p := range products {
+		name := strings.TrimSpace(p.Name)
+		if name == "" {
+			continue
+		}
+		if winAVEnabled(p.State) {
+			active = append(active, name+" (active)")
+		} else {
+			inactive = append(inactive, name+" (disabled)")
+		}
+	}
+	return strings.Join(append(active, inactive...), "; ")
 }
 
 // winLicenseStatus names SoftwareLicensingProduct.LicenseStatus.
@@ -268,6 +328,47 @@ func winLicenseStatus(status uint32) string {
 }
 
 // ---- installed software ----
+
+// The Uninstall hives are not trusted input: any user can create keys of any
+// size under their own HKCU, and the whole inventory travels over the
+// WebSocket on every refresh (the server drops an agent whose frame exceeds
+// 16 MiB). So the list is bounded in both directions, the way the Linux
+// collector caps itself at maxSoftware entries.
+const (
+	winMaxSoftware      = 5000
+	winMaxSoftwareField = 256
+)
+
+// winIsUserHive reports whether an HKEY_USERS subkey is a loaded interactive
+// user hive worth reading per-user installs from: local and domain accounts
+// (S-1-5-21-...) and Entra ID accounts (S-1-12-1-...). The service accounts
+// (S-1-5-18/19/20), .DEFAULT and the _Classes siblings are not.
+func winIsUserHive(name string) bool {
+	if strings.HasSuffix(name, "_Classes") {
+		return false
+	}
+	return strings.HasPrefix(name, "S-1-5-21-") || strings.HasPrefix(name, "S-1-12-1-")
+}
+
+// winClip trims s and caps it at max runes, marking a cut with an ellipsis.
+func winClip(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if r := []rune(s); len(r) > max {
+		return string(r[:max]) + "…"
+	}
+	return s
+}
+
+// winCapSoftware bounds the entry count. Sorting before the cut keeps the
+// surviving rows the same from one refresh to the next instead of leaving
+// them in registry-enumeration order.
+func winCapSoftware(list []protocol.Software) []protocol.Software {
+	if len(list) <= winMaxSoftware {
+		return list
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	return list[:winMaxSoftware]
+}
 
 // winUninstallEntry is what one Uninstall registry subkey says about itself.
 type winUninstallEntry struct {
@@ -295,9 +396,9 @@ func winSoftwareFromUninstall(e winUninstallEntry) (protocol.Software, bool) {
 		}
 	}
 	return protocol.Software{
-		Name:      name,
-		Version:   strings.TrimSpace(e.Version),
-		Publisher: strings.TrimSpace(e.Publisher),
+		Name:      winClip(name, winMaxSoftwareField),
+		Version:   winClip(e.Version, winMaxSoftwareField),
+		Publisher: winClip(e.Publisher, winMaxSoftwareField),
 		Installed: winInstallDate(e.InstallDate),
 	}, true
 }
@@ -311,16 +412,52 @@ func winLooksLikeKB(name string) bool {
 	return err == nil
 }
 
-// winInstallDate turns the registry's "20240115" into "2024-01-15"; other
-// shapes are passed through trimmed because some installers write free text.
+// winInstallDate normalises the Uninstall key's InstallDate to ISO
+// yyyy-MM-dd. MSI writes "20240115", but any installer may write whatever it
+// likes, so the machine short date ("1/15/2024", "15.01.2024") and an
+// already-ISO value are accepted too. Anything else - free text, a partial
+// date, an impossible one - yields "" rather than travelling in a field the
+// console renders and sorts as a date. A two-digit first component is read
+// as the month (the en-US short date) unless it is over 12 and can only be a
+// day, which is the best that shape allows.
 func winInstallDate(s string) string {
 	s = strings.TrimSpace(s)
 	if len(s) == 8 {
 		if _, err := strconv.Atoi(s); err == nil {
-			return s[:4] + "-" + s[4:6] + "-" + s[6:]
+			return winISODate(s[:4], s[4:6], s[6:])
 		}
 	}
-	return s
+	f := strings.FieldsFunc(s, func(r rune) bool { return r == '/' || r == '-' || r == '.' })
+	if len(f) != 3 {
+		return ""
+	}
+	if len(f[0]) == 4 {
+		return winISODate(f[0], f[1], f[2])
+	}
+	if len(f[2]) != 4 {
+		return ""
+	}
+	month, day := f[0], f[1]
+	if n, err := strconv.Atoi(month); err == nil && n > 12 {
+		month, day = day, month
+	}
+	return winISODate(f[2], month, day)
+}
+
+// winISODate formats year/month/day as yyyy-MM-dd, or "" when they are not a
+// real calendar date.
+func winISODate(year, month, day string) string {
+	if len(month) == 1 {
+		month = "0" + month
+	}
+	if len(day) == 1 {
+		day = "0" + day
+	}
+	iso := year + "-" + month + "-" + day
+	if _, err := time.Parse("2006-01-02", iso); err != nil {
+		return ""
+	}
+	return iso
 }
 
 // winCIMDate turns a CIM_DATETIME ("20230512000000.000000+000") into
