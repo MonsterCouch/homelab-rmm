@@ -1,0 +1,222 @@
+/* ---------------------------------------------------------------------------
+   mobile-pages.css — phone rules for the page-level Android pass (C2, C13,
+   C15, C17).
+
+   Loaded after global.css (every importer sits in the entry graph, and
+   main.tsx imports global.css before App), so equal-specificity rules here
+   win on source order.
+
+   Rules outside a media query are either styling for markup this pass added
+   (.fp-block, .pair*, the phone entries of the device More menu) or the
+   minimum needed so a control that became a real <a> still looks exactly
+   like the <div> it replaced. Everything that changes an existing layout is
+   inside a query. Breakpoint 700px, matching global.css:1890; the
+   touch-target query matches the coarse-pointer block at global.css:882.
+   ------------------------------------------------------------------------- */
+
+/* ---------- C2 · pairing card + readable fingerprint ---------- */
+
+/* The fingerprint is the one string a human has to compare character by
+   character against a phone screen, so it wraps in full instead of hiding 44
+   of its 64 characters behind a title tooltip touch never fires. */
+.fp-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+.fp-block code {
+  display: block;
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  letter-spacing: 0.02em;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
+.pair {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+.pair-qr {
+  /* A QR is read as dark-on-light regardless of the console theme, so the
+     quiet zone is painted here rather than trusting the page background. */
+  background: #fff;
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  flex: 0 0 auto;
+  display: block;
+}
+.pair-body {
+  flex: 1 1 260px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.pair-uri {
+  /* .code-block already wraps; keep the copy button clear of the text. */
+  padding-right: 44px;
+  font-size: 11.5px;
+}
+
+@media (max-width: 700px) {
+  /* A two-column dl squeezes every value into 198px at 390px wide. */
+  .kv {
+    grid-template-columns: 1fr;
+    gap: 2px 0;
+  }
+  .kv dt {
+    margin-top: 8px;
+  }
+  .kv dt:first-child {
+    margin-top: 0;
+  }
+  .pair {
+    gap: 10px;
+  }
+  .pair-qr {
+    /* Centred and as big as the column allows: this is scanned off the
+       screen by a second device. */
+    margin: 0 auto;
+  }
+}
+
+/* ---------- C13 · device tab strip + page head ---------- */
+
+@media (max-width: 700px) {
+  .tabs {
+    scroll-snap-type: x proximity;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    /* An edge fade is the only signal that 7 of the 12 tabs are off-screen. */
+    -webkit-mask-image: linear-gradient(to right, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%);
+    mask-image: linear-gradient(to right, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%);
+  }
+  .tabs::-webkit-scrollbar {
+    display: none;
+  }
+  .tabs a,
+  .tabs button {
+    scroll-snap-align: center;
+  }
+  /* Both are on the Overview tab; here they cost a whole row of a 121px
+     head that repeats on all twelve tabs. */
+  .page-head .dev-os,
+  .page-head .dev-ip {
+    display: none;
+  }
+  /* Run script / Inventory / Wake move into the More menu below. */
+  .page-head .dev-head-btn {
+    display: none;
+  }
+}
+
+/* The phone entries of the device More menu: rendered always, shown only
+   where the inline buttons are hidden. */
+.dropdown .menu > .phone-only {
+  display: none;
+}
+@media (max-width: 700px) {
+  .dropdown .menu > button.phone-only {
+    display: flex;
+  }
+  .dropdown .menu > hr.phone-only {
+    display: block;
+  }
+}
+/* Two of those entries are only valid while the device is online, and .menu
+   button has no disabled state of its own. */
+.dropdown .menu > button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@media (pointer: coarse) {
+  .tabs a,
+  .tabs button {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    padding: 11px 12px;
+  }
+}
+
+/* ---------- C15 · Alerts / Patches status filter ---------- */
+
+@media (max-width: 700px) {
+  /* global.css:1963 gives the group flex:1 1 140px, so four nowrap buttons
+     needing 242px are squeezed into 179px and paint under the next select
+     (.btn-group is overflow-x: visible). Its own full-width line, scrollable,
+     with children that refuse to shrink. */
+  .toolbar > .btn-group {
+    flex: 1 0 100%;
+    justify-content: flex-start;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .toolbar > .btn-group::-webkit-scrollbar {
+    display: none;
+  }
+  .toolbar > .btn-group > .btn {
+    flex: 0 0 auto;
+  }
+}
+
+/* ---------- C17 · dashboard above the fold ---------- */
+
+/* Unconditional: the stat tiles are real links now, and an <a> would
+   otherwise take the accent colour and an underline on hover. */
+a.card.stat.link {
+  color: inherit;
+  text-decoration: none;
+}
+a.card.stat.link:hover {
+  text-decoration: none;
+}
+a.card.stat.link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* Same for the recent-runs rows, which were role="link" divs too. */
+.list > a.list-item,
+.list > a.list-item:hover {
+  color: inherit;
+  text-decoration: none;
+}
+.list > a.list-item:hover {
+  background: var(--bg-hover);
+}
+.list > a.list-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+@media (max-width: 700px) {
+  /* The blanket phone rule collapses every grid to one column, which puts
+     the open-alert count a screen and a half down. Four numbers fit as 2x2. */
+  .grid.cols-4 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+  .stat {
+    padding: 10px 12px;
+  }
+  .stat .value {
+    font-size: 22px;
+  }
+  .stat .label {
+    font-size: 11px;
+    letter-spacing: 0.4px;
+  }
+  .stat .foot {
+    font-size: 11.5px;
+  }
+}

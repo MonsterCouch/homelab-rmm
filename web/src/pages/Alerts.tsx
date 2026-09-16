@@ -13,6 +13,7 @@ import { relTime, titleCase } from '../lib/format';
 import { useAuth } from '../state/auth';
 import { errMsg, useToast } from '../state/toast';
 import { normTargets } from './Tasks';
+import '../styles/mobile-pages.css';
 
 type Status = 'open' | 'acked' | 'resolved' | 'all';
 
