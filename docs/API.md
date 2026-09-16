@@ -67,7 +67,8 @@ See `routes()` in `internal/server/api.go`. Highlights:
   `GET .../fs/download?path=` (binary), `POST .../fs/upload?path=` (raw body),
   `POST .../fs/delete|mkdir {path}`, `POST .../fs/rename {from,to}`,
   `POST .../power {action: reboot|shutdown|lock|logoff, delay_sec, message}`, `POST .../wol`,
-  `POST .../run {script_id | language+body, args, timeout_sec}` → `{run_id}`,
+  `POST .../run {script_id | language+body, args, timeout_sec}` → `{run_id}` (409 when the run
+  cannot start, including a `script_id` whose `os_filter` does not match the device),
   `GET .../patches` → `{patches, last_scan}`, `POST .../patches/scan`,
   `POST .../patches/install {ids | all:true, reboot_if_required}` (202, follow `patches` events),
   `GET .../events` (agent event log).
@@ -80,8 +81,11 @@ See `routes()` in `internal/server/api.go`. Highlights:
   renders the install script and is unauthenticated, but only for a token that could still enrol
   (404 otherwise) and an `arch` of `amd64|arm64|arm|386` (400 otherwise).
 - Scripts `/api/scripts`, `POST /api/scripts/run {script_id|language+body, args, targets|agent_ids}`
-  → `{runs: {agentId: runId|"error: ..."}}`, runs `/api/runs?agent=&limit=`, `/api/runs/{id}`
-  (includes stdout/stderr, live while running), `POST /api/runs/{id}/cancel`.
+  → `{runs: {agentId: runId|"error: ..."|"skipped: ..."}}`, runs `/api/runs?agent=&limit=`,
+  `/api/runs/{id}` (includes stdout/stderr, live while running), `POST /api/runs/{id}/cancel`.
+  A run's `status` is `queued|running|done|failed|timeout|cancelled` — a cancel is not a failure
+  and raises no `script_failed` alert. `exit_code` is the interpreter's, sign-extended on Windows
+  (`exit -1` reads `-1`, not `4294967295`), or `-1` when the run never produced one.
 - Tasks `/api/tasks` (`kind`: script|patch_scan|patch_install|reboot|inventory; `schedule` is a
   5-field cron or `@hourly`/`@daily`; `targets` = `{all, agents[], groups[], tags[], os}`),
   `POST /api/tasks/{id}/run`.

@@ -330,10 +330,37 @@ rows.
   WMI/registry for manufacturer, serial, installed software, antivirus, pending-reboot registry
   keys; `inventory_linux.go`: DMI, `/etc/os-release`, dpkg/rpm/pacman package lists,
   `reboot-required` / `needs-restarting`).
-- `scripts.go` — writes the body to a temp file with the right extension, launches the
-  interpreter (`pwsh` → `powershell.exe`; `cmd.exe /d /c`; `python3`/`python`/`py`; `bash` → `sh`)
-  with parameters as positional arguments, sets `RMM_RUN_ID`, streams lines, enforces timeout and
-  cancel by killing the process group / job.
+- `scripts.go` — writes the body to a private temp directory (0700) with the right extension,
+  launches the interpreter with the parameters as positional arguments, sets `RMM_RUN_ID`, streams
+  lines as they arrive, and enforces timeout and cancel by killing the process **tree**: on Windows
+  `taskkill /T /F /PID` with `os.Process.Kill` as the fallback (`proc_windows.go`), on Linux the
+  process group. Kill-on-close job objects exist only for PTY shell sessions (`shell_windows.go`),
+  not for script runs. The run directory is removed afterwards — with a retry, because Windows can
+  still hold the script file a moment after the interpreter exits — and directories orphaned by a
+  killed agent are swept at start-up. Four details are worth knowing:
+  - **Interpreters.** On Windows every one is an absolute path, never a bare name resolved from
+    PATH (the agent runs as SYSTEM; see `systemExe` in `exec_windows.go`): `pwsh` from its Program
+    Files install, else `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`; `cmd.exe`
+    through `systemExe`; python from `%SystemRoot%\py.exe`, then the
+    `SOFTWARE\Python\PythonCore\*\InstallPath` keys, then the machine PATH. Because the agent runs
+    as LocalSystem it inherits the *machine* PATH only, so a per-user Python — the python.org and
+    Store default — is invisible to it: install Python, or at least its `py.exe` launcher, for all
+    users. `bash` is the exception: it has no fixed location on Windows (Git Bash, WSL) and is
+    still taken from PATH. Elsewhere `pwsh`, `python3`/`python` and `bash` → `sh` come from PATH.
+  - **Encoding.** A `.ps1` is written with a UTF-8 BOM, because Windows PowerShell 5.1 reads a
+    BOM-less script in the ANSI code page and mangles every non-ASCII character in it. Captured
+    output that is not already valid UTF-8 is decoded from the OEM code page (`winDecodeOutput`),
+    and python runs with `PYTHONIOENCODING=utf-8`. A `.cmd` body gets no BOM — cmd.exe would echo
+    it as part of the first line — and cmd reads a batch file in the console code page, so a batch
+    body should stay ASCII; use `powershell` for anything else.
+  - **Arguments are data.** For `cmd` the command line is built by hand with cmd.exe's own quoting
+    rules, and a value containing `"`, `%`, `!` or a newline is refused with an error: cmd re-parses
+    those whatever the quoting, and exec's `\"` escape would let a parameter start a second command
+    as SYSTEM that appears in no script body.
+  - **Limits.** Each stream keeps 1 MiB in the final result and marks the cut with
+    `[output truncated]`; everything is streamed either way, and the server stores whichever of the
+    streamed and the final copy is longer. Windows exit codes are sign-extended, so `exit -1` reads
+    `-1` rather than `4294967295`.
 - `baseline*.go` — the desired-state engine. One goroutine per process: passes never overlap, the
   next pass is scheduled an interval after the previous one *finished*, every check runs under its
   own deadline enforced by the engine (so a check wedged in a syscall cannot stop the device), and

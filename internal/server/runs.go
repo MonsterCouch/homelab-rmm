@@ -301,18 +301,13 @@ func (t *runTracker) launch(id, agentID string, sr protocol.ScriptRun) {
 			t.s.hub.broadcast(hubEvent{Kind: "run", AgentID: agentID, Data: map[string]any{"run_id": id, "stream": c.Stream, "data": c.Data}})
 		case protocol.TypeReply:
 			var res protocol.ScriptResult
-			status := "done"
+			status := "failed"
 			if env.Err != "" {
-				status = "failed"
 				res.Error = env.Err
 				res.ExitCode = -1
 			} else {
 				json.Unmarshal(env.D, &res)
-				if res.TimedOut {
-					status = "timeout"
-				} else if res.ExitCode != 0 || res.Error != "" {
-					status = "failed"
-				}
+				status = runStatus(res)
 			}
 			t.finish(id, agentID, status, res, lr)
 		}
@@ -324,16 +319,39 @@ func (t *runTracker) launch(id, agentID string, sr protocol.ScriptRun) {
 	_ = cancel // the sink detaches itself on the final reply
 }
 
+// agentCancelled is the error the agent reports for a run the operator
+// cancelled (internal/agent/scripts.go). It is not a failure: it must not
+// read as one in /api/runs or in runs_failed_24h, and it must not open a
+// script_failed alert for the operator's own click.
+const agentCancelled = "cancelled"
+
+// runStatus maps an agent's reply to the status the run is recorded with.
+func runStatus(res protocol.ScriptResult) string {
+	switch {
+	case res.TimedOut:
+		return "timeout"
+	case res.Error == agentCancelled:
+		return "cancelled" // the value the queued-run path already uses
+	case res.ExitCode != 0 || res.Error != "":
+		return "failed"
+	}
+	return "done"
+}
+
 func (t *runTracker) finish(id, agentID, status string, res protocol.ScriptResult, lr *liveRun) {
 	t.mu.Lock()
 	delete(t.live, id)
 	t.mu.Unlock()
 	liveOut, liveErr := lr.snapshot()
 	stdout, stderr := res.Stdout, res.Stderr
-	if stdout == "" {
+	// Keep whichever of the two copies holds more. The agent caps the capture
+	// it sends back below the cap on what is buffered while the run streams,
+	// so on a chatty run the streamed copy is the fuller one - and it is all
+	// there is when the reply carried no output at all.
+	if len(liveOut) > len(stdout) {
 		stdout = liveOut
 	}
-	if stderr == "" {
+	if len(liveErr) > len(stderr) {
 		stderr = liveErr
 	}
 	if res.Error != "" {
