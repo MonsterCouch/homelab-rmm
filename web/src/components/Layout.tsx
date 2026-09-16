@@ -3,9 +3,10 @@ import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
 import type { Agent } from '../api/types';
 import { useAsync } from '../hooks/useAsync';
-import { useEventBus, useLiveReload } from '../hooks/useEvents';
+import { useEventBus, useEvents, useLiveReload } from '../hooks/useEvents';
 import { useTheme } from '../hooks/useTheme';
 import { osLabel, relTime } from '../lib/format';
+import { host } from '../lib/host';
 import { useActivity } from '../state/toast';
 import { useAuth } from '../state/auth';
 import { textMatch } from './DataTable';
@@ -33,6 +34,7 @@ import {
   IconUsers,
 } from './Icons';
 import { Button, Dropdown, ErrorBoundary, OnlineDot } from './ui';
+import '../styles/shell.css';
 
 const NAV = [
   { to: '/', label: 'Dashboard', icon: IconDashboard, end: true },
@@ -62,15 +64,66 @@ export function Layout() {
   // Below 700px the rail is an off-canvas drawer; above it the class does nothing.
   const [navOpen, setNavOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  // C16: while the phone search has the keyboard it takes the whole topbar row.
+  const [searchOpen, setSearchOpen] = useState(false);
   useShortcuts(() => setHelpOpen((o) => !o));
 
   // A tap that navigates must also put the drawer away.
   useEffect(() => setNavOpen(false), [loc.pathname]);
 
+  // ---- the Android shell contract (C12, docs/ANDROID.md §3.4/§3.6) ----------
+  // Every line of this is inert in a browser: the bridge answers nothing, the
+  // subscriptions never fire and host.* resolves false, so a plain browser
+  // renders exactly what it rendered before. Only a shell that has said hello
+  // sets data-rmm-shell, which is what hides the drawer (styles/shell.css); if
+  // it never does, the drawer stays and the native bar falls back to loadUrl.
+  const inShell = useShell();
+
+  // A bottom-tab tap arrives as {t:'navigate'} and becomes a client-side
+  // transition, so the SSE stream and any live socket survive it.
+  useEffect(() => host.onNavigate((path) => navigate(path)), [navigate]);
+
+  // System back: the drawer is the only thing this component can swallow it
+  // with. Returning true tells the shell the press was consumed.
+  useEffect(
+    () =>
+      host.onBack(() => {
+        if (!navOpen) return false;
+        setNavOpen(false);
+        return true;
+      }),
+    [navOpen],
+  );
+
+  // The shell mirrors its own theme preference into the page.
+  useEffect(
+    () =>
+      host.onTheme((value) => {
+        if (value !== theme) toggleTheme();
+      }),
+    [theme, toggleTheme],
+  );
+
+  // Connection test row 3 (§6): the console reports its own SSE hello. The
+  // provider dispatches a synthetic hello on every (re)connect, so this is the
+  // existing stream, not a new one.
+  useEvents(['hello'], () => {
+    void host.sse(true);
+  });
+
   // Open-alert badge: cheap dashboard call, refreshed on alert events.
   const dash = useAsync(() => api.dashboard(), []);
   useLiveReload(['alert', 'hello'], dash.reload, { debounceMs: 800 });
   const openAlerts = dash.data?.open_alerts ?? 0;
+  const criticalAlerts = dash.data?.critical_alerts ?? 0;
+
+  // The native bottom-bar badge rides the counts the drawer badge already has:
+  // no second poller, no second endpoint. inShell is a dependency so a late
+  // handshake still gets the current counts.
+  useEffect(() => {
+    if (!inShell) return;
+    void host.badge(openAlerts, criticalAlerts);
+  }, [inShell, openAlerts, criticalAlerts]);
 
   return (
     <div className="app">
@@ -123,11 +176,11 @@ export function Layout() {
           <div>v{version || 'dev'}</div>
         </div>
       </nav>
-      <header className="topbar">
+      <header className={`topbar ${searchOpen ? 'search-open' : ''}`}>
         <Button variant="ghost" icon className="nav-toggle" onClick={() => setNavOpen((o) => !o)} aria-label="Menu" aria-expanded={navOpen}>
           <IconMenu />
         </Button>
-        <GlobalSearch />
+        <GlobalSearch onFocusChange={setSearchOpen} />
         <span className="spacer" />
         <ActivityMenu />
         <Button variant="ghost" icon onClick={() => setHelpOpen(true)} title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">
@@ -148,10 +201,18 @@ export function Layout() {
           <button onClick={() => navigate('/account')}>
             <IconUser /> Account
           </button>
+          {/* The topbar toggle is hidden below 700px (C16), so the theme has to
+              stay reachable from somewhere a thumb can find. */}
+          <button onClick={toggleTheme}>
+            {theme === 'dark' ? <IconSun /> : <IconMoon />} {theme === 'dark' ? 'Light theme' : 'Dark theme'}
+          </button>
           <hr />
           <button
             onClick={async () => {
               await logout();
+              // The shell clears its own session state on this signal (§3.6);
+              // in a browser it is a no-op.
+              void host.signedOut();
               navigate('/login');
             }}
           >
@@ -190,10 +251,36 @@ function ConnState() {
   );
 }
 
-function GlobalSearch() {
+/**
+ * True once the Android shell's bridge has completed its handshake
+ * (web/src/lib/host.ts). False in every browser, and false in the shell until
+ * the shell actually answers — the drawer stays until then, by design.
+ */
+function useShell(): boolean {
+  const [on, setOn] = useState(host.available);
+  useEffect(() => host.onAvailable(setOn), []);
+  return on;
+}
+
+/** A media query as state, for the bits of the phone layout JS has to own. */
+function useMedia(query: string): boolean {
+  const [on, setOn] = useState(() => window.matchMedia?.(query).matches ?? false);
+  useEffect(() => {
+    const mq = window.matchMedia?.(query);
+    if (!mq) return;
+    const onChange = () => setOn(mq.matches);
+    onChange();
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, [query]);
+  return on;
+}
+
+function GlobalSearch({ onFocusChange }: { onFocusChange: (focused: boolean) => void }) {
   const [q, setQ] = useState('');
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
+  const phone = useMedia('(max-width: 700px)');
   const navigate = useNavigate();
   const agents = useAsync(() => api.agents(), [], { enabled: open || q.length > 0 });
   useLiveReload(['agent_online', 'agent_offline', 'inventory'], agents.reload, { debounceMs: 2000 });
@@ -226,6 +313,18 @@ function GlobalSearch() {
     };
   }, []);
 
+  // System back closes the results list before it reaches the shell's history.
+  useEffect(
+    () =>
+      host.onBack(() => {
+        if (!open) return false;
+        setOpen(false);
+        inputRef.current?.blur();
+        return true;
+      }),
+    [open],
+  );
+
   const go = (a: Agent) => {
     navigate(`/devices/${a.id}`);
     setQ('');
@@ -238,15 +337,27 @@ function GlobalSearch() {
       <input
         ref={inputRef}
         type="search"
-        placeholder="Search devices by name, IP or tag…  ( / )"
+        // The "( / )" hint is dead weight on a phone, where the placeholder
+        // truncates to "Search (" in a 103px box (C16).
+        placeholder={phone ? 'Search devices…' : 'Search devices by name, IP or tag…  ( / )'}
         value={q}
         aria-label="Search devices"
+        // Android capitalises and autocorrects a hostname into something that
+        // matches nothing.
+        autoCapitalize="none"
+        autoCorrect="off"
+        spellCheck={false}
+        enterKeyHint="search"
         onChange={(e) => {
           setQ(e.target.value);
           setOpen(true);
           setActive(0);
         }}
-        onFocus={() => setOpen(true)}
+        onFocus={() => {
+          setOpen(true);
+          onFocusChange(true);
+        }}
+        onBlur={() => onFocusChange(false)}
         onKeyDown={(e) => {
           if (e.key === 'ArrowDown') {
             e.preventDefault();

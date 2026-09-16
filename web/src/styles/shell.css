@@ -1,0 +1,90 @@
+/* ---------------------------------------------------------------------------
+   shell.css — the Android-shell navigation contract (C12) and the phone
+   global-search layout (C16). Imported from Layout.tsx, i.e. after
+   global.css, and every selector here is deliberately one step more specific
+   than the rule it overrides so bundle order can never decide the outcome.
+
+   Nothing in this file applies until either
+     - the bridge has said hello, which is what sets data-rmm-shell on <html>
+       (web/src/lib/host.ts, docs/ANDROID.md §3.6), or
+     - the viewport is a phone (the console's existing 700px breakpoint).
+   A desktop browser with no shell is untouched.
+   --------------------------------------------------------------------------- */
+
+/* ---------- C12: inside the shell the native bottom bar owns navigation ----------
+   docs/ANDROID.md §3.4. The off-canvas drawer, its scrim and the hamburger are
+   replaced by a 5-item BottomNavigationView, so they are hidden here — and
+   ONLY here, keyed on the attribute the handshake sets. If the shell never
+   says hello the attribute is never set, the drawer stays, and the native bar
+   falls back to loadUrl: no configuration ends up with no navigation. */
+:root[data-rmm-shell] {
+  --nav-w: 0px;
+}
+:root[data-rmm-shell] .app {
+  grid-template-columns: 0 1fr;
+}
+:root[data-rmm-shell] .nav,
+:root[data-rmm-shell] .nav-scrim,
+:root[data-rmm-shell] .nav-toggle {
+  display: none;
+}
+
+@media (max-width: 700px) {
+  /* ---------- C16: global search on a phone ----------
+     The input collapses to ~103px because .spacer takes an equal share of the
+     line, and the results panel inherits that width because it is absolutely
+     positioned inside .search. Give the input the whole line and take the
+     panel out to the viewport.
+
+     Deviation from the written fix, deliberate: .topbar .search keeps
+     position:relative instead of becoming static. The magnifier
+     (.topbar .search svg) is absolutely positioned inside .search, so making
+     .search static would resolve it against the initial containing block and
+     throw the icon to x=10px of the viewport. A FIXED panel is not affected by
+     a relative ancestor (only transform/filter/contain create a containing
+     block for it), so left/right below still measure from the viewport. */
+  :root .topbar .search {
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: none;
+  }
+  :root .topbar .search input {
+    min-width: 0;
+  }
+  :root .topbar .spacer {
+    flex: 0 0 0;
+  }
+  /* A phone topbar has no room for the theme toggle; it moves into the user
+     menu (Layout.tsx), and inside the shell the theme is pushed natively. */
+  :root .topbar .btn[aria-label='Toggle theme'] {
+    display: none;
+  }
+
+  :root .search-results {
+    position: fixed;
+    left: 8px;
+    right: 8px;
+    /* env() is 0 until viewport-fit=cover (C4) lands, so this is correct both
+       before and after that change. */
+    top: calc(var(--topbar-h) + env(safe-area-inset-top, 0px) + 4px);
+    max-height: 60vh;
+    max-height: 60dvh;
+  }
+  /* "DESKTOP-EQE8HAP127.0.0.1 · Windows" in a 101px box: give the meta line its
+     own row instead of margin-left:auto. */
+  :root .search-results .item {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+  :root .search-results .item .meta {
+    margin-left: 0;
+    flex: 1 0 100%;
+  }
+
+  /* While the search has focus it takes the whole topbar. Gated on the shell
+     NOT being present: inside the app this row competes with the native
+     toolbar, and the native bar has already freed the hamburger's space. */
+  :root:not([data-rmm-shell]) .topbar.search-open > *:not(.search):not(.nav-toggle) {
+    display: none;
+  }
+}
