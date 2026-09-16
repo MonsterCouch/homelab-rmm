@@ -55,7 +55,10 @@ export function DevicePatches({ agent, canWrite }: TabProps) {
     try {
       const res = await api.patchScan(agent.id);
       data.setData(res);
-      toast.success('Patch scan complete', `${res.patches.filter((p) => p.status === 'available').length} available`);
+      // A scan whose update source failed still answers 200 with a fresh
+      // timestamp and the previous list, so say so instead of "complete".
+      if (res.scan_error) toast.warning('Patch scan reported a problem', res.scan_error);
+      else toast.success('Patch scan complete', `${res.patches.filter((p) => p.status === 'available').length} available`);
     } catch (err) {
       toast.error('Scan failed', errMsg(err));
     } finally {
@@ -111,8 +114,36 @@ export function DevicePatches({ agent, canWrite }: TabProps) {
     },
     { key: 'kb', header: 'KB', sort: (p) => p.kb, render: (p) => <span className="mono small">{p.kb || '—'}</span> },
     { key: 'sev', header: 'Severity', sort: (p) => p.severity, render: (p) => (p.severity ? <Chip tone={sevTone(p.severity)}>{p.severity}</Chip> : <span className="faint">—</span>) },
-    { key: 'size', header: 'Size', align: 'right', sort: (p) => p.size, render: (p) => (p.size ? bytes(p.size) : <span className="faint">—</span>) },
-    { key: 'src', header: 'Source', sort: (p) => p.source, render: (p) => <span className="muted">{p.source}</span> },
+    {
+      key: 'size',
+      header: 'Size',
+      align: 'right',
+      sort: (p) => p.size,
+      csv: (p) => (p.downloaded ? `${p.size} (downloaded)` : p.size),
+      // "downloaded" is the difference between a 96 GB cumulative update the
+      // device still has to fetch and one Windows has already staged.
+      render: (p) => (
+        <span>
+          {p.size ? bytes(p.size) : <span className="faint">—</span>}
+          {p.downloaded && (
+            <>
+              {' '}
+              <Chip tone="info">downloaded</Chip>
+            </>
+          )}
+        </span>
+      ),
+    },
+    {
+      key: 'src',
+      header: 'Source',
+      sort: (p) => p.source,
+      render: (p) => (
+        <span className="muted" title={p.source === 'winget' ? 'Application upgrade reported by winget — informational: the agent service account cannot install it' : undefined}>
+          {p.source}
+        </span>
+      ),
+    },
     { key: 'reboot', header: 'Reboot', sort: (p) => (p.reboot_required ? 0 : 1), csv: (p) => (p.reboot_required ? 'yes' : 'no'), render: (p) => (p.reboot_required ? <Chip tone="warn">yes</Chip> : <span className="faint">no</span>) },
     {
       key: 'seen',
@@ -128,6 +159,13 @@ export function DevicePatches({ agent, canWrite }: TabProps) {
       {agent.pending_reboot && (
         <div className="banner warn">
           <span>This device requires a reboot to finish installing updates.</span>
+        </div>
+      )}
+      {data.data?.scan_error && (
+        <div className="banner warn">
+          <span>
+            The last patch scan reported a problem: {data.data.scan_error}. The list below is what the previous scan found and may be out of date.
+          </span>
         </div>
       )}
       <div className="toolbar">

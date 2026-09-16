@@ -14,13 +14,18 @@ package agent
 // on a device with a KB-numbered update into an empty list with a baffling
 // error.
 
-// wuaScanScript searches for applicable software updates. It never throws
-// to the host: a search failure is reported in the JSON so the operator
-// sees the HRESULT instead of a blank scan. $ErrorActionPreference is Stop
-// so a COM error lands in the catch rather than scrolling warnings.
+// wuaScanScript searches for applicable software updates and reads back the
+// install history. It never throws to the host: a search failure is reported
+// in the JSON so the operator sees the HRESULT instead of a blank scan.
+// $ErrorActionPreference is Stop so a COM error lands in the catch rather
+// than scrolling warnings.
+//
+// The history pass has its own try/catch and runs after the pending list is
+// already in $out: a device with no history, or a QueryHistory that throws,
+// must still report the updates it owes.
 const wuaScanScript = `
 $ErrorActionPreference = 'Stop'
-$out = [ordered]@{ updates = @(); reboot_pending = $false; error = ''; error_hresult = '' }
+$out = [ordered]@{ updates = @(); history = @(); reboot_pending = $false; error = ''; error_hresult = '' }
 try {
 	$si = New-Object -ComObject Microsoft.Update.SystemInfo
 	$out.reboot_pending = [bool]$si.RebootRequired
@@ -59,6 +64,24 @@ try {
 	$out.error = "$($_.Exception.Message)"
 	if ($ex -is [System.Runtime.InteropServices.COMException]) { $out.error_hresult = ('0x{0:X8}' -f $ex.HResult) }
 }
+try {
+	if ($searcher) {
+		$total = 0; try { $total = [int]$searcher.GetTotalHistoryCount() } catch {}
+		if ($total -gt 0) {
+			$take = $total; if ($take -gt 200) { $take = 200 }
+			$hist = New-Object System.Collections.ArrayList
+			foreach ($h in $searcher.QueryHistory(0, $take)) {
+				if ([int]$h.Operation -ne 1) { continue }
+				$rc = [int]$h.ResultCode
+				if ($rc -ne 2 -and $rc -ne 3) { continue }
+				$hid = ''; try { $hid = "$($h.UpdateIdentity.UpdateID)" } catch {}
+				if ($hid -eq '') { continue }
+				[void]$hist.Add([ordered]@{ id = $hid; title = "$($h.Title)" })
+			}
+			$out.history = @($hist)
+		}
+	}
+} catch {}
 Write-Output ("RESULT " + ($out | ConvertTo-Json -Depth 6 -Compress))
 `
 

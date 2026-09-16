@@ -736,3 +736,146 @@ func TestWinWUAScriptShape(t *testing.T) {
 		t.Error("install script's GUID guard changed; keep it in step with winIsUpdateID")
 	}
 }
+
+// ---- patching: WIN-08 / WIN-10 / WIN-12 / WIN-16 ----
+
+func TestWinSplitInstallIDs(t *testing.T) {
+	// One winget row in the batch used to abort the whole install, which
+	// marked every genuine Windows update in it failed. Each unsupported id
+	// now fails on its own and the GUIDs still install.
+	ids := []string{
+		"916031e1-9d13-48e9-a262-c8a0db93fbac",
+		"winget:Notepad++.Notepad++",
+		"wua:AAAAAAAA-1111-2222-3333-444444444444",
+		"not-an-update",
+		"",
+	}
+	guids, skipped := winSplitInstallIDs(ids)
+	want := []string{"916031e1-9d13-48e9-a262-c8a0db93fbac", "AAAAAAAA-1111-2222-3333-444444444444"}
+	if !reflect.DeepEqual(guids, want) {
+		t.Fatalf("guids = %v, want %v", guids, want)
+	}
+	if len(skipped) != 3 {
+		t.Fatalf("skipped = %v", skipped)
+	}
+	// the key is the id exactly as the server sent it: the server matches it
+	// back against patches.patch_id
+	if msg := skipped["winget:Notepad++.Notepad++"]; !strings.Contains(msg, "service account") {
+		t.Errorf("winget reason = %q", msg)
+	}
+	if msg := skipped["not-an-update"]; !strings.Contains(msg, "invalid update id") {
+		t.Errorf("invalid id reason = %q", msg)
+	}
+	// a batch of nothing but winget rows resolves to no GUIDs at all, which
+	// the caller must not turn into "install everything applicable"
+	if g, s := winSplitInstallIDs([]string{"winget:GitHub.cli"}); len(g) != 0 || len(s) != 1 {
+		t.Errorf("all-winget batch: %v %v", g, s)
+	}
+	if g, s := winSplitInstallIDs(nil); g != nil || s != nil {
+		t.Errorf("empty batch: %v %v", g, s)
+	}
+}
+
+func TestWinJoinScanError(t *testing.T) {
+	cases := [][3]string{
+		{"", "", ""},
+		{"wua failed", "", "wua failed"},
+		{"", "winget failed", "winget failed"},
+		{"wua failed", "winget failed", "wua failed; winget failed"},
+	}
+	for _, c := range cases {
+		if got := winJoinScanError(c[0], c[1]); got != c[2] {
+			t.Errorf("winJoinScanError(%q,%q) = %q, want %q", c[0], c[1], got, c[2])
+		}
+	}
+}
+
+func TestWinKBFromTitle(t *testing.T) {
+	cases := [][2]string{
+		{"2026-09 Security Update (KB5129195) (26200.9457)", "KB5129195"},
+		{"Windows Malicious Software Removal Tool x64 - v5.145 (KB890830)", "KB890830"},
+		{"9NRZT3Q9R3DL-Microsoft.WindowsAppRuntime.2", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := winKBFromTitle(c[0]); got != c[1] {
+			t.Errorf("winKBFromTitle(%q) = %q, want %q", c[0], c[1], got)
+		}
+	}
+}
+
+func TestWinParseWUAScanInstalledHistory(t *testing.T) {
+	// The pending search is the only thing that ever reached the server, so
+	// the Installed tab was empty on a device WUA has 137 history entries
+	// for. History rows arrive installed, and a pending id wins over its own
+	// history entry: an update that installed and is waiting for a reboot is
+	// offered again and must not be reported as done.
+	scan := `{"updates":[{"id":"916031e1-9d13-48e9-a262-c8a0db93fbac","title":"2026-09 Security Update (KB5129195)","kb":["5129195"],"downloaded":true}],` +
+		`"history":[{"id":"916031e1-9d13-48e9-a262-c8a0db93fbac","title":"2026-09 Security Update (KB5129195)"},` +
+		`{"id":"22222222-2222-2222-2222-222222222222","title":"2026-09 .NET Framework Security Update (KB5126052)"}],` +
+		`"reboot_pending":true,"error":""}`
+	res, err := winParseWUAScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Updates) != 2 {
+		t.Fatalf("updates = %+v", res.Updates)
+	}
+	byID := map[string]protocol.Update{}
+	for _, u := range res.Updates {
+		byID[u.ID] = u
+	}
+	pending := byID["916031e1-9d13-48e9-a262-c8a0db93fbac"]
+	if pending.Installed || !pending.Downloaded {
+		t.Errorf("a still-pending update must stay pending: %+v", pending)
+	}
+	done := byID["22222222-2222-2222-2222-222222222222"]
+	if !done.Installed || done.Source != "wua" || done.KB != "KB5126052" {
+		t.Errorf("history entry decoded wrong: %+v", done)
+	}
+	// no history key at all is a scan from an older agent, not an error
+	if r, err := winParseWUAScan(`{"updates":[],"reboot_pending":false}`); err != nil || len(r.Updates) != 0 {
+		t.Fatalf("scan without history: %+v %v", r, err)
+	}
+	// the script has to actually ask for it
+	for _, want := range []string{"GetTotalHistoryCount", "QueryHistory(0, $take)"} {
+		if !strings.Contains(wuaScanScript, want) {
+			t.Errorf("scan script no longer calls %s", want)
+		}
+	}
+}
+
+func TestWinTrustedExe(t *testing.T) {
+	roots := []string{`C:\Windows`, `C:\Program Files`}
+	trusted := []string{
+		`C:\Program Files\PowerShell\7\pwsh.exe`,
+		`c:\program files\powershell\7\pwsh.exe`,
+		`C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`,
+	}
+	for _, p := range trusted {
+		if !winTrustedExe(p, roots) {
+			t.Errorf("%q should be trusted", p)
+		}
+	}
+	// the agent runs as SYSTEM: a user-writable directory on PATH must never
+	// be able to hand it a pwsh.exe or a winget.exe. The last three are the
+	// prefix traps - a root has to match on a path boundary, not as text.
+	hostile := []string{
+		`C:\tools\pwsh.exe`,
+		`C:\Users\bob\AppData\Local\Microsoft\WindowsApps\winget.exe`,
+		`pwsh.exe`,
+		``,
+		`C:\Windows2\pwsh.exe`,
+		`C:\Program Files (x86)\evil\pwsh.exe`,
+		`C:\Windows`,
+	}
+	for _, p := range hostile {
+		if winTrustedExe(p, roots) {
+			t.Errorf("%q must not be trusted", p)
+		}
+	}
+	// an empty root (the env var is unset) matches nothing
+	if winTrustedExe(`C:\Windows\System32\cmd.exe`, []string{""}) {
+		t.Error("an empty root must not match")
+	}
+}

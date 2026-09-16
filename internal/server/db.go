@@ -395,6 +395,49 @@ CREATE TABLE IF NOT EXISTS baseline_history(
 CREATE INDEX IF NOT EXISTS idx_baseline_history_agent ON baseline_history(agent_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_baseline_history_ts ON baseline_history(ts);
 `,
+	// 5: patches.downloaded and patches.description.
+	//
+	// The agent has always sent IsDownloaded and the (truncated) description
+	// with every Windows Update scan and the table had nowhere to put them,
+	// so the console showed a bare 96 GB against a cumulative update Windows
+	// had already staged on disk.
+	//
+	// The columns arrive by rebuild rather than by ALTER TABLE ADD COLUMN:
+	// ADD COLUMN cannot be written IF NOT EXISTS, and a migration that
+	// cannot be replayed onto its own result bricks a database whose
+	// user_version was rewound - the rule migrations 3 and 4 spell out.
+	// Replaying this one copies the table onto a fresh one of the same shape
+	// and succeeds, but it is not quite a no-op: the copy carries only the
+	// columns the pre-v5 table had, so downloaded and description fall back
+	// to their defaults. Every patch scan rewrites both, so a replay costs
+	// one scan, not the row.
+	`
+CREATE TABLE IF NOT EXISTS patches_v5 (
+	agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+	patch_id TEXT NOT NULL,
+	title TEXT NOT NULL,
+	kb TEXT NOT NULL DEFAULT '',
+	severity TEXT NOT NULL DEFAULT '',
+	categories TEXT NOT NULL DEFAULT '[]',
+	size INTEGER NOT NULL DEFAULT 0,
+	source TEXT NOT NULL DEFAULT '',
+	version TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL DEFAULT 'available',  -- available, approved, installing, installed, failed, ignored
+	reboot_required INTEGER NOT NULL DEFAULT 0,
+	downloaded INTEGER NOT NULL DEFAULT 0,     -- windows: the payload is already on the device
+	description TEXT NOT NULL DEFAULT '',
+	first_seen INTEGER NOT NULL,
+	last_seen INTEGER NOT NULL,
+	installed_at INTEGER NOT NULL DEFAULT 0,
+	error TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (agent_id, patch_id)
+);
+INSERT INTO patches_v5(agent_id, patch_id, title, kb, severity, categories, size, source, version, status, reboot_required, first_seen, last_seen, installed_at, error)
+	SELECT agent_id, patch_id, title, kb, severity, categories, size, source, version, status, reboot_required, first_seen, last_seen, installed_at, error FROM patches;
+DROP TABLE patches;
+ALTER TABLE patches_v5 RENAME TO patches;
+CREATE INDEX IF NOT EXISTS idx_patches_agent_status ON patches(agent_id, status);
+`,
 }
 
 // Close checkpoints the write-ahead log before closing, so a short-lived

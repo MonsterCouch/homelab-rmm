@@ -71,7 +71,10 @@ See `routes()` in `internal/server/api.go`. Highlights:
   `POST .../power {action: reboot|shutdown|lock|logoff, delay_sec, message}`, `POST .../wol`,
   `POST .../run {script_id | language+body, args, timeout_sec}` → `{run_id}` (409 when the run
   cannot start, including a `script_id` whose `os_filter` does not match the device),
-  `GET .../patches` → `{patches, last_scan}`, `POST .../patches/scan`,
+  `GET .../patches` → `{patches, last_scan, scan_error}` (`scan_error` is what the agent said went
+  wrong during the last scan, `""` when it was clean: a scan whose update source failed still
+  answers 200 and still refreshes `last_scan`, so this is the only signal that the list is stale),
+  `POST .../patches/scan`,
   `POST .../patches/install {ids | all:true, reboot_if_required}` (202, follow `patches` events),
   `GET .../events` (agent event log).
 - Terminal: WebSocket `/ws/shell/{id}`. Send `{"t":"open","shell":"powershell|cmd|bash|sh|","cols","rows"}`,
@@ -136,8 +139,17 @@ See `routes()` in `internal/server/api.go`. Highlights:
   outside `/etc`/`ProgramData` or an `allow_reboot` check needs **admin** — on `preview` as well as
   on the save path, because a preview runs the draft on the devices it names. Full shapes and the
   check-kind parameter schemas are in [BASELINES.md](BASELINES.md).
-- Patches `/api/patches?agent=&status=`, `POST /api/patches/status {items:[{AgentID,PatchID}], status: approved|ignored|available}`,
-  policies `/api/patch-policies` (`mode`: approved|all|security; `reboot`: never|if_required|always).
+- Patches `/api/patches?agent=&status=`, `POST /api/patches/status {items:[{agent_id,patch_id}], status: approved|ignored|available}`
+  (`AgentID`/`PatchID` are accepted too; the reply is `{ok:true, changed:<rows>}`, and a body whose
+  items match no patch — wrong ids, or patches that are installing or installed — is **404**, not a
+  silent success), policies `/api/patch-policies` (`mode`: approved|all|security; `reboot`:
+  never|if_required|always).
+  A patch row carries `source` (`wua`, `winget`, `apt`, `dnf`, `pacman`, `zypper`), `downloaded`
+  (Windows Update has already staged the payload, so `size` is not a download still to come) and
+  `description`. **`source: "winget"` rows are informational**: they are the application upgrades
+  `winget upgrade` lists for the agent's service account, the agent refuses to install them, and
+  the server leaves them out of `all:true` approvals and of "install everything approved". Sending
+  one explicitly comes back as a per-id failure, and the rest of the batch still installs.
 - Admin: `/api/settings` (GET/PUT `Settings`), `POST /api/settings/test-mail`, `/api/users`,
   `GET /api/audit?limit=`, `GET /api/system`, `GET /api/dashboard`.
 

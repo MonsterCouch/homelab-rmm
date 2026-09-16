@@ -201,6 +201,28 @@ pacman), installs, and
 reboots per `reboot` (`never`, `if_required`, `always`). A device with no patch rows gets a scan
 20 s after its first connection.
 
+"No longer reported ⇒ installed" only runs for a scan that reported **no** error. The agent's
+error text is kept in `last_patch_scan_error:<agent>` and served as `scan_error`, and an agent
+that could not enumerate one of its sources (an apt index that would not refresh, a winget that
+resolved and then failed) sets it: an empty list from a broken source is otherwise
+indistinguishable from "everything is up to date", which would mark every row of that source
+installed and resolve its alerts.
+
+On Windows a scan reports three things. Applicable Windows updates, with `downloaded`
+(IsDownloaded) so the console can tell an already-staged cumulative update from one that still has
+to come down the wire. The last 200 `IUpdateSearcher::QueryHistory` entries that installed
+successfully, as `installed` rows — the only record of what a freshly enrolled device already has,
+since a pending update it never offered can never "disappear" from a later scan (an id that is
+still pending wins over its history entry, so an update waiting for a reboot stays pending); the
+`installed_at` of such a row is when this server first saw it, not the device's own install date,
+because the wire format carries no per-update timestamp. And `winget upgrade` rows,
+`source = 'winget'`, which are **informational**: the agent service account cannot install them,
+so they are excluded from `all:true` approvals, from a policy's `all` mode and from "install
+everything approved". An explicitly requested winget id comes back as a per-id failure and the
+rest of the batch still installs — one unsupported id never fails a whole batch. The SYSTEM
+account's winget view also differs from the logged-in user's (per-user package registrations), so
+the list is not what that user sees in a terminal.
+
 ### Baselines (`baselines.go`, `baselines_db.go`, `api_baselines.go`)
 Desired state. `agentConfig` resolves the enabled baselines whose targets match a device and sends
 the **complete** set in every config push and in `welcome` — never a delta — after the
@@ -299,7 +321,7 @@ slice in `db.go`, applied in order and tracked in `PRAGMA user_version`.
 
 | Table | Purpose | Notable columns |
 |---|---|---|
-| `settings` | key/value config: `public_url`, `smtp`, `agent_defaults`, `retention`, `seeded`, `seeded_baselines`, `last_patch_scan:<agent>` | |
+| `settings` | key/value config: `public_url`, `smtp`, `agent_defaults`, `retention`, `seeded`, `seeded_baselines`, `last_patch_scan:<agent>`, `last_patch_scan_error:<agent>` | |
 | `users`, `sessions` | operators and their cookies | `role`, `totp_secret`, `totp_enabled`, `expires_at` |
 | `groups` | device groups | unique `name` |
 | `enroll_tokens` | bootstrap tokens | `uses_left` (-1 unlimited), `expires_at`, `group_id` |
@@ -310,7 +332,7 @@ slice in `db.go`, applied in order and tracked in `PRAGMA user_version`.
 | `tasks` | scheduled/manual jobs | `kind`, `script_id`, `targets` (JSON), `schedule` (cron), `options` (JSON), `next_run` |
 | `automations` | event → action | `trigger`, `filter` (JSON), `action`, `action_params` (JSON) |
 | `alert_rules`, `alerts` | rules and open/acked/resolved alerts | `kind`, `params` (JSON), `severity`, `dedupe_key`, `notified` |
-| `patches` | per-device update inventory, `(agent_id, patch_id)` | `status` (`available`, `approved`, `installing`, `installed`, `failed`, `ignored`), `severity`, `categories`, `source` |
+| `patches` | per-device update inventory, `(agent_id, patch_id)` | `status` (`available`, `approved`, `installing`, `installed`, `failed`, `ignored`), `severity` (listed worst-first by an explicit rank, not by the TEXT column's own order; Windows reports the MSRC ratings, apt/dnf/zypper report `security`, which ranks with `Important` so a distro's security updates are never the rows a `LIMIT` drops), `categories` (always a JSON array), `source`, `downloaded`, `description` |
 | `patch_policies` | scan/install schedules | `scan_schedule`, `install_schedule`, `mode`, `reboot` |
 | `audit` | who did what | `user`, `ip`, `action`, `target`, `details` |
 | `agent_events` | unsolicited agent events (service changes, patch progress, log lines) | `kind`, `message`, `fields` |

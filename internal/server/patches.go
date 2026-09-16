@@ -27,11 +27,36 @@ type Patch struct {
 	Version        string   `json:"version"`
 	Status         string   `json:"status"`
 	RebootRequired bool     `json:"reboot_required"`
-	FirstSeen      int64    `json:"first_seen"`
-	LastSeen       int64    `json:"last_seen"`
-	InstalledAt    int64    `json:"installed_at"`
-	Error          string   `json:"error"`
+	// Downloaded is Windows Update's IsDownloaded: the payload is already on
+	// the device and the size beside it is not a download that still has to
+	// happen. Description is the agent's (truncated) update description.
+	Downloaded  bool   `json:"downloaded"`
+	Description string `json:"description,omitempty"`
+	FirstSeen   int64  `json:"first_seen"`
+	LastSeen    int64  `json:"last_seen"`
+	InstalledAt int64  `json:"installed_at"`
+	Error       string `json:"error"`
 }
+
+// patchSeverityRank orders the severity TEXT column worst-first. SQLite sorts
+// TEXT lexicographically, so the old `severity DESC` put Critical below
+// Unspecified, Moderate and Low, and the LIMIT truncated the worst patches
+// first.
+//
+// Critical/Important/Moderate/Low are Windows Update's MSRC ratings.
+// "security" is what apt, dnf and zypper set (internal/agent/linuxparse.go)
+// and is the ONLY non-empty severity a Linux device ever reports, so it has
+// to rank with the rated updates rather than fall into the unrated bucket -
+// otherwise the LIMIT cuts a distro's security updates like any other row.
+// It ties with Important on purpose: an advisory covers the update but the
+// distro gave no rating. ORDER BY breaks the tie on title.
+const patchSeverityRank = `CASE UPPER(p.severity) WHEN 'CRITICAL' THEN 0 WHEN 'IMPORTANT' THEN 1 WHEN 'SECURITY' THEN 1 WHEN 'MODERATE' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END`
+
+// patchSourceInstallable excludes the sources the agent cannot install from a
+// bulk approve or an "install everything approved" batch. winget rows are
+// reported for visibility only: the agent service account cannot install
+// them (see internal/agent/updates_windows.go).
+const patchSourceInstallable = ` AND source <> 'winget'`
 
 type PatchPolicy struct {
 	ID              int64   `json:"id"`
@@ -46,7 +71,7 @@ type PatchPolicy struct {
 }
 
 func (d *DB) ListPatches(agentID, status string, limit int64) ([]Patch, error) {
-	q := `SELECT p.agent_id, COALESCE(NULLIF(a.display_name,''), a.hostname, ''), p.patch_id, p.title, p.kb, p.severity, p.categories, p.size, p.source, p.version, p.status, p.reboot_required, p.first_seen, p.last_seen, p.installed_at, p.error
+	q := `SELECT p.agent_id, COALESCE(NULLIF(a.display_name,''), a.hostname, ''), p.patch_id, p.title, p.kb, p.severity, p.categories, p.size, p.source, p.version, p.status, p.reboot_required, p.downloaded, p.description, p.first_seen, p.last_seen, p.installed_at, p.error
 		FROM patches p LEFT JOIN agents a ON a.id = p.agent_id WHERE 1=1`
 	args := []any{}
 	if agentID != "" {
@@ -57,7 +82,7 @@ func (d *DB) ListPatches(agentID, status string, limit int64) ([]Patch, error) {
 		q += ` AND p.status = ?`
 		args = append(args, status)
 	}
-	q += ` ORDER BY p.status, p.severity DESC, p.title LIMIT ?`
+	q += ` ORDER BY p.status, ` + patchSeverityRank + `, p.title LIMIT ?`
 	args = append(args, limit)
 	rows, err := d.Query(q, args...)
 	if err != nil {
@@ -68,14 +93,30 @@ func (d *DB) ListPatches(agentID, status string, limit int64) ([]Patch, error) {
 	for rows.Next() {
 		var p Patch
 		var cats string
-		if err := rows.Scan(&p.AgentID, &p.AgentName, &p.PatchID, &p.Title, &p.KB, &p.Severity, &cats, &p.Size, &p.Source, &p.Version, &p.Status, &p.RebootRequired, &p.FirstSeen, &p.LastSeen, &p.InstalledAt, &p.Error); err != nil {
+		if err := rows.Scan(&p.AgentID, &p.AgentName, &p.PatchID, &p.Title, &p.KB, &p.Severity, &cats, &p.Size, &p.Source, &p.Version, &p.Status, &p.RebootRequired, &p.Downloaded, &p.Description, &p.FirstSeen, &p.LastSeen, &p.InstalledAt, &p.Error); err != nil {
 			return nil, err
 		}
+		// The API promises an array. Rows written before categories were
+		// stored as "[]" hold the literal "null", which unmarshals a
+		// pre-initialised slice straight back to nil.
 		p.Categories = []string{}
-		json.Unmarshal([]byte(cats), &p.Categories)
+		var cl []string
+		if json.Unmarshal([]byte(cats), &cl) == nil && cl != nil {
+			p.Categories = cl
+		}
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// patchCategories marshals an update's categories for storage. A nil slice
+// marshals to the literal "null", which the column (NOT NULL DEFAULT '[]')
+// and the published Patch type both say it is not.
+func patchCategories(c []string) string {
+	if c == nil {
+		c = []string{}
+	}
+	return jsonText(c)
 }
 
 func (d *DB) ListPatchPolicies() ([]PatchPolicy, error) {
@@ -158,14 +199,21 @@ func (s *Server) patchScanLocked(agentID string) error {
 		if u.Installed {
 			status = "installed"
 		}
-		s.db.Exec(`INSERT INTO patches(agent_id, patch_id, title, kb, severity, categories, size, source, version, status, reboot_required, first_seen, last_seen, installed_at)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		s.db.Exec(`INSERT INTO patches(agent_id, patch_id, title, kb, severity, categories, size, source, version, status, reboot_required, downloaded, description, first_seen, last_seen, installed_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 			ON CONFLICT(agent_id, patch_id) DO UPDATE SET title=excluded.title, kb=excluded.kb, severity=excluded.severity, categories=excluded.categories,
-				size=excluded.size, version=excluded.version, reboot_required=excluded.reboot_required, last_seen=excluded.last_seen,
+				size=excluded.size, version=excluded.version, reboot_required=excluded.reboot_required, downloaded=excluded.downloaded,
+				description=excluded.description, last_seen=excluded.last_seen,
 				status = CASE WHEN patches.status IN ('approved','ignored','installing') AND excluded.status='available' THEN patches.status ELSE excluded.status END,
-				installed_at = CASE WHEN excluded.status='installed' AND patches.installed_at=0 THEN excluded.last_seen ELSE patches.installed_at END`,
-			agentID, u.ID, u.Title, u.KB, u.Severity, jsonText(u.Categories), u.SizeBytes, u.Source, u.Version, status, u.RebootReq, ts, ts, map[bool]int64{true: ts, false: 0}[u.Installed])
+				installed_at = CASE WHEN excluded.status='installed' AND patches.installed_at=0 THEN excluded.last_seen
+					WHEN excluded.status='available' AND patches.status='installed' THEN 0
+					ELSE patches.installed_at END`,
+			agentID, u.ID, u.Title, u.KB, u.Severity, patchCategories(u.Categories), u.SizeBytes, u.Source, u.Version, status, u.RebootReq, u.Downloaded, u.Description, ts, ts, map[bool]int64{true: ts, false: 0}[u.Installed])
 	}
+	// An id the agent offers again after the table called it installed was
+	// never installed (or a sweep over a broken scan decided it was), so the
+	// stale installed_at goes with the status.
+	//
 	// Anything previously pending that the agent no longer lists was installed
 	// elsewhere - but only believe that when the scan itself was clean:
 	// a scan whose index refresh failed lists from a stale cache, and
@@ -206,7 +254,9 @@ func (s *Server) patchInstall(agentID string, ids []string, reboot bool, by stri
 
 func (s *Server) patchInstallLocked(agentID string, ids []string, reboot bool, by string) (*protocol.UpdatesInstallResult, error) {
 	if ids == nil {
-		rows, err := s.db.Query(`SELECT patch_id FROM patches WHERE agent_id = ? AND status = 'approved'`, agentID)
+		// Only what the agent can actually install: a winget row approved by
+		// hand would otherwise ride along in the batch and come back failed.
+		rows, err := s.db.Query(`SELECT patch_id FROM patches WHERE agent_id = ? AND status = 'approved'`+patchSourceInstallable, agentID)
 		if err != nil {
 			return nil, err
 		}
@@ -278,7 +328,7 @@ func (s *Server) patchInstallPolicy(agentID string, p *PatchPolicy) {
 	}
 	switch p.Mode {
 	case "all":
-		s.db.Exec(`UPDATE patches SET status='approved' WHERE agent_id=? AND status='available'`, agentID)
+		s.db.Exec(`UPDATE patches SET status='approved' WHERE agent_id=? AND status='available'`+patchSourceInstallable, agentID)
 	case "security":
 		s.db.Exec(`UPDATE patches SET status='approved' WHERE agent_id=? AND status='available' AND (severity IN ('Critical','Important') OR categories LIKE '%Security%' OR source IN ('apt','dnf','pacman'))`, agentID)
 	}
@@ -347,7 +397,7 @@ func (s *Server) handlePatchInstall(w http.ResponseWriter, r *http.Request) {
 	}
 	readJSON(r, &in)
 	if in.All {
-		s.db.Exec(`UPDATE patches SET status='approved' WHERE agent_id=? AND status='available'`, id)
+		s.db.Exec(`UPDATE patches SET status='approved' WHERE agent_id=? AND status='available'`+patchSourceInstallable, id)
 		in.IDs = nil
 	} else if len(in.IDs) == 0 {
 		writeErr(w, 400, "ids required (or all=true)")
@@ -372,11 +422,37 @@ func (s *Server) handlePatchInstall(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 202, map[string]any{"ok": true})
 }
 
+// patchRef is one item of a status change. Both spellings of the two keys are
+// accepted: the console sends the Go field names, and a client that round-
+// trips a Patch straight from GET /api/patches sends the snake_case names the
+// API itself emits. Matching only one of them made the other a silent no-op
+// that still answered 200 and still wrote an audit record.
+type patchRef struct {
+	AgentID    string `json:"AgentID"`
+	PatchID    string `json:"PatchID"`
+	AgentIDAlt string `json:"agent_id"`
+	PatchIDAlt string `json:"patch_id"`
+}
+
+func (p patchRef) agent() string {
+	if strings.TrimSpace(p.AgentID) != "" {
+		return p.AgentID
+	}
+	return strings.TrimSpace(p.AgentIDAlt)
+}
+
+func (p patchRef) patch() string {
+	if strings.TrimSpace(p.PatchID) != "" {
+		return p.PatchID
+	}
+	return strings.TrimSpace(p.PatchIDAlt)
+}
+
 // handlePatchStatus sets approved/ignored/available for a set of patches.
 func (s *Server) handlePatchStatus(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Items  []struct{ AgentID, PatchID string } `json:"items"`
-		Status string                              `json:"status"`
+		Items  []patchRef `json:"items"`
+		Status string     `json:"status"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		fail(w, err)
@@ -388,12 +464,34 @@ func (s *Server) handlePatchStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "status must be approved, ignored or available")
 		return
 	}
-	for _, it := range in.Items {
-		s.db.Exec(`UPDATE patches SET status=? WHERE agent_id=? AND patch_id=? AND status IN ('available','approved','ignored','failed')`, in.Status, it.AgentID, it.PatchID)
+	if len(in.Items) == 0 {
+		writeErr(w, 400, "items required")
+		return
 	}
-	s.audit(r, "patch."+in.Status, "", len(in.Items))
+	var changed int64
+	for _, it := range in.Items {
+		agentID, patchID := it.agent(), it.patch()
+		if agentID == "" || patchID == "" {
+			continue
+		}
+		res, err := s.db.Exec(`UPDATE patches SET status=? WHERE agent_id=? AND patch_id=? AND status IN ('available','approved','ignored','failed')`, in.Status, agentID, patchID)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		n, _ := res.RowsAffected()
+		changed += n
+	}
+	// Nothing matched: the ids are wrong, or every one of them is installing
+	// or already installed. Saying "ok" to that hid a client sending the
+	// wrong key names for months.
+	if changed == 0 {
+		writeErr(w, 404, "no patch matched: check agent_id/patch_id, and that the patches are not installing or installed")
+		return
+	}
+	s.audit(r, "patch."+in.Status, "", changed)
 	s.hub.broadcast(hubEvent{Kind: "patches"})
-	writeJSON(w, 200, map[string]any{"ok": true})
+	writeJSON(w, 200, map[string]any{"ok": true, "changed": changed})
 }
 
 func (s *Server) handleListPatchPolicies(w http.ResponseWriter, r *http.Request) {

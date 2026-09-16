@@ -456,6 +456,9 @@ export interface Patch {
   version: string;
   status: PatchStatus | string;
   reboot_required: boolean;
+  /** Windows Update has already staged the payload: `size` is not a download still to come. */
+  downloaded?: boolean;
+  description?: string;
   first_seen: number;
   last_seen: number;
   installed_at: number;
@@ -465,6 +468,12 @@ export interface Patch {
 export interface AgentPatches {
   patches: Patch[];
   last_scan: number;
+  /**
+   * What the agent said went wrong during the last scan, '' when it was clean.
+   * A failed scan still refreshes last_scan and still answers 200, so this is
+   * the only thing that says the list beside it may be stale.
+   */
+  scan_error?: string;
 }
 
 export interface PatchPolicy {

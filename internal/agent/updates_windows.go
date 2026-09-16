@@ -49,8 +49,15 @@ func scanUpdates(ctx context.Context) (*protocol.UpdatesScanResult, error) {
 	if pendingReboot() {
 		res.RebootPending = true
 	}
-	if wu := scanWinget(scanCtx); len(wu) > 0 {
-		res.Updates = append(res.Updates, wu...)
+	wu, wingetErr := scanWinget(scanCtx)
+	res.Updates = append(res.Updates, wu...)
+	if wingetErr != nil {
+		// A scan that could not enumerate one of its sources has to say so.
+		// An empty winget list is indistinguishable from "every application is
+		// up to date", and the server reads that as "installed elsewhere": one
+		// silent winget failure marked every winget row on the device
+		// installed and resolved their alerts.
+		res.Error = winJoinScanError(res.Error, wingetErr.Error())
 	}
 	return res, nil
 }
@@ -58,20 +65,23 @@ func scanUpdates(ctx context.Context) (*protocol.UpdatesScanResult, error) {
 // installUpdates downloads and installs the requested updates (empty list =
 // all applicable), streaming progress lines through progress. req.Reboot
 // schedules a restart when the install reports one is required.
+//
+// An id this agent cannot install (a winget row, or anything that is not an
+// update GUID) fails on its own and the rest of the batch still runs: the
+// server marks exactly those ids failed with the reason, instead of failing
+// every patch in the request because of one of them.
 func installUpdates(ctx context.Context, req protocol.UpdatesInstall, progress func(string)) (*protocol.UpdatesInstallResult, error) {
-	var args []string
-	for _, id := range req.IDs {
-		id = strings.TrimSpace(strings.TrimPrefix(id, "wua:"))
-		if strings.HasPrefix(id, "winget:") {
-			// winget upgrades are reported as extras but installing them
-			// from the SYSTEM account is unreliable; refuse rather than
-			// pretend. The scan labels them clearly.
-			return nil, errors.New("winget upgrades cannot be installed from the agent service account")
+	args, skipped := winSplitInstallIDs(req.IDs)
+	for id, why := range skipped {
+		if progress != nil {
+			progress("skipping " + id + ": " + why)
 		}
-		if !winIsUpdateID(id) {
-			return nil, fmt.Errorf("invalid update id %q", id)
-		}
-		args = append(args, id)
+	}
+	if len(req.IDs) > 0 && len(args) == 0 {
+		// An empty argument list means "every applicable update" to the
+		// install script, so a batch whose ids were all skipped must not run
+		// it - that would install the whole queue nobody asked for.
+		return &protocol.UpdatesInstallResult{Failed: skipped}, nil
 	}
 	// One servicing operation at a time on this device. A baseline `package`
 	// or `windows_feature` remediation takes the same mutex and backs off
@@ -100,6 +110,12 @@ func installUpdates(ctx context.Context, req protocol.UpdatesInstall, progress f
 		return nil, parseErr
 	}
 	winMarkUnreported(res, args)
+	for id, why := range skipped {
+		if res.Failed == nil {
+			res.Failed = map[string]string{}
+		}
+		res.Failed[id] = why
+	}
 	if len(other) > 0 {
 		if res.Log != "" {
 			res.Log += "\n"
@@ -175,40 +191,46 @@ func powershellArgs(script string, args []string) []string {
 	return append([]string{"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script}, args...)
 }
 
-// scanWinget appends winget upgrades as extra items. winget resolved from
+// scanWinget returns winget upgrades as extra items. winget resolved from
 // the SYSTEM account is the exception, not the rule (its App Installer
-// package registers per-user), so an absent or failing winget is silent:
-// the return is simply empty.
-func scanWinget(ctx context.Context) []protocol.Update {
+// package registers per-user): when it is not there at all, winget is simply
+// not a source on this device and that is not an error.
+//
+// A winget that IS there and then fails - a timeout, a crash, an unreachable
+// source - is reported, because an empty list is indistinguishable from
+// "every application is up to date" and the server acts on that difference.
+func scanWinget(ctx context.Context) ([]protocol.Update, error) {
 	exe, err := resolveWinget()
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	wctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	// --include-unknown lists apps whose installed version winget cannot
 	// read; --accept-source-agreements avoids a first-run prompt that would
 	// otherwise hang a non-interactive run.
-	stdout, _, err := runHidden(wctx, exe, "upgrade", "--include-unknown", "--accept-source-agreements", "--disable-interactivity")
+	stdout, stderr, err := runHidden(wctx, exe, "upgrade", "--include-unknown", "--accept-source-agreements", "--disable-interactivity")
 	if err != nil && strings.TrimSpace(stdout) == "" {
-		return nil
+		return nil, errors.New("winget upgrade failed: " + winFirstLine(stderr, err.Error()))
 	}
-	return winParseWingetUpgrade(stdout)
+	return winParseWingetUpgrade(stdout), nil
 }
 
-// resolveWinget finds winget.exe. It is usually not on the SYSTEM PATH; the
-// per-machine WindowsApps alias is checked directly before giving up.
+// resolveWinget finds winget.exe. It is usually not on the SYSTEM PATH, and
+// PATH is not trusted for it either (the agent runs as LocalSystem): the
+// per-machine WindowsApps alias is checked first, and a PATH hit is only
+// accepted from an administrator-only root.
 func resolveWinget() (string, error) {
-	if p, err := exec.LookPath("winget.exe"); err == nil {
-		return p, nil
-	}
-	for _, base := range []string{os.Getenv("ProgramFiles"), os.Getenv("ProgramW6432")} {
+	for _, base := range []string{os.Getenv("ProgramW6432"), os.Getenv("ProgramFiles")} {
 		if base == "" {
 			continue
 		}
 		if matches, _ := filepath.Glob(filepath.Join(base, "WindowsApps", "Microsoft.DesktopAppInstaller_*", "winget.exe")); len(matches) > 0 {
 			return matches[len(matches)-1], nil
 		}
+	}
+	if p, err := exec.LookPath("winget.exe"); err == nil && winTrustedExe(p, winTrustedRoots()) {
+		return p, nil
 	}
 	return "", errNotFoundWinget
 }
