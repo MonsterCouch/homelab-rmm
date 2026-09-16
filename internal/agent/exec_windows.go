@@ -70,17 +70,26 @@ func (o *outputBuffer) String() string {
 //     shutdown.exe, taskkill.exe, query.exe and Windows PowerShell 5.1 keep
 //     writing when their stdout is a pipe rather than a console.
 //   - cpACP (CP_ACP, the system ANSI code page, 1252 on a Western install)
-//     is what wevtutil.exe writes once its output is redirected: it renders
-//     the event XML through the ANSI console API, so an event message with
-//     an accented character comes back in ANSI, and decoding it as OEM turns
-//     "ä" into "õ" (and worse for Cyrillic or Greek installs).
+//     is what wevtutil.exe writes once its output is redirected unless it is
+//     told otherwise: it renders the event XML through the ANSI console API,
+//     so an event message with an accented character comes back in ANSI, and
+//     decoding it as OEM turns "ä" into "õ" (and worse for Cyrillic or Greek
+//     installs).
 //
 // Passing the wrong one does not fail loudly - it silently mangles exactly
 // the characters an operator is most likely to complain about - so every
 // capture names its code page.
+//
+// Neither code page can carry a character it has no room for: whatever the
+// ANSI code page cannot represent is already "?" in the pipe. cpUTF16LE is
+// not a Windows code page at all (real ones are 0..65535); it marks a
+// capture from a tool asked to write Unicode instead, which is the only way
+// Greek, Cyrillic or CJK event text survives - wevtutil /uni:true, see
+// queryEventLog.
 const (
-	cpACP = 0
-	cpOEM = 1
+	cpACP     = 0
+	cpOEM     = 1
+	cpUTF16LE = 1 << 31
 )
 
 // winDecodeOutput turns a tool's raw stdout into a Go string. Output that is
@@ -89,6 +98,11 @@ const (
 // event-log message or an update title reaches the operator instead of
 // turning into U+FFFD in the JSON reply.
 func winDecodeOutput(b []byte, cp uint32) string {
+	if cp == cpUTF16LE {
+		// Before the UTF-8 check: an ASCII-only UTF-16LE buffer is "valid
+		// UTF-8" made of NUL-separated letters.
+		return winDecodeUTF16LE(b)
+	}
 	if len(b) == 0 || utf8.Valid(b) {
 		return string(b)
 	}
@@ -133,16 +147,16 @@ func systemExe(name string) string {
 // killing the whole process tree. err is non-nil when the command could not
 // run, was killed by ctx, or exited non-zero; stdout and stderr are returned
 // in every case so callers can read a tool's own error text. Non-UTF-8
-// output is read as OEM; a tool that writes ANSI instead (wevtutil) uses
-// runHiddenCP with cpACP.
+// output is read as OEM; a tool that writes ANSI instead uses runHiddenCP
+// with cpACP, and one told to write UTF-16 (wevtutil) uses runHiddenUTF16.
 func runHidden(ctx context.Context, name string, args ...string) (stdout, stderr string, err error) {
 	return runHiddenCP(ctx, cpOEM, nil, name, args...)
 }
 
-// runHiddenACP is runHidden for a tool whose redirected output is in the
-// ANSI code page rather than the OEM one.
-func runHiddenACP(ctx context.Context, name string, args ...string) (stdout, stderr string, err error) {
-	return runHiddenCP(ctx, cpACP, nil, name, args...)
+// runHiddenUTF16 is runHidden for a tool told to write UTF-16LE (wevtutil
+// /uni:true), so its text is not folded into a code page on the way out.
+func runHiddenUTF16(ctx context.Context, name string, args ...string) (stdout, stderr string, err error) {
+	return runHiddenCP(ctx, cpUTF16LE, nil, name, args...)
 }
 
 // runHiddenLines is runHidden for a long-running child whose stdout is worth

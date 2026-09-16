@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"unicode/utf16"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
 )
@@ -212,6 +213,113 @@ func TestWinParseWevtutilXML(t *testing.T) {
 	broken := wevtSample + "\n<Event><System><Level>oops</Lev"
 	if es, err := winParseWevtutilXML([]byte(broken)); err != nil || len(es) != 3 {
 		t.Errorf("broken tail should keep the 3 good events: len=%d err=%v", len(es), err)
+	}
+}
+
+// utf16BOM is the byte-order mark wevtutil puts at the head of a /uni:true
+// capture (written as a rune, because Go source may not carry a literal one
+// anywhere but the first byte of a file).
+var utf16BOM = string(rune(0xFEFF))
+
+// utf16Bytes encodes s the way a tool asked for Unicode output writes it.
+func utf16Bytes(s string) []byte {
+	var b []byte
+	for _, u := range utf16.Encode([]rune(s)) {
+		b = append(b, byte(u), byte(u>>8))
+	}
+	return b
+}
+
+// evt-01: wevtutil writes the console code page unless it is told otherwise,
+// which folds every character the code page cannot hold into "?" - Ω, 日本語,
+// Привет, ✓ - before the agent reads a byte. /uni:true makes it write
+// UTF-16LE instead, and this is the decoder for that stream.
+func TestWinDecodeUTF16LE(t *testing.T) {
+	const text = "<Event>ünïcödé-Ω-日本語-Привет-✓-🙂</Event>"
+	if got := winDecodeUTF16LE(utf16Bytes(utf16BOM + text)); got != text {
+		t.Errorf("with BOM = %q", got)
+	}
+	// stderr comes back without a BOM
+	if got := winDecodeUTF16LE(utf16Bytes(text)); got != text {
+		t.Errorf("without BOM = %q", got)
+	}
+	// a capture cut in half by the output cap loses the half code unit, not
+	// the characters before it
+	odd := append(utf16Bytes(utf16BOM+"abc"), 0x41)
+	if got := winDecodeUTF16LE(odd); got != "abc" {
+		t.Errorf("odd trailing byte = %q", got)
+	}
+	for _, empty := range [][]byte{nil, {}, {0x41}} {
+		if got := winDecodeUTF16LE(empty); got != "" {
+			t.Errorf("%v decoded to %q", empty, got)
+		}
+	}
+	// the exact failure the live run caught: the same text decoded as a
+	// single-byte code page would already be "?" by now
+	if !strings.Contains(winDecodeUTF16LE(utf16Bytes("日本語")), "日本語") {
+		t.Error("CJK did not survive the decode")
+	}
+}
+
+// evt-02: wevtutil's RenderedXml format omits any record whose provider
+// message cannot be resolved - it warns on stderr and still exits 0 - so the
+// raw XML pass is merged back in and those records keep their provider, id,
+// level and time.
+func TestWinMergeRenderedEventsKeepsUnrenderableRecords(t *testing.T) {
+	raw, err := winParseWevtutilRecords([]byte(wevtSample))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 3 || raw[0].RecordID != "1234" || raw[1].RecordID != "1233" || raw[2].RecordID != "" {
+		t.Fatalf("record ids = %+v", raw)
+	}
+	// The rendered pass dropped everything but the first record.
+	rendered, err := winParseWevtutilRecords([]byte(strings.Split(wevtSample, "\n")[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := winMergeRenderedEvents(raw, rendered)
+	if len(got) != 3 {
+		t.Fatalf("merge lost a record: %d entries", len(got))
+	}
+	if !strings.HasPrefix(got[0].Message, "The operating system started") {
+		t.Errorf("the rendered message was not kept: %q", got[0].Message)
+	}
+	if got[1].EventID != 7000 || got[1].Level != "error" || got[1].Source != "Service Control Manager" || got[1].TS == 0 {
+		t.Errorf("the unrenderable record lost its identity: %+v", got[1])
+	}
+	// A record the rendered pass saw but the (later) raw pass no longer
+	// covers is kept rather than dropped.
+	got = winMergeRenderedEvents(raw[1:], rendered)
+	if len(got) != 3 || !strings.HasPrefix(got[2].Message, "The operating system started") {
+		t.Errorf("a record that slid out of the second window was lost: %+v", got)
+	}
+}
+
+// evt-04: the 8000-character cap is a display cap. Applying it before the
+// search made anything past character 8000 of a long message - a 9 KB
+// command line, a policy dump - unfindable as well as unreadable.
+func TestEventMessageTruncationIsADisplayCap(t *testing.T) {
+	long := strings.Repeat("x", wevtMaxMessage+400) + "-winval-long-end"
+	sample := `<Event><System><Provider Name='PS'/><EventID>403</EventID><Level>4</Level><TimeCreated SystemTime='2026-09-15T03:34:12.0000000Z'/><EventRecordID>9</EventRecordID><Channel>Windows PowerShell</Channel></System><EventData><Data Name='Host'>` + long + `</Data></EventData></Event>`
+	entries, err := winParseWevtutilXML([]byte(sample))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("parse: %d %v", len(entries), err)
+	}
+	if !strings.HasSuffix(entries[0].Message, "-winval-long-end") {
+		t.Fatal("the parser must keep the whole message for the search")
+	}
+	if got := winFilterEventLog(entries, "winval-long-end"); len(got) != 1 {
+		t.Fatal("a search past the display cap found nothing")
+	}
+	out := winTruncateEventMessages(entries)
+	if r := []rune(out[0].Message); len(r) != wevtMaxMessage+1 || r[wevtMaxMessage] != '…' {
+		t.Errorf("message went out at %d runes", len(r))
+	}
+	// a short message is untouched
+	short := []protocol.EventLogEntry{{Message: "fine"}}
+	if got := winTruncateEventMessages(short); got[0].Message != "fine" {
+		t.Errorf("short message = %q", got[0].Message)
 	}
 }
 

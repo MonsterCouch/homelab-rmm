@@ -51,7 +51,7 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("POST /api/agents/{id}/processes/kill", s.requireWrite(s.handleProcKill))
 	api.HandleFunc("GET /api/agents/{id}/services", s.handleServices)
 	api.HandleFunc("POST /api/agents/{id}/services/action", s.requireWrite(s.handleServiceAction))
-	api.HandleFunc("GET /api/agents/{id}/eventlog", s.handleEventLog)
+	api.HandleFunc("GET /api/agents/{id}/eventlog", s.guardEventLog(s.handleEventLog))
 	api.HandleFunc("GET /api/agents/{id}/fs", s.handleFsList)
 	api.HandleFunc("GET /api/agents/{id}/fs/download", s.requireWrite(s.handleFsDownload))
 	api.HandleFunc("POST /api/agents/{id}/fs/upload", s.requireWrite(s.handleFsUpload))
@@ -149,6 +149,49 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("/", s.staticHandler())
 
 	return logRequests(secureHeaders(mux))
+}
+
+// sensitiveEventLogChannel reports whether a channel name is an audit trail
+// rather than an ordinary log. The Security channel is the device's own
+// audit record (logons, and 4798-style enumerations with account names and
+// SIDs) and the PowerShell channels carry whole command lines and script
+// blocks, i.e. anything ever typed into a script. Reading one of those off a
+// device gives up more than downloading a file from it, which has always
+// been requireWrite and audited. Everything else - System, Application, a
+// unit's journal - stays a plain read a viewer may do.
+//
+// The comparison is case- and space-insensitive because the channel name is
+// resolved case-insensitively on both agents ("security" reaches the same
+// log as "Security").
+func sensitiveEventLogChannel(log string) bool {
+	l := strings.ToLower(strings.TrimSpace(log))
+	// "auth" is the Linux agent's name for the same selector.
+	return l == "security" || l == "auth" || strings.Contains(l, "powershell")
+}
+
+// guardEventLog gates and records the sensitive channels of
+// GET /api/agents/{id}/eventlog. The decision is per request, not per route,
+// because the channel is a query parameter. The audit row is written before
+// the device is asked: the operator asked for the Security log either way,
+// and a read that fails because the device is offline is still worth a line.
+func (s *Server) guardEventLog(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if !sensitiveEventLogChannel(q.Get("log")) {
+			next(w, r)
+			return
+		}
+		if !userFrom(r.Context()).CanWrite() {
+			writeErr(w, http.StatusForbidden, "read-only account")
+			return
+		}
+		s.audit(r, "eventlog.query", r.PathValue("id"), map[string]string{
+			"log":    q.Get("log"),
+			"level":  q.Get("level"),
+			"search": q.Get("search"),
+		})
+		next(w, r)
+	}
 }
 
 func secureHeaders(next http.Handler) http.Handler {

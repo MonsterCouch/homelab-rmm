@@ -319,6 +319,15 @@ func (e *alertEngine) inventory(agentID string, inv *protocol.Inventory) {
 	}
 }
 
+// event matches rules of kind "event" against the events an agent EMITS.
+// That is a much narrower feed than the name suggests: the only producer is
+// the agent's patch installer (`c.event("patch", …)` around installUpdates),
+// so today an `event` rule can only ever match update-install output. The
+// Windows Event Log and journald are pull-only - `eventlog.query` answers a
+// console request and nothing watches either of them - so no log record
+// reaches this function on any platform. docs/API.md says so where the kind
+// is documented; widening it needs a feed to widen it with, and a dedupe key
+// that carries the channel and event id rather than the constant kind.
 func (e *alertEngine) event(agentID string, ev *protocol.Event) {
 	a, err := e.s.db.GetAgent(agentID)
 	if err != nil {

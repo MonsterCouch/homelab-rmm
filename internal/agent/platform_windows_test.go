@@ -5,6 +5,7 @@ package agent
 import (
 	"context"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -18,15 +19,60 @@ import (
 // miss until it ran on a real device.
 
 func TestWevtutilArgs(t *testing.T) {
-	got := wevtutilArgs("System", 200, "*[System[(Level=1 or Level=2)]]")
-	want := []string{"qe", "System", "/c:200", "/rd:true", "/f:RenderedXml", "/q:*[System[(Level=1 or Level=2)]]"}
+	got := wevtutilArgs("System", 200, "*[System[(Level=1 or Level=2)]]", wevtFormatRendered)
+	want := []string{"qe", "System", "/c:200", "/rd:true", "/f:RenderedXml", "/uni:true", "/q:*[System[(Level=1 or Level=2)]]"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("with filter = %v", got)
 	}
-	got = wevtutilArgs("Application", 50, "")
-	want = []string{"qe", "Application", "/c:50", "/rd:true", "/f:RenderedXml"}
+	got = wevtutilArgs("Application", 50, "", wevtFormatRaw)
+	want = []string{"qe", "Application", "/c:50", "/rd:true", "/f:XML", "/uni:true"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("no filter = %v", got)
+	}
+	// evt-01: without /uni:true wevtutil writes the console code page and
+	// every character it cannot hold is "?" before the agent reads a byte.
+	for _, format := range []string{wevtFormatRendered, wevtFormatRaw} {
+		if !slices.Contains(wevtutilArgs("System", 1, "", format), "/uni:true") {
+			t.Errorf("%s query must ask for Unicode output", format)
+		}
+	}
+}
+
+// evt-03: the search window is a property of the query, not of the page size
+// the operator happens to have selected - a match must not disappear because
+// the limit dropdown moved from 50 to 20.
+func TestWinEventLogFetchIsIndependentOfLimit(t *testing.T) {
+	for _, limit := range []int{1, 20, 50, 1000} {
+		if got := winEventLogFetch(limit, "boot"); got != eventLogSearchWindow {
+			t.Errorf("search window at limit %d = %d, want %d", limit, got, eventLogSearchWindow)
+		}
+		if got := winEventLogFetch(limit, "  "); got != limit {
+			t.Errorf("no search at limit %d fetched %d", limit, got)
+		}
+	}
+	// A page bigger than the window still reads the whole page.
+	if got := winEventLogFetch(eventLogMaxLimit+1000, "boot"); got != eventLogMaxLimit+1000 {
+		t.Errorf("oversized page = %d", got)
+	}
+}
+
+// evt-07: the caps are a documented contract, and the same request must not
+// read five times more of the log on Windows than on Linux.
+func TestWinEventLogLimit(t *testing.T) {
+	if eventLogDefaultLimit != 200 || eventLogMaxLimit != 5000 {
+		t.Fatalf("the documented caps drifted: default=%d max=%d", eventLogDefaultLimit, eventLogMaxLimit)
+	}
+	if got := winEventLogLimit(0); got != eventLogDefaultLimit {
+		t.Errorf("unset limit = %d", got)
+	}
+	if got := winEventLogLimit(-5); got != eventLogDefaultLimit {
+		t.Errorf("negative limit = %d", got)
+	}
+	if got := winEventLogLimit(100_000); got != eventLogMaxLimit {
+		t.Errorf("huge limit = %d", got)
+	}
+	if got := winEventLogLimit(37); got != 37 {
+		t.Errorf("ordinary limit = %d", got)
 	}
 }
 
@@ -104,6 +150,31 @@ func TestWinDecodeOutput(t *testing.T) {
 	}
 	if got := winDecodeOutput([]byte{0x82}, cpOEM); got != "é" {
 		t.Errorf("OEM 0x82 = %q, want é", got)
+	}
+}
+
+// evt-01: a capture marked cpUTF16LE is decoded as UTF-16, whatever the
+// system code page is. The branch has to come before the UTF-8 shortcut,
+// because an ASCII-only UTF-16 buffer is valid UTF-8 made of NUL-separated
+// letters.
+func TestWinDecodeOutputUTF16(t *testing.T) {
+	if cpUTF16LE <= 65535 {
+		t.Fatalf("cpUTF16LE = %d collides with a real Windows code page", cpUTF16LE)
+	}
+	const text = "<Event>Ω-日本語-Привет-✓</Event>"
+	raw := utf16Bytes(utf16BOM + text)
+	if got := winDecodeOutput(raw, cpUTF16LE); got != text {
+		t.Errorf("utf-16 capture = %q", got)
+	}
+	if got := winDecodeOutput(utf16Bytes("plain ascii\r\n"), cpUTF16LE); got != "plain ascii\r\n" {
+		t.Errorf("ascii utf-16 capture = %q", got)
+	}
+	b := &outputBuffer{limit: 1 << 20, cp: cpUTF16LE}
+	if _, err := b.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.String(); got != text {
+		t.Errorf("buffer = %q", got)
 	}
 }
 
