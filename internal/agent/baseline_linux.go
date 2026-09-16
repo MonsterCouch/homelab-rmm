@@ -124,6 +124,7 @@ func lnxServiceCheck(ctx context.Context, c *checkCtx) kindResult {
 	}
 	unit := lnxUnitName(p.Name)
 	want := lnxServiceWant(p)
+	c.setExpected(want)
 	if !validUnitName(unit) {
 		return blError(want, "refused", fmt.Sprintf("%q is not a valid systemd unit name", p.Name))
 	}
@@ -321,6 +322,7 @@ func lnxPackageCheck(ctx context.Context, c *checkCtx) kindResult {
 	if p.MinVersion != "" {
 		want = "present >= " + p.MinVersion
 	}
+	c.setExpected(want)
 	present, version, err := lnxPkgInstalled(ctx, p.Name)
 	if err != nil {
 		return blError(want, "unknown", err.Error())
@@ -477,6 +479,7 @@ func lnxGroupCheck(ctx context.Context, c *checkCtx) kindResult {
 		return blError("valid parameters", "invalid parameters", err.Error())
 	}
 	want := groupExpectedLabel(p)
+	c.setExpected(want)
 	members, primary, err := lnxGroupMembers(ctx, p.Group)
 	if err != nil {
 		return blError(want, "unknown", err.Error())
@@ -541,6 +544,7 @@ func lnxFirewallCheck(ctx context.Context, c *checkCtx) kindResult {
 		return blError("valid parameters", "invalid parameters", err.Error())
 	}
 	want := "firewall " + onOff(p.Want())
+	c.setExpected(want)
 	switch lnxFirewallTool() {
 	case "ufw":
 		out, stderr, _, err := runCmd(ctx, "ufw", "status")
@@ -596,6 +600,7 @@ func lnxTimeSyncCheck(ctx context.Context, c *checkCtx) kindResult {
 		return blError("valid parameters", "invalid parameters", err.Error())
 	}
 	want := "time sync " + onOff(p.Want())
+	c.setExpected(want)
 	if !hasCmd("timedatectl") {
 		return blSkip("timedatectl is not available")
 	}
@@ -670,6 +675,7 @@ func lnxSysctlCheck(ctx context.Context, c *checkCtx) kindResult {
 		return blError("valid parameters", "invalid parameters", err.Error())
 	}
 	want := p.Key + " = " + strings.TrimSpace(p.Value)
+	c.setExpected(want)
 	b, err := os.ReadFile(lnxSysctlPath(p.Key))
 	if err != nil {
 		return blError(want, "unknown", fmt.Sprintf("%s is not readable on this device: %v", lnxSysctlPath(p.Key), err))

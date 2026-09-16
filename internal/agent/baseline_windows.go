@@ -697,6 +697,7 @@ func winFeatureCheck(ctx context.Context, c *checkCtx) kindResult {
 		return blError("valid parameters", "invalid parameters", err.Error())
 	}
 	want := p.Name + " " + p.State
+	c.setExpected(want)
 	stdout, stderr, err := runPowerShellScript(ctx, winFeatureQueryScript, p.Name)
 	state, ok := blWinFeatureState(stdout)
 	if !ok {

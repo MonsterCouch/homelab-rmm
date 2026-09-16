@@ -314,7 +314,11 @@ function KindForm({ kind, params, setP }: { kind: BaselineKind; params: Baseline
       return (
         <>
           <div className="form-row">
-            <Field label="Package name or winget id" htmlFor="p-name">
+            <Field
+              label="Package name, winget id or program name"
+              htmlFor="p-name"
+              hint="On Windows the name Add/Remove Programs shows works too: GitHub CLI, 7-Zip 26.03 (x64)."
+            >
               <input id="p-name" value={str(params, 'name')} onChange={(e) => setP({ name: e.target.value })} />
             </Field>
             <Field label="State" htmlFor="p-state">
