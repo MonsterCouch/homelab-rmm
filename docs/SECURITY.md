@@ -258,7 +258,9 @@ Verify a fingerprint out of band before pasting it; it is the trust anchor for t
 `Net.WebClient` `DownloadString` piped into `iex`, with certificate validation turned off first —
 is the shape of a dropper, and AMSI-aware scanners refuse it on sight (Bitdefender:
 `ScriptContainedMaliciousContent`, before a line runs). The documented path is therefore the
-two-step one: `Invoke-WebRequest -OutFile` the script, **read it**, then run it. That is strictly
+two-step one: `Invoke-WebRequest -OutFile` the script, **read it**, then run it with
+`powershell -NoProfile -ExecutionPolicy Bypass -File` (the default `Restricted` execution policy
+refuses `& script.ps1`, so the bare form fails on a fresh client). That is strictly
 better for review as well — the one-liner executes a script nobody looked at.
 
 Expect the agent binary to be questioned too: the releases carry no Authenticode signature, so

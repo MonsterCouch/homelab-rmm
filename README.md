@@ -412,8 +412,9 @@ stopping the service, putting the files back and starting it. More in
   things can be stopped:
   - *The one-liner itself* (`ScriptContainedMaliciousContent`, Bitdefender and friends): the
     `DownloadString` + `iex` shape is what trips AMSI, not the script. Use the four-line form in
-    [Quick start](#quick-start-windows-server) — `Invoke-WebRequest -OutFile`, then run the
-    `.ps1` — which also lets you read the script first.
+    [Quick start](#quick-start-windows-server) — `Invoke-WebRequest -OutFile`, then run the `.ps1` with
+    `powershell -NoProfile -ExecutionPolicy Bypass -File` (a default `Restricted` execution policy
+    refuses `& script.ps1`) — which also lets you read the script first.
   - *The downloaded `rmm-agent.exe`* (SmartScreen, "unrecognised app", a quarantine): the release
     binaries carry no Authenticode signature, so reputation-based blocks are normal on a fresh
     machine. Add an exclusion for `C:\Program Files\HomelabRMM` and
