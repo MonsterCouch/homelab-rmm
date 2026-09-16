@@ -26,7 +26,10 @@ self-signed setup is safe.
   call a webhook.
 - **Patch management** — Windows Update (WUA) on Windows; apt, dnf/yum, pacman and zypper on
   Linux; scan, approve, ignore, install with live log, reboot policy, scheduled scan and install
-  policies with approved / all / security-only modes.
+  policies with approved / all / security-only modes. A Windows scan also lists `winget`
+  application upgrades and the device's WUA install history; winget rows are **informational**
+  (the agent service account cannot install them, so they are left out of bulk approvals and
+  install batches) — see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#patches-patchesgo).
 - **Baselines** — desired state with drift detection and self-healing: a named list of checks
   (service, package, registry, file, command, local group members, firewall, time sync, sysctl,
   Windows feature, pending reboot, disk free) assigned by group, tag or OS. Agents evaluate on

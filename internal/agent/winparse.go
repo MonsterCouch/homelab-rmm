@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -675,11 +676,20 @@ type wuaScanUpdate struct {
 	Mandatory      bool            `json:"mandatory"`
 }
 
+// wuaHistoryItem is one IUpdateSearcher::QueryHistory entry - what the
+// device has actually installed. A history entry carries no KB list and no
+// categories, so the KB number has to come out of the title.
+type wuaHistoryItem struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+}
+
 type wuaScanOutput struct {
-	Updates       wuaList[wuaScanUpdate] `json:"updates"`
-	RebootPending bool                   `json:"reboot_pending"`
-	Error         string                 `json:"error"`
-	ErrorHResult  string                 `json:"error_hresult"`
+	Updates       wuaList[wuaScanUpdate]  `json:"updates"`
+	History       wuaList[wuaHistoryItem] `json:"history"`
+	RebootPending bool                    `json:"reboot_pending"`
+	Error         string                  `json:"error"`
+	ErrorHResult  string                  `json:"error_hresult"`
 }
 
 type wuaInstallItem struct {
@@ -777,6 +787,30 @@ func winParseWUAScan(result string) (*protocol.UpdatesScanResult, error) {
 			}
 		}
 		res.Updates = append(res.Updates, up)
+	}
+	// Installed history. WUA is the only record of what the device already
+	// has: without it the console's Installed tab stays empty until a pending
+	// update happens to vanish from a later scan. An id that is still pending
+	// wins over its history entry - a cumulative update that installed and is
+	// waiting for a reboot is offered again, and must not be reported as done.
+	seen := map[string]bool{}
+	for _, u := range res.Updates {
+		seen[strings.ToLower(u.ID)] = true
+	}
+	for _, h := range out.History {
+		id := strings.TrimSpace(h.ID)
+		if id == "" || seen[strings.ToLower(id)] {
+			continue
+		}
+		seen[strings.ToLower(id)] = true
+		title := strings.TrimSpace(h.Title)
+		res.Updates = append(res.Updates, protocol.Update{
+			ID:        id,
+			Title:     title,
+			KB:        winKBFromTitle(title),
+			Installed: true,
+			Source:    "wua",
+		})
 	}
 	sort.SliceStable(res.Updates, func(i, j int) bool {
 		return strings.ToLower(res.Updates[i].Title) < strings.ToLower(res.Updates[j].Title)
@@ -912,6 +946,103 @@ func winWUAResultText(code int, hresult int64, errText string) string {
 var winUpdateIDRE = regexp.MustCompile(`^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$`)
 
 func winIsUpdateID(id string) bool { return winUpdateIDRE.MatchString(id) }
+
+// winKBFromTitle pulls the KB number out of an update title. A WUA history
+// entry has no KBArticleIDs, so its title is the only place the number
+// appears ("2026-09 Security Update (KB5129195) (26200.9457)").
+var winKBTitleRE = regexp.MustCompile(`(?i)\bKB(\d{5,10})\b`)
+
+func winKBFromTitle(title string) string {
+	if m := winKBTitleRE.FindStringSubmatch(title); m != nil {
+		return "KB" + m[1]
+	}
+	return ""
+}
+
+// winSplitInstallIDs partitions an install batch into the update GUIDs the
+// WUA install script can take and the ids this agent cannot install, each
+// with the reason the operator gets back as a per-id failure.
+//
+// Every id used to be validated up front and the FIRST offender aborted the
+// whole request, so a single winget row in the batch - and a Windows device's
+// patch list is mostly winget rows - marked every genuine Windows update in
+// it failed with the winget message, without installing anything.
+func winSplitInstallIDs(ids []string) (guids []string, skipped map[string]string) {
+	skip := func(id, reason string) {
+		if skipped == nil {
+			skipped = map[string]string{}
+		}
+		skipped[id] = reason
+	}
+	for _, raw := range ids {
+		id := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(raw), "wua:"))
+		switch {
+		case strings.HasPrefix(id, "winget:"):
+			// winget upgrades are reported as extras but installing them from
+			// the SYSTEM account is unreliable; refuse this one id rather than
+			// pretend, and let the rest of the batch through.
+			skip(raw, "winget upgrades cannot be installed from the agent service account")
+		case winIsUpdateID(id):
+			guids = append(guids, id)
+		default:
+			skip(raw, fmt.Sprintf("invalid update id %q", id))
+		}
+	}
+	return guids, skipped
+}
+
+// winJoinScanError appends a second problem to a scan's error text without
+// losing the first: the Windows Update half and the winget half of a scan
+// fail independently, and the server only concludes "no longer reported =>
+// installed" for a scan that reported no error at all.
+func winJoinScanError(existing, add string) string {
+	existing, add = strings.TrimSpace(existing), strings.TrimSpace(add)
+	switch {
+	case add == "":
+		return existing
+	case existing == "":
+		return add
+	default:
+		return existing + "; " + add
+	}
+}
+
+// winUnderRoot reports whether path sits inside root, comparing
+// case-insensitively and treating / and \ alike, because Windows does.
+func winUnderRoot(path, root string) bool {
+	norm := func(s string) string {
+		return strings.TrimRight(strings.ToLower(strings.ReplaceAll(strings.TrimSpace(s), "/", `\`)), `\`)
+	}
+	p, r := norm(path), norm(root)
+	if p == "" || r == "" {
+		return false
+	}
+	return strings.HasPrefix(p, r+`\`)
+}
+
+// winTrustedExe reports whether an executable resolved through PATH is safe
+// for the agent to run: it must live under one of roots (%SystemRoot%,
+// %ProgramFiles%, %ProgramW6432%), which only administrators can write. The
+// agent runs as LocalSystem, so a writable directory that made it onto PATH
+// must never be able to shadow a tool - the same rule systemExe applies to
+// System32 (exec_windows.go).
+func winTrustedExe(path string, roots []string) bool {
+	for _, root := range roots {
+		if winUnderRoot(path, root) {
+			return true
+		}
+	}
+	return false
+}
+
+// winTrustedRoots is the administrator-only root list for winTrustedExe.
+func winTrustedRoots() []string {
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		root = `C:\Windows`
+	}
+	return []string{root, os.Getenv("ProgramW6432"), os.Getenv("ProgramFiles"), os.Getenv("ProgramFiles(x86)")}
+}
 
 // ---- winget ----
 

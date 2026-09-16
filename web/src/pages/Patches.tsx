@@ -128,7 +128,16 @@ function PatchList() {
     { key: 'kb', header: 'KB', sort: (p) => p.kb, render: (p) => <span className="mono small">{p.kb || '—'}</span> },
     { key: 'sev', header: 'Severity', sort: (p) => p.severity, render: (p) => (p.severity ? <Chip tone={sevTone(p.severity)}>{p.severity}</Chip> : <span className="faint">—</span>) },
     { key: 'size', header: 'Size', align: 'right', sort: (p) => p.size, render: (p) => (p.size ? bytes(p.size) : <span className="faint">—</span>) },
-    { key: 'src', header: 'Source', sort: (p) => p.source, render: (p) => <span className="muted">{p.source}</span> },
+    {
+      key: 'src',
+      header: 'Source',
+      sort: (p) => p.source,
+      render: (p) => (
+        <span className="muted" title={p.source === 'winget' ? 'Application upgrade reported by winget — informational: the agent service account cannot install it' : undefined}>
+          {p.source}
+        </span>
+      ),
+    },
     { key: 'reboot', header: 'Reboot', sort: (p) => (p.reboot_required ? 0 : 1), csv: (p) => (p.reboot_required ? 'yes' : 'no'), render: (p) => (p.reboot_required ? <Chip tone="warn">yes</Chip> : <span className="faint">no</span>) },
     {
       key: 'seen',
