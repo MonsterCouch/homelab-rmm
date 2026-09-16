@@ -330,7 +330,7 @@ slice in `db.go`, applied in order and tracked in `PRAGMA user_version`.
 | `tasks` | scheduled/manual jobs | `kind`, `script_id`, `targets` (JSON), `schedule` (cron), `options` (JSON), `next_run` |
 | `automations` | event → action | `trigger`, `filter` (JSON), `action`, `action_params` (JSON) |
 | `alert_rules`, `alerts` | rules and open/acked/resolved alerts | `kind`, `params` (JSON), `severity`, `dedupe_key`, `notified` |
-| `patches` | per-device update inventory, `(agent_id, patch_id)` | `status` (`available`, `approved`, `installing`, `installed`, `failed`, `ignored`), `severity` (listed worst-first by an explicit rank, not by the TEXT column's own order), `categories` (always a JSON array), `source`, `downloaded`, `description` |
+| `patches` | per-device update inventory, `(agent_id, patch_id)` | `status` (`available`, `approved`, `installing`, `installed`, `failed`, `ignored`), `severity` (listed worst-first by an explicit rank, not by the TEXT column's own order; Windows reports the MSRC ratings, apt/dnf/zypper report `security`, which ranks with `Important` so a distro's security updates are never the rows a `LIMIT` drops), `categories` (always a JSON array), `source`, `downloaded`, `description` |
 | `patch_policies` | scan/install schedules | `scan_schedule`, `install_schedule`, `mode`, `reboot` |
 | `audit` | who did what | `user`, `ip`, `action`, `target`, `details` |
 | `agent_events` | unsolicited agent events (service changes, patch progress, log lines) | `kind`, `message`, `fields` |

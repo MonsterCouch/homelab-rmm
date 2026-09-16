@@ -92,7 +92,9 @@ func TestPatchStatusAcceptsBothKeySpellingsAndRejectsUnmatched(t *testing.T) {
 func TestListPatchesOrdersSeverityWorstFirst(t *testing.T) {
 	s, _, _ := newTestServer(t)
 	testAgentRow(t, s, "dev1")
-	for _, sev := range []string{"Unspecified", "Low", "Critical", "", "Moderate", "Important"} {
+	// Critical/Important/Moderate/Low are Windows Update's ratings;
+	// "security" is the only severity apt/dnf/zypper ever set.
+	for _, sev := range []string{"Unspecified", "Low", "Critical", "", "Moderate", "Important", "security"} {
 		insertPatch(t, s, "dev1", "p-"+sev, "wua", sev, "available")
 	}
 	ps, err := s.db.ListPatches("dev1", "", 100)
@@ -103,10 +105,42 @@ func TestListPatchesOrdersSeverityWorstFirst(t *testing.T) {
 	for _, p := range ps {
 		got = append(got, p.Severity)
 	}
-	want := []string{"Critical", "Important", "Moderate", "Low"}
+	// "security" ranks with Important, and the tie breaks on title
+	// ("update p-Important" < "update p-security").
+	want := []string{"Critical", "Important", "security", "Moderate", "Low"}
 	for i, w := range want {
 		if i >= len(got) || got[i] != w {
 			t.Fatalf("severity order = %v, want it to start %v (a LIMIT must truncate the least important rows, not the Critical ones)", got, want)
+		}
+	}
+}
+
+// A Linux device reports "security" or nothing at all, so that one value is
+// the whole ordering: if it lands in the same bucket as the unrated rows the
+// 2000-row LIMIT in handleListPatches/handleAgentPatches cuts security
+// updates as readily as anything else.
+func TestListPatchesOrdersLinuxSecurityFirst(t *testing.T) {
+	s, _, _ := newTestServer(t)
+	testAgentRow(t, s, "linux1")
+	// interleaved, and named so that a plain title sort would lead with an
+	// unrated row
+	for _, r := range []struct{ id, sev string }{
+		{"pkg-a", ""}, {"pkg-b", "security"}, {"pkg-c", ""}, {"pkg-d", "security"},
+	} {
+		insertPatch(t, s, "linux1", r.id, "apt", r.sev, "available")
+	}
+	ps, err := s.db.ListPatches("linux1", "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, p := range ps {
+		got = append(got, p.Severity)
+	}
+	want := []string{"security", "security", "", ""}
+	for i, w := range want {
+		if i >= len(got) || got[i] != w {
+			t.Fatalf("linux severity order = %v, want %v (security updates must not be truncated by the LIMIT)", got, want)
 		}
 	}
 }

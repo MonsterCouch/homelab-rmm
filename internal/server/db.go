@@ -406,8 +406,11 @@ CREATE INDEX IF NOT EXISTS idx_baseline_history_ts ON baseline_history(ts);
 	// ADD COLUMN cannot be written IF NOT EXISTS, and a migration that
 	// cannot be replayed onto its own result bricks a database whose
 	// user_version was rewound - the rule migrations 3 and 4 spell out.
-	// Replaying this one copies the table onto a fresh one with the same
-	// shape, which is a no-op apart from the two new values.
+	// Replaying this one copies the table onto a fresh one of the same shape
+	// and succeeds, but it is not quite a no-op: the copy carries only the
+	// columns the pre-v5 table had, so downloaded and description fall back
+	// to their defaults. Every patch scan rewrites both, so a replay costs
+	// one scan, not the row.
 	`
 CREATE TABLE IF NOT EXISTS patches_v5 (
 	agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,

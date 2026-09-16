@@ -42,7 +42,15 @@ type Patch struct {
 // TEXT lexicographically, so the old `severity DESC` put Critical below
 // Unspecified, Moderate and Low, and the LIMIT truncated the worst patches
 // first.
-const patchSeverityRank = `CASE UPPER(p.severity) WHEN 'CRITICAL' THEN 0 WHEN 'IMPORTANT' THEN 1 WHEN 'MODERATE' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END`
+//
+// Critical/Important/Moderate/Low are Windows Update's MSRC ratings.
+// "security" is what apt, dnf and zypper set (internal/agent/linuxparse.go)
+// and is the ONLY non-empty severity a Linux device ever reports, so it has
+// to rank with the rated updates rather than fall into the unrated bucket -
+// otherwise the LIMIT cuts a distro's security updates like any other row.
+// It ties with Important on purpose: an advisory covers the update but the
+// distro gave no rating. ORDER BY breaks the tie on title.
+const patchSeverityRank = `CASE UPPER(p.severity) WHEN 'CRITICAL' THEN 0 WHEN 'IMPORTANT' THEN 1 WHEN 'SECURITY' THEN 1 WHEN 'MODERATE' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END`
 
 // patchSourceInstallable excludes the sources the agent cannot install from a
 // bulk approve or an "install everything approved" batch. winget rows are
