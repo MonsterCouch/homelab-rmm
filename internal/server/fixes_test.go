@@ -918,9 +918,11 @@ func TestOpenDatabaseRefusesAMissingDatabase(t *testing.T) {
 	if _, err := OpenDatabase(Config{DataDir: dir + "/typo"}); err == nil {
 		t.Fatal("a wrong --data must be an error, not a fresh empty database")
 	}
-	if _, err := New(Config{DataDir: dir, Listen: "127.0.0.1:0", Insecure: true, SkipSeed: true}); err != nil {
+	s, err := New(Config{DataDir: dir, Listen: "127.0.0.1:0", Insecure: true, SkipSeed: true})
+	if err != nil {
 		t.Fatal(err)
 	}
+	s.db.Close() // the point is the on-disk file; keep no handle on it
 	db, err := OpenDatabase(Config{DataDir: dir})
 	if err != nil {
 		t.Fatalf("the real directory should open: %v", err)

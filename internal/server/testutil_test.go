@@ -46,7 +46,20 @@ func newServerOnly(t *testing.T, cfg Config) (*Server, *httptest.Server) {
 	t.Cleanup(cancel)
 	s.sched.start(ctx)
 	ts := httptest.NewServer(s.routes())
-	t.Cleanup(ts.Close)
+	t.Cleanup(func() {
+		// Release everything that holds rmm.db open before t.TempDir removes
+		// it: Windows refuses to delete an open file, so an open SQLite handle
+		// turned every passing test in this package into a cleanup failure.
+		// Same order as Server.Run's shutdown: stop new work, close the agent
+		// sockets, wait for their teardown, then the database.
+		cancel()
+		ts.Close()
+		s.jobCancel()
+		s.hub.CloseAll()
+		s.hub.waitClosed(3 * time.Second)
+		s.waitJobs(5 * time.Second)
+		s.db.Close()
+	})
 	return s, ts
 }
 

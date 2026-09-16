@@ -5,7 +5,104 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Nothing yet.
+**First run on real Windows.** Everything Windows-specific had only ever been cross-compiled and
+reviewed. On 2026-09-15 the agent was installed as a service on a Windows 11 workstation, every
+subsystem was exercised against it, and 95 findings were confirmed and fixed. Nothing here changes
+the protocol; old agents keep working.
+
+### Fixed
+- **The Windows service wrote no log.** The slog handler was `io.MultiWriter(os.Stderr, file)`;
+  a process the Service Control Manager starts has no standard handles, so the first write failed
+  and slog swallowed the error: `agent.log` (and `server.log`, including the first-run **setup
+  code**) stayed at 0 bytes on every Windows install. A writer that drops unusable sinks replaces
+  it; `install`'s start confirmation works again and waits 45 s to outlast the SCM's own timeout.
+- **Text outside the ANSI/OEM code page** was corrupted everywhere on Windows: PowerShell script
+  bodies (now written with a UTF-8 BOM), script output (decoded from the console code page; python
+  runs with `PYTHONIOENCODING=utf-8`), the console terminal (ConPTY now starts in UTF-8 with
+  `TERM`/`COLORTERM` set) and the event log (`wevtutil /uni:true`, decoded from UTF-16LE).
+- **Scripts**: a line over 1 MiB no longer wedges a run until its timeout; output that hits the
+  1 MiB cap is marked `[output truncated]` and the server keeps the longer of the streamed and final
+  copies; cancelling records `cancelled` rather than `failed` (no false "Script failed" alert);
+  an `os_filter` mismatch answers 409 instead of 200 with a bogus `run_id`; Windows exit codes are
+  sign-extended (`exit -1` is -1, not 4294967295); python is found through `py.exe` and the
+  registry; orphaned `rmm-script-*` temp directories are swept at start-up; the whole child tree is
+  killed on timeout or cancel through a kill-on-close job object.
+- **Inventory**: `cpu_cores` is the physical core count (it was the logical count); `antivirus`
+  names the active product first and marks each product's state; software `installed` is always an
+  ISO date or empty; timezone carries its UTC offset (`EDT (UTC-04:00)`) plus `extra.timezone_id`;
+  Entra ID (`S-1-12-1-*`) user hives are enumerated; the logged-in-users fallback no longer calls
+  `query.exe` on editions without it and logs the WTS error instead of discarding it.
+- **Event log**: events whose provider message cannot be rendered are no longer dropped from a
+  page; search scans a fixed window of the newest 5000 records whatever the page size and matches
+  beyond the 8000-character display cap; Windows page limits match Linux (default 200, max 5000).
+- **Patching**: a `winget:` row in an install batch no longer aborts the whole batch (WUA updates
+  install, winget rows are reported individually as not installable from the service account); a
+  failed winget half of a scan is reported as `scan_error` instead of marking every winget row
+  "installed"; `scan_error` is typed and shown in the console; `POST /api/patches/status` accepts
+  the snake_case keys the API emits and rejects unmatched items; severity ordering puts Critical
+  first (Linux `security` ranks with Important); `categories` is always an array; `downloaded` and
+  `description` reach the API and console; the Installed tab is fed from WUA history.
+- **Baselines**: `registry` checks verify the stored value type (a REG_QWORD read as `dword` is an
+  error, not a truncated pass); `disk_free` with `/` on Windows is an error instead of silently
+  measuring the system drive; `package` names may contain spaces and parentheses on Windows;
+  `registry` paths may contain GUID braces and punctuation, and rejections name the offending part;
+  an unknown `windows_feature` reports "not found"; a `command` check abandoned at its deadline keeps
+  its `expected` label and partial output, guarded by a test over every kind on both platforms.
+- **Services and processes**: a service whose description is an unresolvable MUI resource keeps its
+  start type; process command-line truncation is rune-safe; process CPU% is normalised by core count.
+- **Power / WoL**: `poweroff`, `halt` and `logout` aliases work on Windows; `delay_sec` is honoured
+  for logoff; the shutdown message is capped at 512 UTF-16 code units; the Wake-on-LAN magic packet
+  leaves on the interface whose subnet contains the target.
+- **Terminal**: `opened` is emitted only once the device has actually started the shell; a 0x0 or
+  absurd resize is refused instead of collapsing the console; the exit watcher no longer races the
+  pseudo-console handle it waits on.
+- **Installer script**: `--fingerprint` is rendered only when non-empty (PowerShell 5.1 dropped the
+  empty argument and the install failed on every server without a pinned certificate); the script
+  refuses before downloading when no SHA-256 exists for the architecture; an unknown `?os=` is a 400
+  instead of the Linux script.
+- **Windows build**: `tools\build.ps1` stamps the real version (a `| Select-Object -First 1` after
+  `git describe` left `$LASTEXITCODE = -1`, so every Windows build said `dev`) and its `package`
+  target refuses stale binaries like `build.sh`; `deploy\uninstall.ps1 -Purge` removes
+  `baselines.json` and `helper.log` too and deletes the directory when empty.
+- `maintenance_until` rejects negative values and is capped at 30 days; `notes`, `display_name` and
+  tags are bounded; the Windows software list is bounded like the Linux one.
+
+- **`go test ./...` passes on Windows.** The server test fixture left its SQLite handle open at
+  cleanup, so Windows (which cannot delete an open file) reported every passing server test as a
+  failure; the fixture now shuts the server down in the same order `Run` does, `Run` closes the
+  database when the listener fails to bind, and the syslog ordering test no longer assumes UTC.
+
+### Security
+- Baseline `file` paths are canonicalised on both sides: an NTFS 8.3 short name
+  (`C:\ProgramData\HOMELA~1\agent.json`) could reach the agent's own configuration directory past
+  the server guard and the admin gate. Short-name components are refused by the server and resolved
+  by the agent before comparison.
+- `%ProgramData%\HomelabRMM` now gets its owner set as well as its DACL, so a standard user who
+  pre-created the directory no longer keeps `WRITE_DAC` over the device key; the server hardens its
+  Windows data directory (`rmm.db`, `server.key`) the same way instead of inheriting "Users can read".
+- `processes/kill` refuses Windows critical processes and the agent itself (the only guard was
+  `pid <= 4`); denied and failed service actions and kills are audited with their outcome.
+- Every interpreter the agent launches as SYSTEM (`powershell.exe`, `cmd.exe`, `pwsh`, `winget`) is
+  resolved by absolute path or an administrator-only root, never a bare PATH lookup; `cmd` script
+  parameters are quoted with cmd.exe's rules and values containing `" % !` or newlines are refused.
+- Agent self-update requires a 64-hex SHA-256 and an `https` URL (or `http` only to the configured
+  server), aborts on a failed executable-path resolution, and survives a lingering `.old`.
+- Reading the Security channel or any PowerShell channel of the event log requires the write role
+  and is audited as `eventlog.query`.
+- `rmm-agent install` warns when the binary it registers lives in a directory (or is a file)
+  writable by non-administrators, and when the server URL is plain `http://`.
+- Terminal WebSockets have a 1 MiB read limit and ping-based liveness, so an abandoned browser tab
+  no longer leaves a SYSTEM shell open.
+
+### Documentation
+- Windows enrolment documents the antivirus reality (AMSI blocks the `iex` one-liner; Bitdefender
+  on the validation machine) and makes the two-step form the primary path, run with
+  `powershell -NoProfile -ExecutionPolicy Bypass -File`. Manual installs go in an
+  administrators-only directory. `agent.json`'s Windows protection is described as a DACL, not
+  `0600`; the enrolment token it keeps is called out; OPERATIONS.md describes the real Windows
+  diagnostic channels; API.md gains an **Event log** section, run statuses, exit-code
+  representation, `scan_error`, power aliases; ARCHITECTURE.md describes the script runner, patch
+  severity ordering and `agent.update` accurately; README no longer advertises public IP.
 
 ## [0.2.0] - 2026-09-15
 

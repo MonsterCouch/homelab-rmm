@@ -289,6 +289,10 @@ func (s *Server) Run(ctx context.Context) error {
 	// any monitoring rule) grepping the log.
 	ln, err := net.Listen("tcp", s.cfg.Listen)
 	if err != nil {
+		// Nothing will run, so release the database the way the other exits
+		// do; a caller (or a test) that retries must not find rmm.db held open.
+		s.jobCancel()
+		s.db.Close()
 		return err
 	}
 	if !s.cfg.Insecure {

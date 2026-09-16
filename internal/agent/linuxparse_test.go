@@ -208,7 +208,9 @@ func TestParseSyslogLines(t *testing.T) {
 	lines := []string{
 		"Sep 15 03:56:01 host CRON[1234]: (root) CMD (run-parts /etc/cron.hourly)",
 		"Sep 15 03:57:02 host kernel: [12345.678] usb 1-1: device descriptor read/64, error -71",
-		"2026-09-15T03:58:03.123456+00:00 host sshd[99]: Connection refused by policy",
+		// Stamped in the local zone like the BSD lines around it, so "newest first"
+		// holds wherever the test runs (a +00:00 literal only ordered correctly in UTC).
+		time.Date(2026, 9, 15, 3, 58, 3, 123456000, time.Local).Format("2006-01-02T15:04:05.000000-07:00") + " host sshd[99]: Connection refused by policy",
 		"garbage without structure",
 		"Dec 31 23:59:59 host prog: from last year",
 	}
