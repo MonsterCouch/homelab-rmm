@@ -142,7 +142,9 @@ an agent error or a timeout marks the run `failed`/`timeout` and feeds the alert
 ### Alert engine (`alerts.go`)
 Rules (`alert_rules`) are loaded into memory and re-read whenever one is saved. Inputs: every
 metrics sample (cpu, memory, disk per mount, monitored services, pending reboot), agent events
-(pattern match), run failures, patch failures, and a 30-second sweep for `offline` rules that is
+(pattern match — these are the events an agent *emits*, and the only kind it emits today is
+`patch`; **no** platform feeds the Windows Event Log or journald into the engine, so the event
+log is pull-only), run failures, patch failures, and a 30-second sweep for `offline` rules that is
 time-based so a device that vanished while the server was down is still caught. `sustained`
 implements "condition true for N minutes"; `dedupe_key = rule:agent:extra` keeps one open alert
 per condition; `auto_resolve` closes it when the condition clears; a device in maintenance mode
@@ -375,6 +377,11 @@ rows.
 - `shell*.go` — pseudo-terminal sessions; `services_*.go`, `proc_*.go`, `eventlog_*.go`,
   `updates_*.go`, `power_*.go`, `files.go`, `wol.go` — the per-feature handlers;
   `platform_other.go` documents the contract each platform file fulfils.
+  `eventlog_windows.go` reads channels through `wevtutil /uni:true` (UTF-16, so text outside the
+  system ANSI code page is not folded to "?") and falls back to a second `/f:XML` pass whenever
+  wevtutil warns that it could not render a record, because `/f:RenderedXml` drops such records
+  while still exiting 0. Page sizes, the fixed search window and the level vocabulary are the
+  cross-platform contract in [API.md](API.md#event-log).
 - `update.go` — `agent.update` downloads a binary over the pinned TLS client, verifies SHA-256,
   swaps it next to the running one and exits so the service manager restarts it (no server-side
   trigger exists yet).

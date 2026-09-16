@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf16"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
 )
@@ -38,6 +39,30 @@ func winFirstLine(candidates ...string) string {
 		}
 	}
 	return ""
+}
+
+// winDecodeUTF16LE turns a UTF-16LE byte stream into a Go string. It is the
+// decoder for a tool asked to write Unicode rather than a code page
+// (wevtutil /uni:true), which is the only way event text outside the system
+// ANSI code page - Greek, Cyrillic, CJK, a tick mark - survives the pipe at
+// all: without it the console layer has already folded those characters to
+// "?" before the agent reads a byte.
+//
+// A byte-order mark is dropped (wevtutil writes one on stdout and none on
+// stderr), and a trailing odd byte - a capture cut in half by the output cap
+// - is discarded rather than turned into a bogus character.
+func winDecodeUTF16LE(b []byte) string {
+	if len(b) < 2 {
+		return ""
+	}
+	u := make([]uint16, 0, len(b)/2)
+	for i := 0; i+1 < len(b); i += 2 {
+		u = append(u, uint16(b[i])|uint16(b[i+1])<<8)
+	}
+	if u[0] == 0xFEFF {
+		u = u[1:]
+	}
+	return string(utf16.Decode(u))
 }
 
 // winCleanMessage makes operator-supplied text safe for a command line and a
@@ -580,9 +605,12 @@ func winValidEventLogName(name string) bool {
 	return name != "" && len(name) <= 200 && winEventLogNameRE.MatchString(name)
 }
 
-// winEventLogXPath builds the wevtutil /q: filter. Level 1 is Critical,
-// 2 Error, 3 Warning; "info" and "all" impose no level filter. since is a
-// Unix time in seconds (milliseconds are tolerated).
+// winEventLogXPath builds the wevtutil /q: filter. level is a MINIMUM
+// severity, as on the Linux agent: Level 1 is Critical, 2 Error, 3 Warning,
+// so "error" means critical-or-error and "warning" means those plus warning.
+// "info", "all" and anything unrecognised impose no level filter - the same
+// documented fallback journalctl's side takes (docs/API.md). since is a Unix
+// time in seconds (milliseconds are tolerated).
 func winEventLogXPath(level string, since int64) string {
 	var conds []string
 	switch strings.ToLower(strings.TrimSpace(level)) {
@@ -605,7 +633,10 @@ func winEventLogXPath(level string, since int64) string {
 	return "*[System[" + strings.Join(conds, " and ") + "]]"
 }
 
-// winEventLevelName maps the numeric Level of an event record.
+// winEventLevelName maps the numeric Level of an event record. "verbose"
+// (Level 5) is a Windows-only value: no level filter selects it on its own,
+// it only ever arrives with an unfiltered ("info"/"all") query, and the
+// Linux agent never produces it.
 func winEventLevelName(level int) string {
 	switch level {
 	case 1:
@@ -636,7 +667,8 @@ type wevtEvent struct {
 		TimeCreated struct {
 			SystemTime string `xml:"SystemTime,attr"`
 		} `xml:"TimeCreated"`
-		Channel string `xml:"Channel"`
+		EventRecordID string `xml:"EventRecordID"`
+		Channel       string `xml:"Channel"`
 	} `xml:"System"`
 	EventData struct {
 		Data []struct {
@@ -652,14 +684,43 @@ type wevtEvent struct {
 	} `xml:"RenderingInfo"`
 }
 
+// wevtMaxMessage is the DISPLAY cap on one message. It is applied on the way
+// out (winTruncateEventMessages), not at parse time, so a search still sees
+// the whole text the log stored: a long command line, group-policy dump or
+// stack trace used to be unsearchable past character 8000 as well as
+// unreadable.
 const wevtMaxMessage = 8000
 
+// winWevtRecord is one parsed <Event> together with its EventRecordID, the
+// channel's own identity for that record and the only reliable way to line
+// one wevtutil pass up with another.
+type winWevtRecord struct {
+	Entry    protocol.EventLogEntry
+	RecordID string
+}
+
+// winRecordEntries drops the record ids once nothing needs to line two
+// passes up any more.
+func winRecordEntries(records []winWevtRecord) []protocol.EventLogEntry {
+	entries := make([]protocol.EventLogEntry, 0, len(records))
+	for _, r := range records {
+		entries = append(entries, r.Entry)
+	}
+	return entries
+}
+
 // winParseWevtutilXML decodes the concatenated <Event> elements wevtutil
-// prints (there is no document root) into wire entries. Decoding is per
-// event and lenient, so one malformed record costs one entry, not the
-// whole page.
+// prints into wire entries, discarding the record ids.
 func winParseWevtutilXML(data []byte) ([]protocol.EventLogEntry, error) {
-	entries := []protocol.EventLogEntry{}
+	records, err := winParseWevtutilRecords(data)
+	return winRecordEntries(records), err
+}
+
+// winParseWevtutilRecords decodes the concatenated <Event> elements wevtutil
+// prints (there is no document root). Decoding is per event and lenient, so
+// one malformed record costs one entry, not the whole page.
+func winParseWevtutilRecords(data []byte) ([]winWevtRecord, error) {
+	records := []winWevtRecord{}
 	d := xml.NewDecoder(bytes.NewReader(data))
 	d.Strict = false
 	d.CharsetReader = func(_ string, in io.Reader) (io.Reader, error) { return in, nil }
@@ -682,12 +743,63 @@ func winParseWevtutilXML(data []byte) ([]protocol.EventLogEntry, error) {
 			lastErr = err
 			continue
 		}
-		entries = append(entries, wevtToEntry(ev))
+		records = append(records, winWevtRecord{Entry: wevtToEntry(ev), RecordID: strings.TrimSpace(ev.System.EventRecordID)})
 	}
-	if len(entries) == 0 && lastErr != nil {
-		return entries, fmt.Errorf("parse wevtutil output: %w", lastErr)
+	if len(records) == 0 && lastErr != nil {
+		return records, fmt.Errorf("parse wevtutil output: %w", lastErr)
 	}
-	return entries, nil
+	return records, nil
+}
+
+// winMergeRenderedEvents repairs the page wevtutil's RenderedXml format hands
+// back. When a provider's message resources cannot be loaded wevtutil prints
+// "Failed to render events" on stderr, exits 0 and simply OMITS the record,
+// so the caller reads one row short with no error anywhere - and the records
+// that go missing are the third-party and uninstalled-driver events an
+// operator is most likely hunting for. raw is the same query asked for in
+// /f:XML, which drops nothing: its order (newest first) is authoritative and
+// every record keeps the rendered message when there was one.
+func winMergeRenderedEvents(raw, rendered []winWevtRecord) []protocol.EventLogEntry {
+	byID := make(map[string]protocol.EventLogEntry, len(rendered))
+	for _, r := range rendered {
+		if r.RecordID != "" {
+			byID[r.RecordID] = r.Entry
+		}
+	}
+	out := make([]protocol.EventLogEntry, 0, len(raw)+len(rendered))
+	seen := make(map[string]bool, len(raw))
+	for _, r := range raw {
+		e := r.Entry
+		if r.RecordID != "" {
+			seen[r.RecordID] = true
+			if rend, ok := byID[r.RecordID]; ok {
+				e = rend
+			}
+		}
+		out = append(out, e)
+	}
+	// The two passes are two calls a moment apart, so a busy channel can push
+	// the oldest records of the first window out of the second one. Those
+	// keep their place at the end (the page is newest first) rather than
+	// disappearing because the repair pass ran.
+	for _, r := range rendered {
+		if r.RecordID != "" && !seen[r.RecordID] {
+			out = append(out, r.Entry)
+		}
+	}
+	return out
+}
+
+// winTruncateEventMessages applies the display cap to the page that is about
+// to go on the wire. It runs last, after the search has matched against the
+// whole message.
+func winTruncateEventMessages(entries []protocol.EventLogEntry) []protocol.EventLogEntry {
+	for i := range entries {
+		if r := []rune(entries[i].Message); len(r) > wevtMaxMessage {
+			entries[i].Message = string(r[:wevtMaxMessage]) + "…"
+		}
+	}
+	return entries
 }
 
 func wevtToEntry(ev wevtEvent) protocol.EventLogEntry {
@@ -725,11 +837,9 @@ func wevtToEntry(ev wevtEvent) protocol.EventLogEntry {
 	if msg == "" && strings.TrimSpace(ev.UserData.Inner) != "" {
 		msg = winXMLText(ev.UserData.Inner)
 	}
-	msg = strings.ReplaceAll(msg, "\r\n", "\n")
-	if r := []rune(msg); len(r) > wevtMaxMessage {
-		msg = string(r[:wevtMaxMessage]) + "…"
-	}
-	e.Message = msg
+	// The message is kept whole here; winTruncateEventMessages caps it once
+	// the search has run.
+	e.Message = strings.ReplaceAll(msg, "\r\n", "\n")
 	return e
 }
 
