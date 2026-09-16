@@ -8,7 +8,8 @@
     PowerShell. Windows PowerShell 5.1 compatible.
 
     Agent:  service HomelabRMMAgent, binary %ProgramFiles%\HomelabRMM\rmm-agent.exe,
-            config %ProgramData%\HomelabRMM\agent.json (+ agent.log)
+            data %ProgramData%\HomelabRMM: agent.json, agent.log (+ agent.log.1),
+            baselines.json and helper.log
     Server: service HomelabRMMServer, data %ProgramData%\HomelabRMM
             (rmm.db, server.crt, server.key, server.log, agents\)
 
@@ -17,7 +18,7 @@
 
 .EXAMPLE
     .\uninstall.ps1                 # agent, keep agent.json
-    .\uninstall.ps1 -Purge          # agent and its identity/log
+    .\uninstall.ps1 -Purge          # agent and its identity, logs and baseline state
     .\uninstall.ps1 -Server         # server, keep the data directory
     .\uninstall.ps1 -Server -Purge  # server and everything under %ProgramData%\HomelabRMM
 #>
@@ -91,14 +92,40 @@ if ($Server) {
         Remove-Item -LiteralPath $ProgramDir -Force
     }
     Write-Host "agent removed from $ProgramDir"
-    # only the agent's own files: the server shares this folder when both run on one box
-    $agentFiles = @('agent.json', 'agent.json.tmp', 'agent.log', 'agent.log.1') | ForEach-Object { Join-Path $DataDir $_ }
+    # Only the agent's own files: the server shares this folder when both run on
+    # one box, so the directory itself is removed only once it is empty. Anything
+    # missing from this list survives -Purge and is inherited by the next install,
+    # so it tracks every name internal/agent writes into the directory:
+    # agent.json and its .tmp (config.go), agent.log and agent.log.1 (the service
+    # log and its one rotation), baselines.json and its .tmp (the baselines
+    # engine's cached state), helper.log (the desktop helper, when it runs with
+    # the service's rights - see agent.HelperLogPaths).
+    $agentNames = @(
+        'agent.json', 'agent.json.tmp',
+        'agent.log', 'agent.log.1',
+        'baselines.json', 'baselines.json.tmp',
+        'helper.log'
+    )
+    $agentFiles = $agentNames | ForEach-Object { Join-Path $DataDir $_ }
     if ($Purge) {
-        foreach ($f in $agentFiles) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force } }
+        $removed = @()
+        foreach ($f in $agentFiles) {
+            if (Test-Path -LiteralPath $f) {
+                Remove-Item -LiteralPath $f -Force
+                $removed += (Split-Path -Leaf $f)
+            }
+        }
+        if ($removed.Count -gt 0) {
+            Write-Host "removed $($removed -join ', ') from $DataDir"
+        } else {
+            Write-Host "no agent files were left in $DataDir"
+        }
         if ((Test-Path -LiteralPath $DataDir) -and -not (Get-ChildItem -LiteralPath $DataDir -Force | Select-Object -First 1)) {
             Remove-Item -LiteralPath $DataDir -Force
+            Write-Host "removed $DataDir"
+        } elseif (Test-Path -LiteralPath $DataDir) {
+            Write-Host "kept $DataDir (it holds files that are not the agent's; a server installed on this machine keeps its database and certificate there)"
         }
-        Write-Host "removed agent.json and agent.log from $DataDir"
     } else {
         Write-Host "kept $DataDir\agent.json (this device's identity AND its enrolment token, so a reinstall keeps the device's history - and a token still valid there would re-enrol it; -Purge removes it)"
     }
