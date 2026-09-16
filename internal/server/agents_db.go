@@ -338,6 +338,62 @@ type AgentUpdate struct {
 	MaintenanceUntil  *int64            `json:"maintenance_until"`
 }
 
+// Bounds for the fields an operator types on a device. Nothing here is a
+// security boundary; they keep one device from degrading the console for
+// everyone (notes ride along on every GET /api/agents row) and keep a
+// mistyped maintenance window from silencing a device for good.
+const (
+	maxDisplayNameLen  = 200
+	maxNotesLen        = 16 << 10
+	maxTagCount        = 64
+	maxTagLen          = 64
+	maxCustomFields    = 64
+	maxCustomFieldLen  = 4096
+	maxMaintenanceDays = 30
+)
+
+// Validate bounds the editable fields. An out-of-range value is refused with
+// the limit named rather than clamped: an operator who asked for a year of
+// maintenance should be told it is a month, not discover it later.
+func (u AgentUpdate) Validate() error {
+	if u.DisplayName != nil && len(*u.DisplayName) > maxDisplayNameLen {
+		return fmt.Errorf("display_name: at most %d characters", maxDisplayNameLen)
+	}
+	if u.Notes != nil && len(*u.Notes) > maxNotesLen {
+		return fmt.Errorf("notes: at most %d characters", maxNotesLen)
+	}
+	if len(u.Tags) > maxTagCount {
+		return fmt.Errorf("tags: at most %d tags", maxTagCount)
+	}
+	for _, t := range u.Tags {
+		if len(t) > maxTagLen {
+			return fmt.Errorf("tags: each tag is at most %d characters", maxTagLen)
+		}
+	}
+	if len(u.CustomFields) > maxCustomFields {
+		return fmt.Errorf("custom_fields: at most %d fields", maxCustomFields)
+	}
+	for k, v := range u.CustomFields {
+		if len(k) > maxTagLen || len(v) > maxCustomFieldLen {
+			return fmt.Errorf("custom_fields: a name is at most %d and a value at most %d characters", maxTagLen, maxCustomFieldLen)
+		}
+	}
+	if u.MaintenanceUntil != nil {
+		// 0 is "not in maintenance" and has to stay allowed. A negative value
+		// is always in the past, and an unbounded one (MaxInt64, or seconds
+		// mistaken for milliseconds) suppresses every alert and every patch
+		// install for that device forever, with nothing in the UI saying so.
+		v := *u.MaintenanceUntil
+		if v < 0 {
+			return errors.New("maintenance_until: must not be negative")
+		}
+		if limit := now() + maxMaintenanceDays*24*3600; v > limit {
+			return fmt.Errorf("maintenance_until: at most %d days ahead", maxMaintenanceDays)
+		}
+	}
+	return nil
+}
+
 func (d *DB) UpdateAgent(id string, u AgentUpdate) error {
 	set, args := []string{}, []any{}
 	if u.DisplayName != nil {

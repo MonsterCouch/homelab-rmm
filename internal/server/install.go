@@ -134,6 +134,10 @@ func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
 	fp := s.fingerprint
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	// os is whitelisted the way arch is. Serving the bash script for anything
+	// unrecognised meant a typo ("windwos") handed a Windows box a shell
+	// script, and ?os=macos got a Linux ELF binary downloaded as root before
+	// anything complained.
 	switch r.URL.Query().Get("os") {
 	case "windows":
 		fmt.Fprint(w, render(windowsInstall, map[string]string{
@@ -143,7 +147,7 @@ func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
 			"ARCH":   psQuote(arch),
 			"SUM":    psQuote(s.agentBinarySHA256("windows", arch)),
 		}))
-	default:
+	case "", "linux": // "" is the documented default
 		fmt.Fprint(w, render(linuxInstall, map[string]string{
 			"SERVER": shQuote(url),
 			"TOKEN":  shQuote(token),
@@ -151,6 +155,8 @@ func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
 			"PIN":    shQuote(s.pubkeyPin),
 			"SUMS":   s.linuxSumCases(),
 		}))
+	default:
+		writeErr(w, http.StatusBadRequest, "unsupported os")
 	}
 }
 
@@ -210,17 +216,18 @@ if ('@@FP@@') {
         return ([BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant() -eq '@@FP@@')
     }
 }
+# The download endpoint is unauthenticated, so what arrives is checked against
+# the hash of the file the server rendered this script from. Without one there
+# is nothing to check, so stop before creating a directory or fetching what
+# would only be a 404 body.
+if (-not $sum) {
+    Write-Error "this server has no rmm-agent-windows-$arch.exe to verify the download against; put the agent binaries in its agents\ directory"
+}
 $dir = Join-Path $env:ProgramFiles 'HomelabRMM'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $exe = Join-Path $dir 'rmm-agent.exe'
 Write-Host "Downloading agent from $server ..."
 (New-Object Net.WebClient).DownloadFile("$server/api/agent-download/rmm-agent-windows-$arch.exe", "$exe.new")
-# The download endpoint is unauthenticated, so what arrived is checked against
-# the hash of the file the server rendered this script from.
-if (-not $sum) {
-    Remove-Item -Force "$exe.new" -ErrorAction SilentlyContinue
-    Write-Error "this server has no rmm-agent-windows-$arch.exe to verify the download against; put the agent binaries in its agents\ directory"
-}
 $stream = [IO.File]::OpenRead("$exe.new")
 try {
     $got = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
@@ -250,7 +257,14 @@ for ($i = 0; $i -lt 10 -and -not $swapped; $i++) {
     try { Move-Item -Force "$exe.new" $exe; $swapped = $true } catch { Start-Sleep -Seconds 1 }
 }
 if (-not $swapped) { Write-Error "could not replace $exe (still in use)" }
-& $exe install --server $server --token $token --fingerprint $fp
+# PowerShell DROPS an empty string when it builds a native command's argument
+# list, so a literal "--fingerprint $fp" with no fingerprint (plain HTTP, or a
+# publicly trusted certificate) reaches the agent as a bare "--fingerprint"
+# and exits 2 - or, with anything after it, eats the next flag as its value.
+# Build the list instead and only add the pair when there is something to pin.
+$installArgs = @('install', '--server', $server, '--token', $token)
+if ($fp) { $installArgs += @('--fingerprint', $fp) }
+& $exe @installArgs
 if ($LASTEXITCODE -ne 0) { Write-Error "install failed ($LASTEXITCODE)" }
 Write-Host 'Agent installed and started. It should appear in the console within a few seconds.'
 `
@@ -268,6 +282,14 @@ SUM=''
 case "$ARCH" in
 @@SUMS@@esac
 if [ "$(id -u)" -ne 0 ]; then echo "run as root (sudo)"; exit 1; fi
+# The download endpoint is unauthenticated, so what arrives is checked against
+# the hash of the file the server rendered this script from. Without one there
+# is nothing to check, so stop before creating anything or fetching what would
+# only be an error page.
+if [ -z "$SUM" ]; then
+    echo "this server has no rmm-agent-linux-$ARCH to verify the download against; put the agent binaries in its agents/ directory" >&2
+    exit 1
+fi
 mkdir -p /opt/homelab-rmm
 NEW=/opt/homelab-rmm/rmm-agent.new
 echo "Downloading agent from $SERVER ..."
@@ -283,13 +305,6 @@ elif [ -n "$FP" ]; then
     CURL+=(-k)
 fi
 "${CURL[@]}" -o "$NEW" "$SERVER/api/agent-download/rmm-agent-linux-$ARCH"
-# The download endpoint is unauthenticated, so what arrived is checked against
-# the hash of the file the server rendered this script from.
-if [ -z "$SUM" ]; then
-    rm -f "$NEW"
-    echo "this server has no rmm-agent-linux-$ARCH to verify the download against; put the agent binaries in its agents/ directory" >&2
-    exit 1
-fi
 GOT=$(sha256sum "$NEW" 2>/dev/null | awk '{print $1}' || true)
 [ -n "$GOT" ] || GOT=$(shasum -a 256 "$NEW" 2>/dev/null | awk '{print $1}' || true)
 [ -n "$GOT" ] || GOT=$(openssl dgst -sha256 "$NEW" 2>/dev/null | awk '{print $NF}' || true)

@@ -157,6 +157,15 @@ device on a timer. Four things bound that:
   setuid/setgid/sticky bit; at most one baseline-initiated reboot per device per 24 h, and none
   while a script run or shell session is live. A `command` check runs through the same path as a
   script run — a temp directory, a 0700 file, `exec.Command` with arguments, never a shell string.
+- **A path is compared as the filesystem sees it, not as it was spelled.** A directory on a
+  Windows volume has two equally valid names: `C:\ProgramData\HomelabRMM` and its NTFS 8.3 short
+  name `C:\ProgramData\HOMELA~1` open the same file, and `C:\PROGRA~1` is Program Files. A deny
+  list that compares strings matches neither the short form nor a different case, so both sides
+  now handle it: the **server refuses an 8.3-shaped component outright** (it cannot see the
+  device's filesystem, and such a path can stand for any directory at all, so it never counts as
+  "inside ProgramData" for the admin gate either), and the **agent resolves the real path** —
+  short names expanded, case folded, symlinks followed — before comparing it with its own
+  configuration directory.
 - **Windows package installs stay refused.** The `package` kind will not invoke winget from the
   service account unless the check sets `allow_winget: true` *and* winget resolves, matching the
   existing patch-management decision rather than quietly working around it.
@@ -168,13 +177,30 @@ The console says so in the Add-check dialog. Have the check read a secret on the
 **Audit.** Every login, script run, shell and desktop session, power action, patch operation,
 settings change and user change is written to the `audit` table with user and source address,
 along with `setup.refused` (a wrong setup code), `agent.enrolled`, `agent.rekeyed` and
-`agent.duplicate_hostname`.
+`agent.duplicate_hostname`. A **service action or process kill is audited whether or not it
+worked**: the attempt is what the log is read for, and a refusal carries
+`"outcome":"failed"` with the device's own error, so "nobody tried to stop the antivirus" and
+"somebody tried and was refused" are not the same empty log.
 
 **Agent hardening.** Helper tools are resolved by absolute path in `System32` on Windows so a
 writable directory on PATH cannot shadow `shutdown.exe`; commands never go through a shell;
 command output is capped (32 MB / 10 MB) so a runaway process cannot exhaust memory; script
 processes are killed as a tree on timeout or cancel. Script bodies are written to a private temp
 directory (0700) and removed afterwards.
+
+**Process kills are bounded.** A pid is not an intention: `csrss.exe`, `wininit.exe`,
+`winlogon.exe`, `services.exe` and `lsass.exe` are listed with ordinary pids like any other row,
+and terminating one bugchecks Windows with `CRITICAL_PROCESS_DIED` — an unplanned reboot with
+data loss, one click away in the console's process table. The agent refuses pids 0-4, the
+processes the operating system is held up by (by name, on both platforms), anything Windows
+itself marks critical (`IsProcessCritical`), and its own image — the service and the desktop
+helper both run from it, so a kill there would drop the device off the console or end the remote
+desktop session.
+
+**Agent self-update.** `agent.update` will not install a binary without a **64-hex SHA-256** (an
+empty hash used to skip verification altogether) and will not fetch one from just anywhere: the
+URL must be `https`, or plain `http` against the configured server's own host, which is the
+`--insecure`-behind-a-proxy deployment. What it installs runs as SYSTEM/root at the next restart.
 
 **Downloads.** `/api/agent-download/` is unauthenticated on purpose (the install script runs
 before the device has credentials), restricted to files named `rmm-agent-*` in the agents
@@ -228,6 +254,20 @@ If that window is unacceptable in your environment:
 
 Verify a fingerprint out of band before pasting it; it is the trust anchor for that device.
 
+**Antivirus will have an opinion, and it is not wrong.** The one-line Windows form — a
+`Net.WebClient` `DownloadString` piped into `iex`, with certificate validation turned off first —
+is the shape of a dropper, and AMSI-aware scanners refuse it on sight (Bitdefender:
+`ScriptContainedMaliciousContent`, before a line runs). The documented path is therefore the
+two-step one: `Invoke-WebRequest -OutFile` the script, **read it**, then run it. That is strictly
+better for review as well — the one-liner executes a script nobody looked at.
+
+Expect the agent binary to be questioned too: the releases carry no Authenticode signature, so
+SmartScreen and reputation engines have nothing to go on, and an agent that runs scripts as
+SYSTEM and reads the event log scores highly with behavioural engines. Exclusions for
+`C:\Program Files\HomelabRMM` and `%ProgramData%\HomelabRMM` are the usual answer; decide that
+deliberately, because an exclusion is a hole you are choosing to keep. The manual install needs
+neither the script nor the download.
+
 ## What is not protected
 
 - **Anyone with a console account is root everywhere.** There is no per-device permission model
@@ -250,9 +290,15 @@ Verify a fingerprint out of band before pasting it; it is the trust anchor for t
   nothing beyond that device's own identity.
 - **Email is plain text.** Alert mail carries device names and messages; use STARTTLS/TLS to
   your relay and do not put secrets in alert titles.
-- **The database is not encrypted at rest.** The data directory should be readable only by the
-  service account (the installer sets 0750 on Linux; on Windows `%ProgramData%\HomelabRMM`
-  inherits ProgramData ACLs — tighten them if other local users exist).
+- **The database is not encrypted at rest.** It is, however, readable only by the service
+  account: 0750 on Linux, and on Windows the server replaces the data directory's inherited
+  ACL with a protected one granting SYSTEM and Administrators only — the same lockdown the agent
+  applies to `%ProgramData%\HomelabRMM`, and for the same reason (`BUILTIN\Users` inherits
+  read-and-execute from `%ProgramData%`, which would expose `rmm.db` and `server.key` to every
+  local account). The directory's **owner** is set as well: an owner keeps `WRITE_DAC` whatever
+  the DACL says, so a standard user who pre-created the directory could otherwise hand the
+  permissions straight back. Anyone with administrative rights on the server host still has
+  everything, as they always do.
 - **Enrolment re-uses an offline device record** with the same hostname and OS. A rogue machine
   that knows a valid token and a victim's hostname could take over that record while the victim
   is offline (it would receive the victim's group/tags and queued runs, and the victim's own key

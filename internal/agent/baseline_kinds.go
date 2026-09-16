@@ -295,12 +295,40 @@ func blFilePathSafe(p baselines.FileParams) error {
 	if runtime.GOOS != "windows" && baselines.PathStyle(p.Path) != "unix" {
 		return errors.New("this device needs an absolute unix path")
 	}
-	own := baselines.CleanPath(ConfigDir())
-	target := baselines.CleanPath(p.Path)
+	// Both sides are canonicalised first. The server compares spellings; only
+	// the device can resolve them, and on Windows C:\ProgramData\HOMELA~1 is
+	// the same directory as C:\ProgramData\HomelabRMM (A34).
+	own := baselines.CleanPath(blCanonPath(ConfigDir()))
+	target := baselines.CleanPath(blCanonPath(p.Path))
 	if target == own || strings.HasPrefix(target, own+"/") {
 		return errors.New("the agent's own configuration directory is not manageable by a baseline")
 	}
 	return blNoSymlinkParents(p.Path)
+}
+
+// blCanonPath resolves p as far as the filesystem allows: the longest
+// ancestor that exists is put through filepath.EvalSymlinks - which on
+// Windows also expands an NTFS 8.3 short name ("HOMELA~1") to the long name
+// and fixes the case - and the components that do not exist yet are appended
+// unchanged. A path that resolves to nothing at all is returned as it came,
+// so this can only make a comparison stricter, never looser.
+func blCanonPath(p string) string { return blCanonPathWith(p, filepath.EvalSymlinks) }
+
+func blCanonPathWith(p string, eval func(string) (string, error)) string {
+	dir := filepath.Clean(p)
+	var rest []string
+	for i := 0; i < 64; i++ {
+		if resolved, err := eval(dir); err == nil {
+			return filepath.Join(append([]string{resolved}, rest...)...)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		rest = append([]string{filepath.Base(dir)}, rest...)
+		dir = parent
+	}
+	return p
 }
 
 // blNoSymlinkParents walks the parent chain with Lstat and refuses the first

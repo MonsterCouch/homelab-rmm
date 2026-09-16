@@ -80,3 +80,48 @@ func TestFileCheckRefusesTheAgentsOwnDirectory(t *testing.T) {
 		}
 	}
 }
+
+// 8.3 short names are a second, equally valid spelling of every directory on
+// a volume that has them (the default on C:): `dir /x C:\ProgramData` lists
+// HOMELA~1 beside HomelabRMM, and both open the same agent.json. Every guard
+// here compares strings against the long spelling, so the short one walked
+// past the agent's own directory AND past the admin gate - a `tech` could
+// point a file check at C:\ProgramData\HOMELA~1\agent.json and rewrite the
+// server URL of every Windows device in the fleet.
+func TestFileCheckRefusesNTFSShortNames(t *testing.T) {
+	for _, p := range []string{
+		`C:\ProgramData\HOMELA~1\agent.json`,
+		`c:\programdata\homela~1`,
+		`C:\PROGRA~1\HomelabRMM\rmm-agent.exe`,
+		`C:\Windows\SYSTEM~1\config\SAM`,
+		`C:\ProgramData\HOMEL~12\x.txt`,
+		`C:\Temp\REPORT~1.TXT`,
+	} {
+		err := CheckFilePath(p, "present", "x")
+		if err == nil {
+			t.Errorf("%s: an 8.3 short name must not be accepted", p)
+			continue
+		}
+		if !strings.Contains(err.Error(), "short name") {
+			t.Errorf("%s: the error must say what is wrong, got %v", p, err)
+		}
+		// The admin gate reads the same path. A short name proves nothing
+		// about which tree the write lands in, so it can never answer "no
+		// admin needed".
+		if !FileNeedsAdmin(p) {
+			t.Errorf("%s: an 8.3 short name must not pass the admin gate", p)
+		}
+	}
+	// A long name that merely contains a tilde is a real file an operator may
+	// manage, and a unix path is not 8.3 at all.
+	for _, p := range []string{
+		`C:\ProgramData\app\release~1notes.txt`,
+		`C:\ProgramData\app\backup~.txt`,
+		`C:\ProgramData\app\v1~2~3.config`,
+		"/etc/app/emacs~1",
+	} {
+		if err := CheckFilePath(p, "present", "x"); err != nil {
+			t.Errorf("%s is a legitimate target: %v", p, err)
+		}
+	}
+}

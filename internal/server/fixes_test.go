@@ -1156,3 +1156,101 @@ func TestSustainedWindowMustBeCrossed(t *testing.T) {
 		t.Fatalf("auto_resolve should have closed the alert: %+v", al)
 	}
 }
+
+// ---- svc-05: only successful service actions and process kills were
+// audited, so "nobody tried to stop Defender" and "somebody tried and the SCM
+// said no" looked identical in /api/audit - and a refused kill left no trace
+// at all. ----
+
+func TestRefusedServiceActionsAndKillsAreAudited(t *testing.T) {
+	s, ts, b := newTestServer(t)
+	tok := enrolToken(t, s)
+	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "auditbox", "windows")
+	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
+	// The device refuses both, which is what an SCM "Access is denied." and
+	// the agent's own "refusing to kill a protected process" look like here.
+	go func() {
+		for {
+			var env protocol.Envelope
+			if err := ag.ws.ReadJSON(&env); err != nil {
+				return
+			}
+			switch env.T {
+			case protocol.ReqPing:
+				ag.ws.WriteJSON(protocol.Envelope{T: protocol.TypePong, ID: env.ID})
+			case protocol.ReqSvcAction:
+				ag.ws.WriteJSON(protocol.Envelope{T: protocol.TypeReply, ID: env.ID, Err: `open service "WinDefend": Access is denied.`})
+			case protocol.ReqProcKill:
+				ag.ws.WriteJSON(protocol.Envelope{T: protocol.TypeReply, ID: env.ID, Err: "refusing to kill a process the operating system marks critical"})
+			}
+		}
+	}()
+
+	if st, _ := b.do("POST", "/api/agents/"+ag.id+"/services/action", map[string]any{"name": "WinDefend", "action": "stop"}); st == 200 {
+		t.Fatal("the fake agent was supposed to refuse the action")
+	}
+	if st, _ := b.do("POST", "/api/agents/"+ag.id+"/processes/kill", map[string]any{"pid": 1328}); st == 200 {
+		t.Fatal("the fake agent was supposed to refuse the kill")
+	}
+
+	var audit []struct{ Action, Target, Details string }
+	b.mustJSON("GET", "/api/audit?limit=50", nil, &audit)
+	var svc, kill bool
+	for _, a := range audit {
+		if a.Target != ag.id || !strings.Contains(a.Details, `"outcome":"failed"`) {
+			continue
+		}
+		if a.Action == "service.stop" && strings.Contains(a.Details, "WinDefend") {
+			svc = true
+		}
+		if a.Action == "process.kill" && strings.Contains(a.Details, "1328") {
+			kill = true
+		}
+	}
+	if !svc || !kill {
+		t.Fatalf("a refused action must leave a trace: service=%v kill=%v (%+v)", svc, kill, audit)
+	}
+}
+
+// ---- dev-02/dev-03: notes, display_name, tags and maintenance_until went
+// into the database unchecked. A 190 KB note then rode along on every row of
+// GET /api/agents, and maintenance_until = MaxInt64 silenced every alert and
+// blocked every patch install for that device for good. ----
+
+func TestAgentUpdateBoundsWhatAnOperatorCanType(t *testing.T) {
+	s, ts, b := newTestServer(t)
+	tok := enrolToken(t, s)
+	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "boundsbox", "linux")
+	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
+	path := "/api/agents/" + ag.id
+
+	for _, c := range []struct {
+		name string
+		body map[string]any
+	}{
+		{"a note the device list would carry to every operator", map[string]any{"notes": strings.Repeat("x", (16<<10)+1)}},
+		{"a display name no column can show", map[string]any{"display_name": strings.Repeat("x", 201)}},
+		{"more tags than a device can have", map[string]any{"tags": make([]string, 65)}},
+		{"a tag longer than a tag", map[string]any{"tags": []string{strings.Repeat("t", 65)}}},
+		{"maintenance in the past", map[string]any{"maintenance_until": -1}},
+		{"maintenance forever", map[string]any{"maintenance_until": int64(1) << 62}},
+	} {
+		if st, body := b.do("PATCH", path, c.body); st != 400 {
+			t.Errorf("%s should be refused, got %d %s", c.name, st, body)
+		}
+	}
+
+	// The values an operator actually types still go through, including the
+	// zero that ends a maintenance window.
+	for _, c := range []map[string]any{
+		{"notes": strings.Repeat("x", 16<<10)},
+		{"display_name": "Reception PC"},
+		{"tags": []string{"office", "win11"}},
+		{"maintenance_until": time.Now().Add(2 * time.Hour).Unix()},
+		{"maintenance_until": 0},
+	} {
+		if st, body := b.do("PATCH", path, c); st != 200 {
+			t.Errorf("%v should be accepted, got %d %s", c, st, body)
+		}
+	}
+}

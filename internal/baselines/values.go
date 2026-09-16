@@ -191,6 +191,54 @@ func HasDotDot(p string) bool {
 	return false
 }
 
+// winShortNameComponent returns the first component of a Windows path that is
+// an NTFS 8.3 short name, or "" if there is none.
+//
+// 8.3 name creation is on by default on the system volume, so every directory
+// with a long name has a second, equally valid spelling:
+// C:\ProgramData\HOMELA~1 IS C:\ProgramData\HomelabRMM, and C:\PROGRA~1 is
+// Program Files. Every deny list below compares strings, and the server cannot
+// expand a short name - only the device can see that filesystem - so a path
+// spelled the short way walked straight past the agent's own directory, the
+// registry hive tree and the admin gate. Refusing the shape here is the half
+// the server can enforce; the agent resolves the real path as well.
+//
+// The shape is exact: a base of at most 8 characters that contains "~"
+// followed by digits, and at most one extension of at most 3 characters. A
+// long name such as "release~1notes.txt" is not touched.
+func winShortNameComponent(p string) string {
+	for _, c := range strings.Split(strings.ReplaceAll(p, `\`, "/"), "/") {
+		if isWinShortName(c) {
+			return c
+		}
+	}
+	return ""
+}
+
+func isWinShortName(c string) bool {
+	base := c
+	if i := strings.Index(c, "."); i >= 0 {
+		base = c[:i]
+		ext := c[i+1:]
+		if len(ext) > 3 || strings.ContainsAny(ext, ".~") {
+			return false
+		}
+	}
+	if len(base) == 0 || len(base) > 8 {
+		return false
+	}
+	i := strings.Index(base, "~")
+	if i < 0 || i == len(base)-1 {
+		return false
+	}
+	for _, r := range base[i+1:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // deniedAgentDirs are the agent's own default configuration directories, in
 // CleanPath form. A file check that managed one would rewrite the device's
 // identity, its server URL or its baseline cache on every matched device -
@@ -240,6 +288,14 @@ func CheckFilePath(p, state, content string) error {
 		return errors.New(`must not contain ".."`)
 	}
 	clean := CleanPath(p)
+	if style == "windows" {
+		// Every deny list below is a string comparison against the long
+		// spelling, and an 8.3 short name is a second, equally valid name for
+		// the same directory that none of them match (A34).
+		if c := winShortNameComponent(clean); c != "" {
+			return fmt.Errorf(`%q is an NTFS 8.3 short name, which can stand for any directory; spell the path out in full`, c)
+		}
+	}
 	for _, d := range deniedAgentDirs {
 		if clean == d || strings.HasPrefix(clean, d+"/") {
 			return errors.New("the RMM agent's own configuration directory is not manageable by a baseline")
@@ -299,6 +355,12 @@ func FileNeedsAdmin(p string) bool {
 	case "unix":
 		return !(clean == "/etc" || strings.HasPrefix(clean, "/etc/"))
 	case "windows":
+		// A short name can stand for any directory, so it cannot be read as
+		// proof that the path stays inside ProgramData. CheckFilePath refuses
+		// one outright; if the gate is asked first, it asks for admin.
+		if winShortNameComponent(clean) != "" {
+			return true
+		}
 		i := strings.Index(clean, "/programdata/")
 		return !(i == 2 && len(clean) > len("c:/programdata/"))
 	}
