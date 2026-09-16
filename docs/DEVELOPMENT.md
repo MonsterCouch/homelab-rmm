@@ -210,6 +210,6 @@ Packaging by hand: `make package` is safe on its own — it depends on `server a
 rebuilds first. The script targets do **not** build anything; `tools/build.sh package` and
 `tools\build.ps1 -Target package` archive whatever `server` and `agents` last left in `dist/`,
 and because the console is embedded in the server binary a stale archive looks right until it is
-run. Use `tools/build.sh all package`. `tools/build.sh` refuses a binary older than the sources
-or `web/dist` it was built from (`ALLOW_STALE_BUILD=1` packages it anyway); `tools/build.ps1`
-does not carry that check yet, so on Windows build before you package.
+run. Use `tools/build.sh all package`. Both `tools/build.sh` and `tools\build.ps1` refuse a
+binary older than the sources or `web/dist` it was built from (`ALLOW_STALE_BUILD=1` packages it
+anyway).

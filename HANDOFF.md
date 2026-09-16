@@ -102,8 +102,11 @@ the new version and fix the compare links at the bottom).
 ## Known open items
 
 1. **No LICENSE file.** Archives ship a placeholder. Pick one.
-2. `tools/build.ps1 package` lacks the stale-binary guard that `tools/build.sh` has; port
-   `fresh`/`first_newer` and run it once on Windows.
+2. `tools/build.ps1 -Target package` now carries the stale-binary guard (`Assert-Fresh` /
+   `Get-NewestSource`, the twin of `fresh` / `first_newer` in `tools/build.sh`), and the
+   version it stamps is no longer always `dev`. Neither has been executed: PowerShell is
+   quarantined on the validation machine. Run `tools\build.ps1 -Target all package` once,
+   then again without rebuilding, to see the guard fire.
 3. Drift alerts cannot link back to the baseline and check that raised them: the alerts API
    exposes no `dedupe_key` / `baseline_id` (the key `drift:<baseline>:<check>:<agent>`
    already holds both). Needs `internal/server/alerts.go` plus `web/src/api/types.ts`.

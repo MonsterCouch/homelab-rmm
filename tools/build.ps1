@@ -11,7 +11,8 @@
       test      go vet, go test, UI type-check + build
       package   dist\homelab-rmm-<os>-<arch>.zip per server platform (+ .tar.gz for linux
                 when tar.exe is available) and dist\SHA256SUMS. It archives what
-                server/agents built and does NOT build the UI.
+                server/agents built and does NOT build the UI, and it refuses a
+                binary older than the sources or web\dist it was built from.
       clean     remove dist\ and the built UI
 
     Needs go, node and npm on PATH.
@@ -19,6 +20,10 @@
     server and package refuse to run when web\dist\index.html is missing: rmm-server
     embeds web\dist, so such a build would ship with no console. Set the environment
     variable ALLOW_EMPTY_WEB=1 to build one on purpose (for use with --dev-web).
+
+    Environment: VERSION (default: the output of git describe --tags --always),
+    ALLOW_EMPTY_WEB, ALLOW_STALE_BUILD (packages a binary older than the sources
+    anyway). Same names and meanings as tools/build.sh.
 
 .EXAMPLE
     tools\build.ps1                       # everything
@@ -50,9 +55,19 @@ function Get-BuildVersion {
     # so relax the preference just for this call.
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+    $v = 'dev'
     try {
-        $v = (& git describe --tags --always 2>$null | Select-Object -First 1)
-        if ($LASTEXITCODE -ne 0 -or -not $v) { $v = 'dev' }
+        # Capture git's output whole, then read $LASTEXITCODE before anything else
+        # runs. Piping the call into Select-Object -First 1 stops the upstream
+        # pipeline as soon as it has its line, which kills the native process and
+        # leaves $LASTEXITCODE = -1 under Windows PowerShell 5.1: the describe was
+        # then thrown away and every Windows build stamped 'dev'.
+        $out = & git describe --tags --always 2>$null
+        $code = $LASTEXITCODE
+        if ($code -eq 0 -and $out) {
+            $first = ([string](@($out)[0])).Trim()
+            if ($first) { $v = $first }
+        }
     } catch { $v = 'dev' } finally { $ErrorActionPreference = $prev }
     return [string]$v
 }
@@ -158,6 +173,58 @@ function Write-Checksums {
     Write-Host "  wrote $Dist\SHA256SUMS"
 }
 
+# The newest file this build is made from: every *.go, go.mod and go.sum in the
+# tree (minus dist\, node_modules\ and .git\) plus everything under web\dist,
+# which rmm-server embeds. tools/build.sh walks the tree once per binary with
+# find(1); one cached walk gives the same verdict - "some source is newer than
+# this binary" and "the newest source is newer than this binary" agree - and
+# `package` checks two dozen binaries against it.
+$script:newestSource = $null
+
+function Get-NewestSource {
+    if ($null -ne $script:newestSource) { return $script:newestSource }
+    $newest = @{ Path = ''; Time = [datetime]::MinValue }
+    $webDist = Join-Path $root 'web\dist'
+    $distFull = ''
+    if (Test-Path -LiteralPath $Dist) { $distFull = (Resolve-Path -LiteralPath $Dist).Path.TrimEnd('\') }
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($root)
+    while ($stack.Count -gt 0) {
+        $dir = [string]$stack.Pop()
+        $inWebDist = ($dir -eq $webDist) -or $dir.StartsWith($webDist + '\', [System.StringComparison]::OrdinalIgnoreCase)
+        foreach ($e in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)) {
+            if ($e.PSIsContainer) {
+                if ($e.Name -eq 'node_modules' -or $e.Name -eq '.git') { continue }
+                if ($distFull -and $e.FullName.TrimEnd('\') -eq $distFull) { continue }
+                $stack.Push($e.FullName)
+                continue
+            }
+            if (-not ($inWebDist -or $e.Name -like '*.go' -or $e.Name -eq 'go.mod' -or $e.Name -eq 'go.sum')) { continue }
+            if ($e.LastWriteTimeUtc -gt $newest.Time) {
+                $newest.Time = $e.LastWriteTimeUtc
+                $newest.Path = $e.FullName
+            }
+        }
+    }
+    $script:newestSource = $newest
+    return $newest
+}
+
+function Assert-Fresh([string]$Binary, [string]$BuildTarget) {
+    # package archives what server and agents left in dist\, so a run that skips
+    # them ships whatever was built last time - a server binary that predates the
+    # feature, beside the docs that describe it. Nothing about that archive looks
+    # wrong until someone runs it, so it is refused here. Same guard, message and
+    # escape hatch as fresh() in tools/build.sh.
+    if ($env:ALLOW_STALE_BUILD) { return }
+    $newest = Get-NewestSource
+    if (-not $newest.Path) { return }
+    $built = (Get-Item -LiteralPath $Binary).LastWriteTimeUtc
+    if ($newest.Time -gt $built) {
+        throw "$Binary is older than $($newest.Path): it would ship a binary built from different source than this tree. Run 'tools\build.ps1 -Target $BuildTarget' (or -Target all) first, or set ALLOW_STALE_BUILD=1 to package it anyway."
+    }
+}
+
 function New-Packages {
     Assert-WebBuilt
     New-Item -ItemType Directory -Force -Path $Dist | Out-Null
@@ -172,12 +239,14 @@ function New-Packages {
         New-Item -ItemType Directory -Force -Path (Join-Path $stage 'agents') | Out-Null
         $srv = Get-BinName 'rmm-server' $os $arch
         if (-not (Test-Path -LiteralPath $srv)) { throw "missing $srv (run: tools\build.ps1 -Target server)" }
+        Assert-Fresh $srv 'server'
         $srvName = if ($os -eq 'windows') { 'rmm-server.exe' } else { 'rmm-server' }
         Copy-Item -LiteralPath $srv -Destination (Join-Path $stage $srvName)
         foreach ($ap in $agentPlatforms) {
             $aparts = $ap.Split('/')
             $a = Get-BinName 'rmm-agent' $aparts[0] $aparts[1]
             if (-not (Test-Path -LiteralPath $a)) { throw "missing $a (run: tools\build.ps1 -Target agents)" }
+            Assert-Fresh $a 'agents'
             Copy-Item -LiteralPath $a -Destination (Join-Path $stage 'agents')
         }
         Copy-Item -LiteralPath 'README.md' -Destination $stage
