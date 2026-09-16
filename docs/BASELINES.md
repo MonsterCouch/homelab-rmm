@@ -82,7 +82,11 @@ fixing; the alert is the signal that an operator should find out what keeps brea
   to [5, 600] (default 60) for **every** kind. A check that exceeds its timeout is `error` with
   detail `timed out after Ns` and the pass continues with the next check. The deadline is enforced
   by the engine, not by the kind, so a check wedged in a syscall (a hung NFS mount, a stuck SCM
-  query) cannot stop the device evaluating.
+  query) cannot stop the device evaluating. A timed-out check still reports the `expected` label it
+  would have compared against (every kind publishes it before it starts work), with `observed`
+  `no answer`. A `command` check gets its own deadline a **full second** shorter than the engine's,
+  so the script runner's timeout normally wins the race and the partial output the script printed
+  reaches `detail`; the `timed out after Ns` it reports is the check's own `timeout_sec`.
 - Remediation runs only when `spec.enforce && check.remediate && state == fail`. After a fix the
   check is evaluated again: pass → `fixed`, otherwise `error` with the fix output in `detail`.
 - A check whose fix **failed** is not retried for 60 minutes. The hold-off is keyed by check id,
@@ -130,9 +134,9 @@ on the device's OS, or whose `os_filter` does not match, is `skipped`.
 | kind | params | platforms | fix |
 |---|---|---|---|
 | `service` | `name`, `state` (`running`\|`stopped`), `start_type` (`auto`\|`manual`\|`disabled`\|`any`, default `any`) | windows, linux | start/stop and set the start type (SCM / `systemctl enable`\|`disable`) |
-| `package` | `name`, `state` (`present`\|`absent`), `min_version` (optional, present only), `allow_winget` (windows, default false) | linux (dpkg/rpm/pacman/zypper), windows (Uninstall registry keys + `winget list`) | linux: the package manager, non-interactively; windows: refused unless `allow_winget` |
+| `package` | `name` (a package id, a winget id, **or** a Windows program name as the Uninstall keys spell it), `state` (`present`\|`absent`), `min_version` (optional, present only), `allow_winget` (windows, default false) | linux (dpkg/rpm/pacman/zypper), windows (Uninstall registry keys + `winget list`) | linux: the package manager, non-interactively; windows: refused unless `allow_winget` |
 | `registry` | `path` (`HKLM\…` or `HKCU\…`), `name`, `type` (`dword`\|`qword`\|`string`\|`expand_string`\|`multi_string`), `value` | windows | create the key if needed and set the value |
-| `file` | `path`, `state` (`present`\|`absent`), and for `present` optionally `content`, `sha256`, `contains`, `mode`, `owner` | windows, linux | present: write `content` and set mode/owner; absent: delete a regular file. `sha256`/`contains` without `content` are check-only |
+| `file` | `path`, `state` (`present`\|`absent`), and for `present` optionally `content`, `sha256`, `contains`, `mode` (**linux only**), `owner` (**linux only**) | windows, linux | present: write `content` and set mode/owner; absent: delete a regular file. `sha256`/`contains` without `content` are check-only |
 | `command` | `language` (`bash`\|`sh`\|`powershell`\|`cmd`\|`python`), `check`, `fix` (optional), `expected` (label) | windows, linux | run `fix`, then re-run `check` |
 | `group_members` | `group`, `allowed` (names), `mode` (`exact`\|`subset`, default `subset`), `allow_domain` (default false) | windows (local groups), linux (`/etc/group` + `getent`) | remove members that are not allowed; **never adds** |
 | `firewall` | `enabled` (default true) | windows (all three profiles), linux (ufw, else firewalld, else `skipped`) | enable/disable |
@@ -171,6 +175,17 @@ unless the params set `allow_winget: true` **and** winget resolves; even then th
 15-minute cap with its whole output in `detail`. On Linux the manager is detected in the order
 apt/dpkg, dnf/rpm, pacman, zypper and installs run non-interactively through `exec.Command` args.
 
+**`package` names have two legal spellings**, because the two platforms match on different things.
+A package-manager id or a winget id (`unattended-upgrades`, `Git.Git`) is one; a Windows program
+name exactly as the Uninstall keys hold it — `7-Zip 26.03 (x64)`, `GitHub CLI`,
+`Intel® Chipset Device Software` — is the other, and it is what the Windows `package` kind compares
+against (case-insensitively, after trimming). Such a name may be any single line of printable text
+up to 256 characters, but it may not begin with a space or with anything that is not a letter or a
+digit, so it can never be read as an option by the winget command line it is passed to as one
+argument. The **device** then re-validates with its own platform rule: a name dpkg could never hold
+is `error` on a Linux device (`… is not a valid package name`) rather than a 400 that would stop
+the Windows baseline being written at all — give such a check `os_filter: windows`.
+
 **`min_version` comparison is specified.** Strip an epoch (`1:`) and everything from the first `-`,
 `~` or `+`, then compare the remaining dot-separated fields numerically left to right, missing
 fields as 0, a non-numeric field as a string. If either side yields no numeric field at all the
@@ -186,6 +201,15 @@ refuses (state `error`) if any component of the parent chain is a symlink. Denie
 **regular file** only — never a directory, never recursively. `mode` is a 3- or 4-digit octal
 ≤ 0777 with no setuid/setgid/sticky bit. Writes are tmp+rename in the same directory, preserving
 mode and owner when the file already exists.
+
+**`file`: `mode` and `owner` are Linux-only and are IGNORED on Windows.** NTFS ACLs are not
+expressible as `0644`, so on a Windows device neither field is checked and neither is applied: they
+are dropped from the `expected` label, the result reads
+`present, mode and owner are not checked on Windows` in `observed`, and a check that names them can
+still report `pass`. They are accepted rather than refused on write because one baseline is meant to
+cover a mixed fleet — the same `file` check carrying `mode: "0644"` is enforced on the Linux devices
+it matches and ignored on the Windows ones. If the Windows half matters on its own, give the check
+`os_filter: windows` and leave `mode`/`owner` out.
 
 **`group_members` is the most dangerous kind**, so the agent enforces its own rules. It never
 removes the built-in Administrator (well-known RID 500) or `root`/uid 0; never removes the account
@@ -209,6 +233,21 @@ string for `string`/`expand_string`, array of strings for `multi_string`); anyth
 server-side and `error` agent-side. `expand_string` compares the **unexpanded** stored value. A
 missing key or value with remediation off is `fail`, not `error`.
 
+`type` also fixes the type the value must be **stored** as on the device: `dword` reads a
+`REG_DWORD` and nothing else, `qword` a `REG_QWORD`, `string` a `REG_SZ`, `expand_string` a
+`REG_EXPAND_SZ`, `multi_string` a `REG_MULTI_SZ`. A value stored as another type is `error`
+(`the check declares dword (REG_DWORD) but the value is stored as REG_QWORD`), never `pass`: the
+pairs are not interchangeable, a 64-bit value read as a `dword` would compare only its low 32 bits,
+and remediating such a check would rewrite the value with a different registry type.
+
+**Registry path characters.** A key name may contain anything Windows allows, which is everything
+but a backslash: GUID braces (`HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-…}`,
+`HKLM\SOFTWARE\Classes\CLSID\{…}`), parentheses, commas, apostrophes and non-ASCII are all fine —
+the path reaches `registry.OpenKey`, never a command line. What is refused, with a 400 that names
+the offending part: a root other than `HKLM`/`HKCU`, an empty key name (a doubled or trailing
+backslash), a wildcard (`*`, `?`), a control character, a path over 1024 characters or a key name
+over 256, and the denied hives above.
+
 **`firewall` / `time_sync` / `sysctl` / `windows_feature` / `disk_free`.** `enabled` defaults to
 **true** when absent, so `{}` means "must be on". Windows firewall requires all three profiles to
 match (observed `domain/private/public: on/on/off`); Linux uses ufw if present, else firewalld,
@@ -218,8 +257,15 @@ count); Linux reads `timedatectl`. `sysctl` reads `/proc/sys/<key with dots as s
 fix runs `sysctl -w` **and** rewrites `/etc/sysctl.d/90-homelab-rmm.conf` as a whole file the agent
 owns — one sorted `key = value` line per managed key, tmp+rename, so concurrent sysctl checks do
 not clobber each other. `windows_feature` fixes run **without** `-All`, so a feature whose parent is
-disabled fails loudly rather than enabling a tree nobody asked for. `disk_free` normalises `mount`
-to `C:` form on Windows and a `/`-prefixed path on Linux; an unknown mount is `error`, not `fail`.
+disabled fails loudly rather than enabling a tree nobody asked for. A `windows_feature` name no
+optional feature has is `error` with `there is no optional feature named '<name>' on this device`,
+the way an unknown service is — `Get-WindowsOptionalFeature` returns nothing for it rather than
+failing. `disk_free` normalises `mount` to `C:` form on Windows and a `/`-prefixed path on Linux;
+an unknown mount is `error`, not `fail`, and the mount is always named in `expected` and `observed`.
+**A bare `/` or `\` is not a Windows mount**: on a Windows device it is `error`
+(`/ is not a mount point on this device: a Windows mount is a drive such as C:, or the path of a
+mounted folder`), not a silent measurement of whichever drive the agent runs from. A mixed-fleet
+`disk_free` check therefore needs one check per platform with `os_filter` set, not a single `/`.
 
 **`reboot_pending`.** With `allow_reboot: true` the check may only be created by an **admin**, is
 audited as `baseline.reboot_check`, and the console asks for a typed confirmation. The agent

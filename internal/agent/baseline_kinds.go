@@ -112,6 +112,7 @@ func fileCheck(ctx context.Context, c *checkCtx) kindResult {
 		return blError("a safe path", "refused", err.Error())
 	}
 	want := fileWantLabel(p)
+	c.setExpected(want)
 	st, err := os.Lstat(p.Path)
 	switch {
 	case err != nil && os.IsNotExist(err):
@@ -486,14 +487,17 @@ func commandCheck(ctx context.Context, c *checkCtx) kindResult {
 		return blError("valid parameters", "invalid parameters", err.Error())
 	}
 	expected := orText(p.Expected, "exit 0")
+	c.setExpected(expected)
 	res := c.e.runScript(ctx, c, "check", p.Language, p.Check)
 	detail := blScriptDetail(res)
 	switch {
 	case res.TimedOut:
-		// The runner's own deadline fires a moment before the engine's, so
-		// the script's partial output is captured; res.Error carries the
-		// "timed out after Ns" the operator needs to see.
-		return blError(expected, "timed out", joinDetail(res.Error, detail))
+		// The runner's own deadline fires a full second before the engine's,
+		// so the script's partial output is captured here rather than lost
+		// when probe abandons the check. The operator is told the CHECK's
+		// timeout, not the runner's deliberately shorter internal one.
+		return blError(expected, "timed out",
+			joinDetail(fmt.Sprintf("timed out after %ds", baselines.ClampTimeout(c.check.TimeoutSec)), detail))
 	case res.Error != "":
 		return blError(expected, "could not run", joinDetail(res.Error, detail))
 	case res.ExitCode == 0:
@@ -527,13 +531,9 @@ func commandFix(ctx context.Context, c *checkCtx) (string, error) {
 // uses: a temp directory, a 0700 file, an interpreter invoked with
 // exec.Command arguments - never a shell string.
 func (e *baselineEngine) runScript(ctx context.Context, c *checkCtx, phase, lang, body string) *protocol.ScriptResult {
-	timeout := 60
+	timeout := baselines.DefaultTimeoutSec
 	if d, ok := ctx.Deadline(); ok {
-		if s := int(time.Until(d).Seconds()); s > 0 {
-			timeout = s
-		} else {
-			timeout = 1
-		}
+		timeout = blScriptTimeout(time.Until(d))
 	}
 	req := protocol.ScriptRun{
 		RunID:    fmt.Sprintf("baseline-%d-%d-%s", c.spec.ID, c.check.ID, phase),
@@ -553,6 +553,25 @@ func (e *baselineEngine) runScript(ctx context.Context, c *checkCtx, phase, lang
 		runner = newScriptRunner()
 	}
 	return runner.run(ctx, req, func(protocol.ScriptChunk) {})
+}
+
+// blScriptTimeout is the deadline the script runner gets, in whole seconds,
+// derived from what is left of the engine's.
+//
+// It is at least a FULL SECOND shorter, and that second is the whole point:
+// when the runner's deadline fires first it kills the process tree, keeps
+// everything the script printed and answers `timed out`, and the check
+// reports that partial output. When the engine's deadline wins instead,
+// probe abandons the check goroutine and every line the script wrote is lost
+// with it. int() truncation alone leaves only the fractional part as
+// headroom, which is nothing at all when the caller's deadline happens to
+// land on a whole second.
+func blScriptTimeout(remaining time.Duration) int {
+	s := int(remaining.Seconds()) - 1
+	if s < 1 {
+		return 1
+	}
+	return s
 }
 
 // blScriptDetail is the last 4 KiB of stderr, then stdout: an operator
@@ -577,6 +596,7 @@ func diskFreeCheck(ctx context.Context, c *checkCtx) kindResult {
 	}
 	mount := blNormaliseMount(p.Mount)
 	want := fmt.Sprintf("at least %.4g%% free on %s", p.MinFreePct, mount)
+	c.setExpected(want)
 	target, err := blResolveMount(mount)
 	if err != nil {
 		return blError(want, "unknown mount", err.Error())
@@ -598,15 +618,27 @@ func diskFreeCheck(ctx context.Context, c *checkCtx) kindResult {
 
 // blNormaliseMount puts a mount in the form the device uses: "C:" on
 // Windows (accepting "C:\" and "c:"), a "/"-prefixed path elsewhere.
-func blNormaliseMount(m string) string {
+func blNormaliseMount(m string) string { return blNormaliseMountOn(goosName, m) }
+
+// blNormaliseMountOn is blNormaliseMount with the platform spelled out, so
+// the Windows rules can be tested from any device.
+func blNormaliseMountOn(goos, m string) string {
 	m = strings.TrimSpace(m)
-	if runtime.GOOS == "windows" {
-		m = strings.ReplaceAll(m, "/", `\`)
-		m = strings.TrimSuffix(m, `\`)
-		if len(m) == 1 {
-			m += ":"
+	if goos == "windows" {
+		n := strings.ReplaceAll(m, "/", `\`)
+		n = strings.TrimSuffix(n, `\`)
+		if n == "" {
+			// A bare separator normalises to nothing. Returning that empty
+			// string rendered a blank mount in `expected` and `observed` and
+			// sent blResolveMount probing `\`, which disk.Usage happily
+			// answers for whatever drive the agent runs from. Keep the
+			// operator's own text instead; blMountNamed refuses it next.
+			return strings.ToUpper(m)
 		}
-		return strings.ToUpper(m)
+		if len(n) == 1 {
+			n += ":"
+		}
+		return strings.ToUpper(n)
 	}
 	m = strings.ReplaceAll(m, `\`, "/")
 	if !strings.HasPrefix(m, "/") {
@@ -618,10 +650,31 @@ func blNormaliseMount(m string) string {
 	return m
 }
 
+// blMountNamed refuses a mount this platform cannot name at all, before any
+// disk is probed. "/" and "\" are the unix spelling of the root filesystem
+// and name no Windows volume: a mixed-fleet baseline written as
+// {"mount":"/","min_free_pct":10} - the natural Linux spelling, and the shape
+// of the seeded Linux check - would otherwise report a silent C: measurement
+// on every Windows device it matched. An unknown mount is `error`, not a
+// drift (A40).
+func blMountNamed(goos, mount string) error {
+	m := strings.TrimSpace(mount)
+	switch {
+	case m == "":
+		return errors.New("a mount point or drive is required")
+	case goos == "windows" && (m == `\` || m == "/"):
+		return fmt.Errorf("%s is not a mount point on this device: a Windows mount is a drive such as C:, or the path of a mounted folder", m)
+	}
+	return nil
+}
+
 // blResolveMount maps the normalised mount onto a path disk.Usage accepts,
 // and refuses one the device does not have: an unknown mount is an error, not
 // a drift (A40).
 func blResolveMount(mount string) (string, error) {
+	if err := blMountNamed(goosName, mount); err != nil {
+		return "", err
+	}
 	parts, err := disk.Partitions(false)
 	if err == nil {
 		for _, pt := range parts {
@@ -679,6 +732,7 @@ func rebootPendingCheck(ctx context.Context, c *checkCtx) kindResult {
 		max = 1
 	}
 	want := fmt.Sprintf("no reboot pending for more than %dh", max)
+	c.setExpected(want)
 	pending := pendingReboot()
 	// A preview reads the bookkeeping, it never rewrites it (A8).
 	since := c.e.pendingSince(pending, c.preview)

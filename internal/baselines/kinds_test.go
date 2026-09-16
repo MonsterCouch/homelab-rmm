@@ -27,7 +27,21 @@ func TestValidateCheckTable(t *testing.T) {
 		{"package min version on absent", "package", `{"name":"curl","state":"absent","min_version":"8"}`, "min_version"},
 		{"package unparsable min version", "package", `{"name":"curl","state":"present","min_version":"latest"}`, "min_version"},
 		{"package trailing dash", "package", `{"name":"curl-","state":"present"}`, "name"},
+		// package: a Windows program is named the way the Uninstall keys
+		// spell it, which is where the spaces and parentheses come from.
+		{"package windows display name", "package", `{"name":"7-Zip 26.03 (x64)","state":"present"}`, ""},
+		{"package windows two words", "package", `{"name":"GitHub CLI","state":"present"}`, ""},
+		{"package windows punctuation", "package", `{"name":"Microsoft Visual C++ v14 Redistributable (x64) - 14.51.36247","state":"present"}`, ""},
+		{"package windows non-ascii", "package", `{"name":"Intel® Chipset Device Software","state":"present"}`, ""},
+		{"package option injection", "package", `{"name":"-x --force","state":"present"}`, "name"},
+		{"package leading space", "package", `{"name":" Git","state":"present"}`, "name"},
+		{"package newline", "package", `{"name":"Git\nrm -rf","state":"present"}`, "name"},
 		// registry
+		{"registry guid key", "registry", `{"path":"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e972-e325-11ce-bfc1-08002be10318}","name":"Class","type":"string","value":"Net"}`, ""},
+		{"registry punctuation key", "registry", `{"path":"HKLM\\SOFTWARE\\Classes\\CLSID\\{00021401-0000-0000-C000-000000000046}\\InProcServer32 (x86)","name":"","type":"string","value":"a"}`, ""},
+		{"registry wildcard", "registry", `{"path":"HKLM\\SOFTWARE\\Micro*","name":"S","type":"string","value":"a"}`, "wildcard"},
+		{"registry doubled backslash", "registry", `{"path":"HKLM\\SOFTWARE\\\\X","name":"S","type":"string","value":"a"}`, "empty"},
+		{"registry trailing backslash", "registry", `{"path":"HKLM\\SOFTWARE\\X\\","name":"S","type":"string","value":"a"}`, "empty"},
 		{"registry dword", "registry", `{"path":"HKLM\\SOFTWARE\\X","name":"SMB1","type":"dword","value":0}`, ""},
 		{"registry multi", "registry", `{"path":"HKLM\\SOFTWARE\\X","name":"L","type":"multi_string","value":["a","b"]}`, ""},
 		{"registry wrong value type", "registry", `{"path":"HKLM\\SOFTWARE\\X","name":"S","type":"dword","value":"0"}`, "whole number"},
@@ -263,5 +277,73 @@ func TestSeverityTriggerState(t *testing.T) {
 	}
 	if !ValidState("fixed") || ValidState("drifted") {
 		t.Fatal("state vocabulary is wrong")
+	}
+}
+
+// A Windows program is named by its Uninstall DisplayName, which is ordinary
+// text; a Linux package is named by its manager's id. Both spellings have to
+// be writable, and neither may start with something a command line would read
+// as an option.
+func TestPackageNameAcceptsBothSpellings(t *testing.T) {
+	for _, ok := range []string{
+		"unattended-upgrades", "curl", "Git.Git", "Microsoft.VisualStudioCode",
+		"7-Zip 26.03 (x64)", "GitHub CLI", "Node.js", "Google Drive",
+		"NVIDIA App 11.0.8.299", "Intel® Chipset Device Software",
+		"AMD Software: Adrenalin Edition", "Bitdefender Total Security",
+	} {
+		if !packageNameOK(ok) {
+			t.Errorf("%q is a package a device can hold", ok)
+		}
+	}
+	for _, bad := range []string{
+		"", "-x", " leading", "trailing ", "two\nlines", "bell\aname",
+		strings.Repeat("x", 257),
+	} {
+		if packageNameOK(bad) {
+			t.Errorf("%q must not be accepted as a package name", bad)
+		}
+	}
+}
+
+// The registry path rule has to allow the keys Windows actually has - GUID
+// braces above all - while still refusing a wildcard, an empty component and
+// anything but the two roots, and while SAYING which of those it was.
+func TestRegistryPathCharactersAndReasons(t *testing.T) {
+	for _, ok := range []string{
+		`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion`,
+		`HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}`,
+		`HKLM\SOFTWARE\Classes\CLSID\{00021401-0000-0000-C000-000000000046}\InProcServer32`,
+		`HKCU\SOFTWARE\Policies\Microsoft\Office (16.0)\common`,
+		`HKLM\SOFTWARE\Vendor+Co, Ltd.'s app#2`,
+	} {
+		if err := CheckRegistryPath(ok); err != nil {
+			t.Errorf("%s is an ordinary registry key: %v", ok, err)
+		}
+	}
+	for _, tc := range []struct{ path, reason string }{
+		{`HKLM\SOFTWARE\Micro*`, "wildcard"},
+		{`HKCU\SOFTWARE\?`, "wildcard"},
+		{`HKLM\SOFTWARE\\X`, "empty"},
+		{`HKLM\SOFTWARE\X\`, "empty"},
+		{"HKLM\\SOFTWARE\\X\x01", "control character"},
+		{`HKU\SOFTWARE\X`, "only HKLM and HKCU"},
+		{`HKLM`, "at least one key name"},
+	} {
+		if err := CheckRegistryPath(tc.path); err == nil {
+			t.Errorf("%s must be refused", tc.path)
+			continue
+		}
+		why := regPathReason(tc.path)
+		if why == nil || !strings.Contains(why.Error(), tc.reason) {
+			t.Errorf("%s: the refusal must name %q, got %v", tc.path, tc.reason, why)
+		}
+	}
+	// A path the deny list refuses is syntactically fine, so the explainer
+	// must stay quiet and let the deny message through.
+	if regPathReason(`HKLM\SAM\Domains`) != nil {
+		t.Fatal(`the deny list, not the syntax, refuses HKLM\SAM`)
+	}
+	if err := CheckRegistryPath(`HKLM\SAM\Domains`); err == nil || !strings.Contains(err.Error(), "SAM") {
+		t.Fatalf(`HKLM\SAM stays denied: %v`, err)
 	}
 }
