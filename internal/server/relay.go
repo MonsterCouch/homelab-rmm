@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -23,6 +24,25 @@ import (
 //   {"t":"open","shell":"powershell","cols":120,"rows":30}
 //   {"t":"in","data":"ls\r"}  {"t":"resize","cols":..,"rows":..}
 // and receives {"t":"out","data":...}, {"t":"opened","session":..}, {"t":"closed"}.
+
+// A terminal socket is bounded the way its two siblings are - the agent
+// socket (hub.go) and the desktop viewer both cap a frame and drop a peer
+// that stops answering. An interactive SYSTEM shell is the most valuable
+// thing this server hands out, so one operator must not be able to make it
+// buffer arbitrary input frames, and a viewer that vanished without a TCP
+// FIN (a closed lid, a dropped VPN, a killed VM) must not leave a shell
+// running on the device for ever. Liveness tracks PONGS, not traffic, for
+// the same reason Hub.keepalive does.
+//
+// These are variables rather than constants so the test can compress the
+// clock; nothing else writes them.
+var (
+	// shellFrameLimit is what the desktop viewer uses: a keystroke or a
+	// paste is small.
+	shellFrameLimit  int64 = 1 << 20
+	shellPingPeriod        = 30 * time.Second
+	shellIdleTimeout       = 90 * time.Second
+)
 
 // sameOrigin rejects cross-site WebSocket hijacking: browsers always send
 // Origin on WebSocket upgrades, and a legitimate viewer's origin host is the
@@ -54,8 +74,35 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer ws.Close()
+	ws.SetReadLimit(shellFrameLimit)
+	ws.SetReadDeadline(time.Now().Add(shellIdleTimeout))
+	ws.SetPongHandler(func(string) error {
+		return ws.SetReadDeadline(time.Now().Add(shellIdleTimeout))
+	})
 	sw := &wsWriter{c: ws}
 	send := func(v any) { sw.json(v) }
+
+	// Ping the viewer so a browser that went away without closing the socket
+	// is noticed within the idle timeout instead of holding the shell open.
+	// WriteControl is documented as safe alongside the other write methods,
+	// so this does not take the writer's lock. Registered after
+	// defer ws.Close(), so the ticker stops before the socket goes.
+	stopPings := make(chan struct{})
+	defer close(stopPings)
+	go func() {
+		t := time.NewTicker(shellPingPeriod)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopPings:
+				return
+			case <-t.C:
+				if err := ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+					return
+				}
+			}
+		}
+	}()
 
 	// Same as the desktop viewer: the terminal used to end by dropping the
 	// socket, so every ending - a closed tab, an agent that went away, a shell
@@ -68,9 +115,24 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 	var (
 		session string
 		cancel  func()
+		// The open handshake below is touched by this goroutine and by the
+		// agent's sink, which runs on the hub's read loop.
+		openMu   sync.Mutex
+		openID   string // the session id, once the agent socket took the request
+		haveID   bool
+		agentSaw bool  // the agent answered: a shell exists
+		refused  bool  // ... and its answer was "no", so one never did
+		flowing  bool  // the viewer has the marker; frames go straight out
+		queued   []any // what the sink produced while the open was undecided
 	)
 	defer func() {
-		if session != "" {
+		openMu.Lock()
+		dead := refused
+		openMu.Unlock()
+		// A session the device refused was never created, so there is
+		// nothing to close - telling it to close that id is a frame about
+		// something that does not exist.
+		if session != "" && !dead {
 			s.hub.Notify(agentID, protocol.ReqShellClose, protocol.ShellClose{Session: session})
 		}
 		if cancel != nil {
@@ -88,6 +150,13 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 			Rows  int    `json:"rows"`
 		}
 		if err := ws.ReadJSON(&msg); err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				// The read deadline the pong handler keeps pushing out: this
+				// viewer stopped answering, so say so rather than reporting
+				// the shell's end as an ordinary close.
+				closeCode, closeText = websocket.CloseGoingAway, "terminal closed: the viewer stopped answering"
+			}
 			return
 		}
 		switch msg.T {
@@ -95,40 +164,64 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 			if session != "" {
 				continue
 			}
-			// The sink runs on the hub's read loop, so the agent's first
-			// prompt can reach it before this goroutine has sent "opened" -
-			// which the viewer reads as output from a session it has not been
-			// told about yet. Anything the sink produces before the marker is
-			// queued and flushed straight after it, in order.
-			var (
-				openMu sync.Mutex
-				opened bool
-				queued []any
-			)
-			emit := func(v any) {
-				openMu.Lock()
-				defer openMu.Unlock()
-				if !opened {
-					queued = append(queued, v)
+			// "opened" means a shell exists, so it waits for the device to
+			// say so rather than going out on the strength of a write to the
+			// agent socket: an open the device refuses (an unsupported shell
+			// name, no ConPTY, no /bin/sh) is answered with an error, and
+			// announcing success first made every such failure arrive as
+			// {"opened"} followed by {"error"}.
+			//
+			// The sink runs on the hub's read loop, so that answer - or a
+			// first prompt - can reach it before Stream has even returned the
+			// session id. Anything it produces before the marker is queued
+			// and flushed straight after it, in order.
+			forward := func(v any) { // caller holds openMu
+				if flowing {
+					send(v)
 					return
 				}
-				send(v)
+				queued = append(queued, v)
+			}
+			settle := func() { // caller holds openMu
+				if flowing {
+					return
+				}
+				if !refused && !(agentSaw && haveID) {
+					return // still waiting for the device, or for the id
+				}
+				if !refused {
+					send(map[string]any{"t": "opened", "session": openID})
+				}
+				flowing = true
+				for _, v := range queued {
+					send(v)
+				}
+				queued = nil
 			}
 			id, c, err := s.hub.Stream(agentID, protocol.ReqShellOpen, protocol.ShellOpen{Shell: msg.Shell, Cols: msg.Cols, Rows: msg.Rows}, func(env protocol.Envelope) {
+				openMu.Lock()
+				defer openMu.Unlock()
 				if env.Err != "" {
-					emit(map[string]any{"t": "error", "message": env.Err})
-					emit(map[string]any{"t": "closed"})
+					// An error before anything else is the open failing;
+					// later it is a session that died with something to say.
+					refused = refused || !agentSaw
+					agentSaw = true
+					forward(map[string]any{"t": "error", "message": env.Err})
+					forward(map[string]any{"t": "closed"})
+					settle()
 					return
 				}
 				var chunk protocol.ShellChunk
 				if json.Unmarshal(env.D, &chunk) != nil {
 					return
 				}
+				agentSaw = true
 				if chunk.EOF || env.T == protocol.TypeReply {
-					emit(map[string]any{"t": "closed"})
-					return
+					forward(map[string]any{"t": "closed"})
+				} else {
+					forward(map[string]any{"t": "out", "data": chunk.Data})
 				}
-				emit(map[string]any{"t": "out", "data": chunk.Data})
+				settle()
 			})
 			if err != nil {
 				send(map[string]any{"t": "error", "message": err.Error()})
@@ -137,12 +230,8 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 			}
 			session, cancel = id, c
 			openMu.Lock()
-			send(map[string]any{"t": "opened", "session": id})
-			opened = true
-			for _, v := range queued {
-				send(v)
-			}
-			queued = nil
+			openID, haveID = id, true
+			settle()
 			openMu.Unlock()
 		case "in":
 			if session != "" {

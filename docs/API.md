@@ -73,8 +73,19 @@ See `routes()` in `internal/server/api.go`. Highlights:
   `POST .../patches/install {ids | all:true, reboot_if_required}` (202, follow `patches` events),
   `GET .../events` (agent event log).
 - Terminal: WebSocket `/ws/shell/{id}`. Send `{"t":"open","shell":"powershell|cmd|bash|sh|","cols","rows"}`,
-  then `{"t":"in","data"}` and `{"t":"resize","cols","rows"}`; receive `{"t":"opened"}`,
-  `{"t":"out","data"}`, `{"t":"closed"}`, `{"t":"error","message"}`.
+  then `{"t":"in","data"}`, `{"t":"resize","cols","rows"}` and `{"t":"close"}`; receive
+  `{"t":"opened","session"}`, `{"t":"out","data"}`, `{"t":"closed"}`, `{"t":"error","message"}`.
+  `opened` is sent only once the device has answered, so it means a shell really exists and its
+  `session` is live; an open the device refused (an unsupported shell name, no ConPTY, no
+  `/bin/sh`) arrives as `error` then `closed` with **no** `opened` before it. A `resize` is
+  applied only when both dimensions are 1..1000 on Windows (1..65535 on Linux); anything else —
+  including the `0x0` a viewer sends while its container is hidden — is refused by the device and
+  the session keeps the size it had. The socket is capped at 1 MiB per frame (a bigger one ends
+  it with `1009`), and the server pings every 30 s and ends the session with `1001` when the
+  viewer has not answered for 90 s, so a browser that vanished without closing the connection
+  cannot leave a shell running on the device. On Windows the shell is started on code page 65001
+  and with `TERM=xterm-256color` / `COLORTERM=truecolor`, so its output is byte-accurate UTF-8
+  exactly as on Linux (where the shell gets `LANG=C.UTF-8`).
 - Remote desktop: WebSocket `/ws/desktop/{id}?quality=60` — see `docs/DESKTOP-PROTOCOL.md`.
 - Groups `/api/groups`, enrolment `/api/enroll` (POST returns `{token, windows, linux}` install
   commands; GET returns `{tokens, public_url, fingerprint}`). `GET /install/{token}?os=windows|linux&arch=`
