@@ -61,9 +61,10 @@ and copies nothing, and the service manager starts that exact file as LocalSyste
 root (Linux) at every boot. It therefore has to live where only administrators can write —
 `C:\Program Files\HomelabRMM`, `/opt/homelab-rmm` — or whoever can replace it owns the machine.
 The install command the console prints already puts it there; a manual install (copy the binary,
-run `install` by hand) must do it too. `rmm-agent install` inspects the directory it is about to
-register — the DACL on Windows, the owner and mode on Linux — and prints a warning naming the
-directory, the accounts that can write it and where to move it. It warns rather than refuses:
+run `install` by hand) must do it too. `rmm-agent install` inspects the location it is about to
+register — the directory *and* the binary itself, by DACL on Windows and by owner and mode on
+Linux — and prints a warning naming what is unprotected, the accounts that can write it and
+where the binary belongs instead. It warns rather than refuses:
 running the agent out of a build tree is normal while developing. `rmm-server install` does not
 check, and the same rule applies to it.
 

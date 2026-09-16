@@ -240,8 +240,9 @@ If that window is unacceptable in your environment:
   from and copies nothing, so a binary left in `Downloads`, on the Desktop or in a build tree
   makes the file the SCM launches as LocalSystem (or systemd launches as root) writable by an
   unprivileged account: replacing it is SYSTEM at the next start, with no UAC prompt anywhere.
-  `install` inspects that directory and warns, naming the accounts that can write it, but it
-  does not refuse.
+  `install` inspects that directory *and* the binary in it — a binary built or unpacked by an
+  unprivileged account keeps an entry for that account wherever it is moved to — and warns,
+  naming the accounts that can write them, but it does not refuse.
 
 Verify a fingerprint out of band before pasting it; it is the trust anchor for that device.
 

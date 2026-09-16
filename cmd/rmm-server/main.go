@@ -84,22 +84,43 @@ func parseFlags(args []string) server.Config {
 	return cfg.FromEnv()
 }
 
+// setupLogging installs the process-wide slog handler over stderr and
+// server.log in the data directory. The file is never closed - it lives as
+// long as the process.
 func setupLogging(cfg server.Config) {
-	var w io.Writer = os.Stderr
+	var f *os.File
 	if err := os.MkdirAll(cfg.DataDir, 0o750); err == nil {
 		path := filepath.Join(cfg.DataDir, "server.log")
 		if st, err := os.Stat(path); err == nil && st.Size() > 20<<20 {
 			os.Rename(path, path+".1")
 		}
-		if f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
-			w = io.MultiWriter(os.Stderr, f)
+		if opened, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+			f = opened
 		}
+	}
+	setupHandler(os.Stderr, f)
+}
+
+// setupHandler installs the handler over the sinks the caller opened. stderr
+// is a parameter rather than os.Stderr for the same reason as in rmm-agent: a
+// process the Windows Service Control Manager started has no standard handles
+// at all, so every write to os.Stderr fails for the whole life of the service.
+// io.MultiWriter stops at that first failure and never reaches server.log,
+// which is the one place docs/OPERATIONS.md tells the operator to read the
+// one-time first-run setup code "when it runs as a Windows service, where
+// stderr goes nowhere". svc.LogWriter drops the dead sink instead - see its
+// comment - and naming both sinks here is what lets a test stand a broken
+// stderr up.
+func setupHandler(stderr io.Writer, file *os.File) {
+	sinks := []io.Writer{stderr}
+	if file != nil {
+		sinks = append(sinks, file)
 	}
 	level := slog.LevelInfo
 	if os.Getenv("RMM_DEBUG") != "" {
 		level = slog.LevelDebug
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(svc.LogWriter(sinks...), &slog.HandlerOptions{Level: level})))
 }
 
 func spec(args []string) svc.Spec {

@@ -77,14 +77,15 @@ func administrative(sid string) bool {
 	return false
 }
 
-// unprotectedWriters lists the principals the directory's DACL grants write
-// access to, other than the administrative accounts above. Inherited entries
-// count - the profile-wide grant a binary under C:\Users picks up is exactly
-// the problem - while inherit-only entries do not, because they describe the
-// children rather than this object (CREATOR OWNER under %ProgramFiles% is one,
-// and treating it as a writer would make the recommended location look unsafe).
-func unprotectedWriters(dir string) ([]string, error) {
-	sd, err := windows.GetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+// unprotectedWriters lists the principals the DACL of path - a directory or
+// the binary itself - grants write access to, other than the administrative
+// accounts above. Inherited entries count - the profile-wide grant a binary
+// under C:\Users picks up is exactly the problem - while inherit-only entries
+// do not, because they describe the children rather than this object (CREATOR
+// OWNER under %ProgramFiles% is one, and treating it as a writer would make
+// the recommended location look unsafe).
+func unprotectedWriters(path string) ([]string, error) {
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return nil, err
 	}
@@ -95,8 +96,8 @@ func unprotectedWriters(dir string) ([]string, error) {
 	if dacl == nil {
 		// A NULL DACL grants everyone everything; an empty one grants nobody
 		// anything, and DACL() reports both as a nil ACL. Only the first is
-		// possible for a directory that exists and can be written at all.
-		return []string{"everyone (the directory has no DACL)"}, nil
+		// possible for an object that exists and can be written at all.
+		return []string{"everyone (no DACL)"}, nil
 	}
 	var writers []string
 	seen := map[string]bool{}

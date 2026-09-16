@@ -14,10 +14,10 @@ func setErrorControl(string) error { return nil }
 // recommendedImageDir is the location docs/OPERATIONS.md gives for the agent.
 func recommendedImageDir() string { return "/opt/homelab-rmm" }
 
-// unprotectedWriters reads the directory's owner and mode; the decision is in
-// unixWriters so it can be tested from any platform.
-func unprotectedWriters(dir string) ([]string, error) {
-	fi, err := os.Stat(dir)
+// unprotectedWriters reads the owner and mode of a directory or a file; the
+// decision is in unixWriters so it can be tested from any platform.
+func unprotectedWriters(path string) ([]string, error) {
+	fi, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}

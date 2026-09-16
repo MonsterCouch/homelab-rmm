@@ -23,28 +23,41 @@ import (
 // is how the agent is developed, and an install that cannot be completed at
 // all would just be worked around. A location that cannot be inspected is not
 // an accusation either - no warning is printed when the check itself fails.
+//
+// Both the directory and the file itself are inspected. Writing the directory
+// is the way a binary is swapped out wholesale, and it is checked first
+// because it is the one that also explains the file; but a binary built or
+// unpacked by an unprivileged account carries an explicit entry of its own
+// (the live box had an explicit "<user>:(F)" entry on rmm-agent.exe), which
+// lets that account rewrite it in place even inside a protected directory.
 func ImagePathWarning(exe string) string {
+	recommended := recommendedImageDir()
 	dir := filepath.Dir(exe)
-	writers, err := unprotectedWriters(dir)
-	if err != nil || len(writers) == 0 {
-		return ""
+	if writers, err := unprotectedWriters(dir); err == nil && len(writers) > 0 {
+		return imagePathWarning(dir, writers, recommended)
 	}
-	return imagePathWarning(dir, writers, recommendedImageDir())
+	if writers, err := unprotectedWriters(exe); err == nil && len(writers) > 0 {
+		return imagePathWarning(exe, writers, recommended)
+	}
+	return ""
 }
 
 // imagePathWarning renders the warning. It is separate from the platform
-// inspection so the wording - which has to name the directory, who can write
-// it and where the binary belongs instead - can be tested anywhere.
-func imagePathWarning(dir string, writers []string, recommended string) string {
+// inspection so the wording - which has to name what is unprotected, who can
+// write it and where the binary belongs instead - can be tested anywhere.
+// "Copy", not "move": a move keeps an explicit entry that is on the file
+// itself, while a copy into a protected directory takes that directory's
+// inherited ACL.
+func imagePathWarning(path string, writers []string, recommended string) string {
 	var b strings.Builder
-	b.WriteString("WARNING: " + dir + " can be modified by accounts that are not administrators:\n")
+	b.WriteString("WARNING: " + path + " can be modified by accounts that are not administrators:\n")
 	for _, w := range writers {
 		b.WriteString("           " + w + "\n")
 	}
-	b.WriteString("         The service manager runs the executable in that directory with full\n")
+	b.WriteString("         The service manager runs the executable registered here with full\n")
 	b.WriteString("         system privileges at every start, so anyone who can replace it runs\n")
 	b.WriteString("         code as LocalSystem/root on this machine.\n")
-	b.WriteString("         Move the binary to " + recommended + " (where the install command the\n")
+	b.WriteString("         Copy the binary into " + recommended + " (where the install command the\n")
 	b.WriteString("         console prints puts it) and run install again from there.")
 	return b.String()
 }

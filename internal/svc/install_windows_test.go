@@ -76,9 +76,11 @@ func tempDirWithACL(t *testing.T, name string) string {
 	return dir
 }
 
-// grant replaces path's DACL with one allow entry per SID, inheritance
-// dropped, so the test knows exactly what the ACL says.
-func grant(t *testing.T, path string, sids []*windows.SID, mask windows.ACCESS_MASK) {
+// grant replaces path's DACL with one allow entry per SID, inheritance from
+// the parent dropped, so the test knows exactly what the ACL says. inherit is
+// what the entries themselves pass down: SUB_CONTAINERS_AND_OBJECTS_INHERIT
+// for a directory, NO_INHERITANCE for a file.
+func grant(t *testing.T, path string, sids []*windows.SID, mask windows.ACCESS_MASK, inherit uint32) {
 	t.Helper()
 	var pinner runtime.Pinner
 	defer pinner.Unpin()
@@ -88,7 +90,7 @@ func grant(t *testing.T, path string, sids []*windows.SID, mask windows.ACCESS_M
 		entries = append(entries, windows.EXPLICIT_ACCESS{
 			AccessPermissions: mask,
 			AccessMode:        windows.GRANT_ACCESS,
-			Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+			Inheritance:       inherit,
 			Trustee: windows.TRUSTEE{
 				TrusteeForm:  windows.TRUSTEE_IS_SID,
 				TrusteeType:  windows.TRUSTEE_IS_WELL_KNOWN_GROUP,
@@ -132,7 +134,7 @@ func TestUnprotectedWritersAcceptsAnAdministratorsOnlyDirectory(t *testing.T) {
 	grant(t, dir, []*windows.SID{
 		wellKnown(t, windows.WinLocalSystemSid),
 		wellKnown(t, windows.WinBuiltinAdministratorsSid),
-	}, fileAllAccess)
+	}, fileAllAccess, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT)
 	writers, err := unprotectedWriters(dir)
 	if err != nil {
 		t.Fatalf("unprotectedWriters: %v", err)
@@ -150,7 +152,7 @@ func TestUnprotectedWritersFindsANonAdministrativeWriter(t *testing.T) {
 		wellKnown(t, windows.WinLocalSystemSid),
 		wellKnown(t, windows.WinBuiltinAdministratorsSid),
 		wellKnown(t, windows.WinBuiltinUsersSid),
-	}, fileAllAccess)
+	}, fileAllAccess, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT)
 	writers, err := unprotectedWriters(dir)
 	if err != nil {
 		t.Fatalf("unprotectedWriters: %v", err)
@@ -168,12 +170,45 @@ func TestUnprotectedWritersFindsANonAdministrativeWriter(t *testing.T) {
 func TestUnprotectedWritersIgnoresReadOnlyPrincipals(t *testing.T) {
 	dir := tempDirWithACL(t, "ProgramFiles")
 	grant(t, dir, []*windows.SID{wellKnown(t, windows.WinBuiltinUsersSid)},
-		windows.FILE_GENERIC_READ|windows.FILE_GENERIC_EXECUTE)
+		windows.FILE_GENERIC_READ|windows.FILE_GENERIC_EXECUTE, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT)
 	writers, err := unprotectedWriters(dir)
 	if err != nil {
 		t.Fatalf("unprotectedWriters: %v", err)
 	}
 	if len(writers) != 0 {
 		t.Fatalf("a read-only grant was reported as write access: %v", writers)
+	}
+}
+
+// The other half of the live state: the directory was fine but the binary in
+// it carried an explicit entry for the interactive user, which is what a
+// binary built or unpacked by that account looks like. Replacing it in place
+// is SYSTEM at the next start just the same, so the check must not stop at the
+// directory.
+func TestImagePathWarningFlagsTheBinaryItselfInsideASoundDirectory(t *testing.T) {
+	dir := tempDirWithACL(t, "HomelabRMM")
+	exe := filepath.Join(dir, "rmm-agent.exe")
+	if err := os.WriteFile(exe, []byte("MZ"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The binary: full control for a non-administrative principal.
+	grant(t, exe, []*windows.SID{
+		wellKnown(t, windows.WinLocalSystemSid),
+		wellKnown(t, windows.WinBuiltinAdministratorsSid),
+		wellKnown(t, windows.WinBuiltinUsersSid),
+	}, fileAllAccess, windows.NO_INHERITANCE)
+	// The directory: nobody but administrators can write it, but the test
+	// process still has to be able to read the file's ACL through it.
+	grant(t, dir, []*windows.SID{
+		wellKnown(t, windows.WinLocalSystemSid),
+		wellKnown(t, windows.WinBuiltinAdministratorsSid),
+	}, fileAllAccess, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT)
+	if writers, err := unprotectedWriters(dir); err != nil || len(writers) != 0 {
+		t.Fatalf("the directory should be sound: writers = %v, err = %v", writers, err)
+	}
+
+	w := ImagePathWarning(exe)
+	if !strings.Contains(w, exe) || !strings.Contains(w, "S-1-5-32-545") {
+		t.Fatalf("ImagePathWarning = %q, want it to name %s and BUILTIN\\Users", w, exe)
 	}
 }
