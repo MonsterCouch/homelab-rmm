@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -16,11 +17,12 @@ import (
 
 // powerAction performs reboot|shutdown (through shutdown.exe, which shows
 // the countdown and message to logged-in users) and lock|logoff (through
-// the terminal-services API on the interactive session). Delay applies to
-// reboot and shutdown only.
+// the terminal-services API on the interactive session). The poweroff/halt
+// and logout aliases are accepted here exactly as the server and the Linux
+// agent accept them. Delay applies to reboot, shutdown and logoff; lock is
+// immediate, as it is on Linux.
 func powerAction(p protocol.Power) error {
-	action := strings.ToLower(strings.TrimSpace(p.Action))
-	switch action {
+	switch action := winPowerAction(p.Action); action {
 	case "reboot", "shutdown":
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -38,18 +40,41 @@ func powerAction(p protocol.Power) error {
 		}
 		return nil
 	case "logoff":
-		sid, err := interactiveSessionID()
-		if err != nil {
+		// Resolve the session now so "no interactive user on this device" is
+		// answered as an error instead of arriving as a silent no-op minutes
+		// later; the delayed run resolves it again, because the session that
+		// is current when the grace period ends is the one to log off.
+		if _, err := interactiveSessionID(); err != nil {
 			return err
 		}
-		// bWait = FALSE: the reply goes back now; the logoff completes on
-		// its own and a stuck application cannot hold the request open.
-		if r, _, e := procWTSLogoffSession.Call(wtsCurrentServerHandle, uintptr(sid), 0); r == 0 {
-			return fmt.Errorf("log off session %d: %w", sid, e)
+		// delay_sec is the same "warn the user first" grace period the Linux
+		// agent honours (power_linux.go logoffGraphicalSessions): answer the
+		// server now and log off when it expires.
+		if delay := winClampPowerDelay(p.Delay); delay > 0 {
+			time.AfterFunc(time.Duration(delay)*time.Second, func() {
+				if err := logoffInteractiveSession(); err != nil {
+					slog.Error("scheduled logoff failed", "err", err)
+				}
+			})
+			return nil
 		}
-		return nil
+		return logoffInteractiveSession()
 	}
 	return fmt.Errorf("unknown power action %q", p.Action)
+}
+
+// logoffInteractiveSession logs off whichever session is interactive now.
+func logoffInteractiveSession() error {
+	sid, err := interactiveSessionID()
+	if err != nil {
+		return err
+	}
+	// bWait = FALSE: the reply goes back now; the logoff completes on its own
+	// and a stuck application cannot hold the request open.
+	if r, _, e := procWTSLogoffSession.Call(wtsCurrentServerHandle, uintptr(sid), 0); r == 0 {
+		return fmt.Errorf("log off session %d: %w", sid, e)
+	}
+	return nil
 }
 
 // runShutdown runs shutdown.exe with args. When a shutdown is already

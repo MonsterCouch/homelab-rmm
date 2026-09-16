@@ -311,7 +311,7 @@ slice in `db.go`, applied in order and tracked in `PRAGMA user_version`.
 | `patches` | per-device update inventory, `(agent_id, patch_id)` | `status` (`available`, `approved`, `installing`, `installed`, `failed`, `ignored`), `severity`, `categories`, `source` |
 | `patch_policies` | scan/install schedules | `scan_schedule`, `install_schedule`, `mode`, `reboot` |
 | `audit` | who did what | `user`, `ip`, `action`, `target`, `details` |
-| `agent_events` | unsolicited agent events (service changes, patch progress, log lines) | `kind`, `message`, `fields` |
+| `agent_events` | the device event timeline: `patch` progress lines pushed by the agent, `enrol` and `drift` rows written by the server. Monitored-service state is **not** here — it rides in each metrics sample and reaches operators through the alert engine | `kind`, `message`, `fields` |
 | `baselines` | desired-state definitions | `targets` (JSON), `enforce`, `interval_sec`, `enabled`, `version` |
 | `baseline_checks` | the checks of a baseline | **`id INTEGER PRIMARY KEY AUTOINCREMENT`** (identity is permanent), `position` (presentation only), `kind`, `params` (JSON), `remediate`, `severity`, `os_filter`, `timeout_sec` |
 | `baseline_results` | current state per (device, check) | `state`, `expected`, `observed`, `detail`, `fixed`, `version`, `stale`, `checked_at` (device clock), `received_at` / `since` (server clock) |

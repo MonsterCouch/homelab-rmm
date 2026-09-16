@@ -100,6 +100,11 @@ func (r *scriptRunner) run(parent context.Context, req protocol.ScriptRun, emit 
 		res.Error = err.Error()
 		return res
 	}
+	// On Windows this puts the interpreter and everything it spawns in a
+	// kill-on-close job, so a timeout or a cancel reaches a descendant whose
+	// parent already exited - the one that would otherwise hold the pipes
+	// below open for ever. Elsewhere the process group already does that.
+	defer superviseCommand(cmd)()
 	var (
 		wg         sync.WaitGroup
 		outB, errB strings.Builder
