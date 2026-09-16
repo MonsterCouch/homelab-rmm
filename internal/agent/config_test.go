@@ -3,6 +3,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -89,5 +90,48 @@ func TestSaveAndLoadRoundTripInTheConfiguredDirectory(t *testing.T) {
 	}
 	if got.ServerURL != "https://rmm.lan:8443" || got.AgentID != "a1" || got.Key != "k1" {
 		t.Fatalf("loaded %+v", got)
+	}
+}
+
+// ---- is the connection to the server protected at all? ----
+
+// docs/SECURITY.md promises the operator that agents pin the server
+// certificate. A server_url of http:// opts out of TLS entirely - WSURL turns
+// it into ws://, which never consults TLSConfig - and nothing said so.
+func TestPlaintextIsRecognisedFromTheURLTheAgentWillDial(t *testing.T) {
+	cases := []struct {
+		url  string
+		want bool
+	}{
+		{"http://127.0.0.1:18080", true},
+		{"http://rmm.lan:8080", true},
+		{"https://rmm.lan:8443", false},
+		{"rmm.lan:8443", false}, // no scheme: WSURL dials wss://
+	}
+	for _, tc := range cases {
+		c := &Config{ServerURL: tc.url}
+		if got := c.Plaintext(); got != tc.want {
+			t.Errorf("Config{%q}.Plaintext() = %v, want %v", tc.url, got, tc.want)
+		}
+		// The two must not drift: what WSURL builds is what is dialled.
+		if got := strings.HasPrefix(c.WSURL("/ws/agent"), "ws://"); got != c.Plaintext() {
+			t.Errorf("%q: WSURL says plaintext=%v, Plaintext() says %v", tc.url, got, c.Plaintext())
+		}
+	}
+}
+
+func TestPlaintextWarningNamesTheURLAndTheIgnoredPin(t *testing.T) {
+	if got := (&Config{ServerURL: "https://rmm.lan:8443"}).PlaintextWarning(); got != "" {
+		t.Fatalf("PlaintextWarning on an https:// URL = %q, want nothing", got)
+	}
+	got := (&Config{ServerURL: "http://rmm.lan:8080"}).PlaintextWarning()
+	if !strings.HasPrefix(got, "WARNING") || !strings.Contains(got, "http://rmm.lan:8080") {
+		t.Fatalf("PlaintextWarning = %q", got)
+	}
+	// A fingerprint on an http:// URL pins nothing at all, which is worse than
+	// having none: the operator thinks the connection is protected.
+	pinned := (&Config{ServerURL: "http://rmm.lan:8080", Fingerprint: "ab12"}).PlaintextWarning()
+	if !strings.Contains(pinned, "fingerprint") {
+		t.Fatalf("PlaintextWarning with a fingerprint = %q, want it to say the pin is ignored", pinned)
 	}
 }

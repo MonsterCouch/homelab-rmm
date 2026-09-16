@@ -33,6 +33,15 @@ you trust it — an attacker who can present *another* self-signed certificate w
 same warning, which is why you should import the real one once rather than click through every
 time.
 
+That protection is the `https://` case, which is what the console's install command produces for
+a server with a certificate. It does **not** hold for a `server_url` of `http://` — what a server
+run with `--insecure` and no proxy in front hands out: the agent then dials `ws://`, no TLS code
+runs at all, a configured `fingerprint` is never consulted, and the device key and every byte
+after it are in clear text. `rmm-agent install` warns about an `http://` URL and the agent logs
+`server URL is plaintext` at every start, but neither refuses it, because a loopback development
+server is a legitimate use of it. Treat any fleet whose agents carry an `http://` URL as
+unprotected against adversary 1 above.
+
 **Device identity.** Enrolment requires a token created by an operator. Tokens are 24 random
 bytes, expire (24 h default) and have a use count (1 default); an exhausted or expired token is
 refused, hidden from the list and purged a day after its expiry. The use is **consumed in the
@@ -53,8 +62,9 @@ on-LAN, is initiated by the server and consists of a broadcast magic packet.
 (`internal/agent/config.go`), and the agent replays it whenever the server answers 401 — that is
 how a device recovers from a revoked key without anyone visiting it, and it is a deliberate
 trade. What it costs: a token created with several uses, or the console's "unlimited", is at rest
-on every device it enrolled (0600, root/SYSTEM-readable, so anyone who is already root there can
-lift it) until it expires — one more reason to prefer single-use tokens and short expiries. And
+on every device it enrolled (readable only by root, or by SYSTEM and Administrators on Windows,
+so anyone who is already root there can lift it) until it expires — one more reason to prefer
+single-use tokens and short expiries. And
 **deleting a device does not revoke the token on it**: the agent re-enrols within seconds as a
 brand-new record with no history, so removing a machine for good means stopping or uninstalling
 its agent first, or waiting out the token. The rejoin is auditable (`agent.enrolled`, or
@@ -224,7 +234,14 @@ If that window is unacceptable in your environment:
 - copy `agents/rmm-agent-<os>-<arch>` to the device by other means and run
   `rmm-agent install --server … --token … --fingerprint …` by hand, comparing the fingerprint
   with the one in the console (`Settings → System`) — this is the manual install described in the
-  README and it never disables validation.
+  README and it never disables validation. **Put the binary in an administrators-only directory
+  first** — `C:\Program Files\HomelabRMM` or `/opt/homelab-rmm`, which is what the rendered
+  installer uses — and run `install` from there. `install` registers the image path it was run
+  from and copies nothing, so a binary left in `Downloads`, on the Desktop or in a build tree
+  makes the file the SCM launches as LocalSystem (or systemd launches as root) writable by an
+  unprivileged account: replacing it is SYSTEM at the next start, with no UAC prompt anywhere.
+  `install` inspects that directory and warns, naming the accounts that can write it, but it
+  does not refuse.
 
 Verify a fingerprint out of band before pasting it; it is the trust anchor for that device.
 
@@ -245,9 +262,19 @@ Verify a fingerprint out of band before pasting it; it is the trust anchor for t
   starter script warns about this: passwords passed as parameters are visible to every console
   user who can read runs. Prefer scripts that generate secrets on the device or read them from
   a vault.
-- **Agent configuration is only as safe as the device.** `agent.json` (0600, owned by root /
-  LocalSystem) contains the device key; whoever has root on a device has that key. It grants
-  nothing beyond that device's own identity.
+- **Agent configuration is only as safe as the device.** `agent.json` holds the device key, and
+  whoever is root or SYSTEM on a device has it. The file is protected by the platform and not by
+  the Go file mode: `0600` and root ownership on Linux, and on Windows a *protected DACL* on
+  `%ProgramData%\HomelabRMM` granting only `NT AUTHORITY\SYSTEM` and `BUILTIN\Administrators`,
+  re-applied at every agent start and inherited by the files inside (the `0600` Go passes there
+  is ignored, and the console's own file browser reports a meaningless `-rw-rw-rw-` for Windows
+  paths — check it with `icacls`). What it grants is **more than that device's identity**: it
+  also holds `enroll_token`, deliberately kept so a device whose key was revoked can re-enrol
+  unattended (see "The token stays on the device" above). Until that token expires or runs out
+  of uses, whoever reads one device's `agent.json` can enrol new devices into the fleet and, with
+  a victim's hostname, take over an offline device's record. Single-use, short-lived tokens keep
+  that window small; a long-lived multi-use token turns every device that used it into a copy of
+  the fleet credential.
 - **Email is plain text.** Alert mail carries device names and messages; use STARTTLS/TLS to
   your relay and do not put secrets in alert titles.
 - **The database is not encrypted at rest.** The data directory should be readable only by the

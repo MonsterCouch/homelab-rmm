@@ -138,6 +138,12 @@ func Control(spec Spec, action string) error {
 		if err := s.Install(); err != nil {
 			return err
 		}
+		if err := setErrorControl(spec.Name); err != nil {
+			// Not fatal: the service is registered and will run. It just
+			// will not leave a Service Control Manager entry behind when it
+			// fails to start, which is the diagnostic of last resort.
+			fmt.Fprintln(os.Stderr, "warning: could not set the service's error control:", err)
+		}
 		return s.Start()
 	case "uninstall":
 		_ = s.Stop()
