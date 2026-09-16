@@ -190,7 +190,14 @@ func runHiddenCP(ctx context.Context, cp uint32, onLine func(string), name strin
 	// A grandchild that inherited our pipes must not keep Wait blocked after
 	// the child itself has gone.
 	cmd.WaitDelay = 10 * time.Second
-	runErr := cmd.Run()
+	// Run, but with the job object attached in between: it is what makes a
+	// cancelled helper take its whole tree with it.
+	runErr := cmd.Start()
+	if runErr == nil {
+		release := superviseCommand(cmd)
+		runErr = cmd.Wait()
+		release()
+	}
 	if splitter != nil {
 		splitter.flush()
 	}

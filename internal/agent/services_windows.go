@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -94,6 +95,73 @@ func openService(scm windows.Handle, name string, access uint32) (*mgr.Service, 
 	return &mgr.Service{Name: name, Handle: h}, nil
 }
 
+// serviceConfigDescOnce keeps the "no description" note to one line per
+// process: on a stock Windows install a handful of services always have an
+// unresolvable description, and one warning per service per poll would be
+// pure noise.
+var serviceConfigDescOnce sync.Once
+
+// serviceConfig reads a service's configuration one query at a time.
+// mgr.Service.Config is all-or-nothing: it returns the error of whichever
+// sub-query failed, and on a service whose description is an "@dll,-N" MUI
+// reference that no longer resolves (WaaSMedicSvc, workfolderssvc,
+// IsolationSession) that is QueryServiceConfig2(DESCRIPTION) failing with
+// ERROR_MUI_FILE_NOT_FOUND - which used to cost the start type as well,
+// reporting a plain demand-start service as "unknown". QueryServiceConfig
+// succeeds for all of them, so ask separately and keep what came back.
+func serviceConfig(h windows.Handle) (winServiceConfig, error) {
+	var raw *windows.QUERY_SERVICE_CONFIG
+	// The buffer is sized from n, whose address is taken as well, so it is
+	// always heap-allocated - the shape x/sys/windows/svc/mgr uses. Replacing
+	// it with a fixed-size local buffer faults (0xc0000005) inside the SCM's
+	// RPC client as it writes the reply back, so keep the run-time size.
+	n := uint32(1024)
+	for {
+		b := make([]byte, n)
+		raw = (*windows.QUERY_SERVICE_CONFIG)(unsafe.Pointer(&b[0]))
+		err := windows.QueryServiceConfig(h, raw, n, &n)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) || n <= uint32(len(b)) {
+			return winServiceConfig{}, fmt.Errorf("QueryServiceConfig: %w", err)
+		}
+	}
+	cfg := winServiceConfig{
+		HaveStartType: true,
+		StartType:     raw.StartType,
+		DisplayName:   windows.UTF16PtrToString(raw.DisplayName),
+	}
+	if b, err := serviceConfig2(h, windows.SERVICE_CONFIG_DELAYED_AUTO_START_INFO); err == nil {
+		cfg.Delayed = (*windows.SERVICE_DELAYED_AUTO_START_INFO)(unsafe.Pointer(&b[0])).IsDelayedAutoStartUp != 0
+	}
+	if b, err := serviceConfig2(h, windows.SERVICE_CONFIG_DESCRIPTION); err == nil {
+		cfg.Description = windows.UTF16PtrToString((*windows.SERVICE_DESCRIPTION)(unsafe.Pointer(&b[0])).Description)
+	} else {
+		serviceConfigDescOnce.Do(func() {
+			slog.Warn("some service descriptions cannot be resolved on this device; state and start type are unaffected", "err", err)
+		})
+	}
+	return cfg, nil
+}
+
+// serviceConfig2 runs one QueryServiceConfig2 level, growing the buffer until
+// the SCM stops asking for more. The buffer is sized from n for the same
+// reason serviceConfig's is.
+func serviceConfig2(h windows.Handle, level uint32) ([]byte, error) {
+	n := uint32(1024)
+	for {
+		b := make([]byte, n)
+		err := windows.QueryServiceConfig2(h, level, &b[0], n, &n)
+		if err == nil {
+			return b, nil
+		}
+		if !errors.Is(err, windows.ERROR_INSUFFICIENT_BUFFER) || n <= uint32(len(b)) {
+			return nil, fmt.Errorf("QueryServiceConfig2(%d): %w", level, err)
+		}
+	}
+}
+
 // describeService reads status and configuration into a wire Service. The
 // config half needs SERVICE_QUERY_CONFIG; when the handle lacks it the
 // start type is reported as unknown rather than failing the row.
@@ -103,12 +171,10 @@ func describeService(s *mgr.Service, display string) protocol.Service {
 		out.State = winServiceStateName(uint32(st.State))
 		out.PID = int(st.ProcessId)
 	}
-	if cfg, err := s.Config(); err == nil {
-		out.StartType = winServiceStartTypeName(cfg.StartType, cfg.DelayedAutoStart)
-		out.Description = winCleanServiceDescription(cfg.Description)
-		if out.DisplayName == "" {
-			out.DisplayName = cfg.DisplayName
-		}
+	if cfg, err := serviceConfig(s.Handle); err == nil {
+		winApplyServiceConfig(&out, cfg)
+	} else {
+		slog.Debug("service configuration unreadable", "service", s.Name, "err", err)
 	}
 	if out.DisplayName == "" {
 		out.DisplayName = s.Name
@@ -134,9 +200,10 @@ func listServices() ([]protocol.Service, error) {
 			s.DisplayName = st.name
 		}
 		if ms, err := openService(scm, st.name, windows.SERVICE_QUERY_CONFIG); err == nil {
-			if cfg, err := ms.Config(); err == nil {
-				s.StartType = winServiceStartTypeName(cfg.StartType, cfg.DelayedAutoStart)
-				s.Description = winCleanServiceDescription(cfg.Description)
+			if cfg, err := serviceConfig(ms.Handle); err == nil {
+				winApplyServiceConfig(&s, cfg)
+			} else {
+				slog.Debug("service configuration unreadable", "service", st.name, "err", err)
 			}
 			ms.Close()
 		}

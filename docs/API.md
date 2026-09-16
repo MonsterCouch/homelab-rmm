@@ -68,7 +68,10 @@ See `routes()` in `internal/server/api.go`. Highlights:
   [Event log](#event-log)), `GET .../fs?path=`,
   `GET .../fs/download?path=` (binary), `POST .../fs/upload?path=` (raw body),
   `POST .../fs/delete|mkdir {path}`, `POST .../fs/rename {from,to}`,
-  `POST .../power {action: reboot|shutdown|lock|logoff, delay_sec, message}`, `POST .../wol`,
+  `POST .../power {action: reboot|shutdown|lock|logoff, delay_sec, message}` — `poweroff` and
+  `halt` are accepted as aliases of `shutdown`, `logout` as an alias of `logoff`; `delay_sec` is a
+  grace period honoured for reboot, shutdown and logoff, while lock is always immediate,
+  `POST .../wol`,
   `POST .../run {script_id | language+body, args, timeout_sec}` → `{run_id}` (409 when the run
   cannot start, including a `script_id` whose `os_filter` does not match the device),
   `GET .../patches` → `{patches, last_scan, scan_error}` (`scan_error` is what the agent said went

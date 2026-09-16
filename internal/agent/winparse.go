@@ -68,7 +68,11 @@ func winDecodeUTF16LE(b []byte) string {
 
 // winCleanMessage makes operator-supplied text safe for a command line and a
 // dialog box: control characters become spaces and the result is capped at
-// max runes (shutdown.exe refuses /c comments over 512 characters).
+// max UTF-16 code units. The unit matters: shutdown.exe refuses a /c comment
+// longer than 512 *characters*, which Windows counts in UTF-16 units, so a
+// rune outside the BMP (an emoji in a maintenance notice) costs two and a
+// rune-based cap of 512 could hand shutdown.exe 1024 units - twice its
+// maximum, turning a valid power request into a failure.
 func winCleanMessage(s string, max int) string {
 	s = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
@@ -77,8 +81,16 @@ func winCleanMessage(s string, max int) string {
 		return r
 	}, s)
 	s = strings.Join(strings.Fields(s), " ")
-	if r := []rune(s); len(r) > max {
-		s = string(r[:max])
+	units := 0
+	for i, r := range s {
+		n := utf16.RuneLen(r)
+		if n < 0 {
+			n = 1 // unencodable: written as U+FFFD, a single unit
+		}
+		if units+n > max {
+			return s[:i]
+		}
+		units += n
 	}
 	return s
 }
@@ -592,6 +604,36 @@ func winCleanServiceDescription(s string) string {
 		return ""
 	}
 	return s
+}
+
+// winServiceConfig is what the per-service configuration queries managed to
+// read. Each part is separate on purpose: on a service whose description is
+// an "@dll,-N" MUI reference the system can no longer resolve (WaaSMedicSvc,
+// workfolderssvc and IsolationSession on a stock Windows 11),
+// QueryServiceConfig2(DESCRIPTION) fails while QueryServiceConfig itself
+// succeeds, and an all-or-nothing read threw the start type away with it.
+type winServiceConfig struct {
+	// HaveStartType is false when even QueryServiceConfig failed, which is
+	// the only case where the start type is genuinely unknown.
+	HaveStartType bool
+	StartType     uint32
+	Delayed       bool
+	Description   string
+	DisplayName   string
+}
+
+// winApplyServiceConfig copies the parts cfg could supply onto s and leaves
+// the rest as they were, so a missing description costs only the description.
+func winApplyServiceConfig(s *protocol.Service, cfg winServiceConfig) {
+	if cfg.HaveStartType {
+		s.StartType = winServiceStartTypeName(cfg.StartType, cfg.Delayed)
+	}
+	if d := winCleanServiceDescription(cfg.Description); d != "" {
+		s.Description = d
+	}
+	if s.DisplayName == "" {
+		s.DisplayName = cfg.DisplayName
+	}
 }
 
 // ---- event log ----
@@ -1387,6 +1429,42 @@ func winParseWingetUpgrade(out string) []protocol.Update {
 }
 
 // ---- power ----
+
+// winPowerAction canonicalises a requested power action to reboot, shutdown,
+// lock or logoff, and returns "" for anything else. The aliases are exactly
+// the ones the server's allow-list (internal/server/api_agents.go) and the
+// Linux agent (power_linux.go) accept, so the same request cannot power a
+// Linux device off and come back as an error from a Windows one.
+func winPowerAction(action string) string {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "reboot":
+		return "reboot"
+	case "shutdown", "poweroff", "halt":
+		return "shutdown"
+	case "lock":
+		return "lock"
+	case "logoff", "logout":
+		return "logoff"
+	}
+	return ""
+}
+
+// winMaxPowerDelay bounds a delay the agent waits out itself (seconds); it
+// mirrors power_linux.go's maxPowerDelay. A huge value would park a logoff
+// years out or overflow the Duration arithmetic, and a wrapped negative timer
+// fires at once - the opposite of what was asked.
+const winMaxPowerDelay = 7 * 24 * 60 * 60
+
+// winClampPowerDelay normalises a requested delay in seconds.
+func winClampPowerDelay(d int) int {
+	if d < 0 {
+		return 0
+	}
+	if d > winMaxPowerDelay {
+		return winMaxPowerDelay
+	}
+	return d
+}
 
 // winShutdownArgs builds the shutdown.exe argument list for reboot or
 // shutdown. /f closes applications without warning (an unattended box has
