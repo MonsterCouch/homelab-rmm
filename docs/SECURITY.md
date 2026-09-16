@@ -289,8 +289,13 @@ certificate — `--public-url`/`RMM_PUBLIC_URL` seeds the `public_url` setting i
 the certificate block (`internal/server/server.go`), so a MagicDNS name
 (`<host>.<tailnet>.ts.net`) is a name on the certificate only when it was the `--public-url` host
 on **first run**. Setting Public URL later, from *Settings*, changes what install commands and
-alert mail say and nothing on disk; the server only raises the `cert_warning` banner shown in
-*Settings → System* and logs `certificate name mismatch` at startup.
+alert mail say and nothing on disk. How would you know the name is not covered? From the log and
+nowhere else: at startup, and again at every settings save, the server warns `certificate does
+not cover the public URL` with the certificate's real names in `dns_sans=`/`ip_sans=`, and
+follows it with `certificate name mismatch`, whose `detail=` is the remediation sentence.
+`GET /api/system` returns that sentence as `cert_warning`, but no page in the console displays
+it today, so a Settings screen that looks clean proves nothing (`docs/OPERATIONS.md` §6 shows
+both lines).
 
 So reaching the server by any other name — the MagicDNS name, an FQDN, an address added after the
 certificate was written — produces a **hostname mismatch on top of the self-signed warning**, and

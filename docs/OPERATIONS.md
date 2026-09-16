@@ -266,9 +266,27 @@ it is written:
 That last row is the one that catches people. The flag seeds the `public_url` *setting* on first
 run and the certificate is generated from the seeded value in the same start. Setting Public URL
 afterwards from *Settings*, or adding the flag to an installation that already has a certificate,
-changes what install commands and alert mail say and nothing on disk. The server does say so: it
-logs `certificate name mismatch` at startup with the certificate's actual names, and
-*Settings → System* carries a banner naming the host that is not covered.
+changes what install commands and alert mail say and nothing on disk. The server does say so — in
+the log, and only there. `checkCertHost` runs at startup, and again every time *Settings* is
+saved, and the one line it writes — before the `listening` line — is the one that carries the
+names actually in the certificate:
+
+```
+level=WARN msg="certificate does not cover the public URL" host=rmm.example.ts.net dns_sans="[localhost RMM-HOST]" ip_sans="[127.0.0.1 192.168.1.12]"
+```
+
+`dns_sans`/`ip_sans` is the whole SAN list, and that line is the only place it is printed. The
+warning after `listening` carries the remediation sentence and no names at all:
+
+```
+level=WARN msg="certificate name mismatch" detail="the server certificate does not cover \"rmm.example.ts.net\": browsers report a name mismatch and an agent enrolled without a fingerprint pin refuses to connect. Supply your own certificate with --cert/--key, or delete server.crt and server.key from <data-dir> and restart to regenerate one (every agent must then re-pin the new fingerprint)."
+```
+
+The console shows neither. That same sentence is what `GET /api/system` returns as `cert_warning`,
+but no page reads the field today: *Settings → System* lists version, public URL, fingerprint,
+data directory, database size, uptime and agents connected, and says nothing about names. **A
+quiet Settings page is not evidence that the certificate covers the name** — the startup log is
+the place to look, or `cert_warning` from the API if you would rather script it.
 
 **A name mismatch here is normal, and on its own it is not a fault.** Browsing to
 `https://rmm.example.ts.net:8443` when the certificate says `localhost, 127.0.0.1, RMM-HOST,
