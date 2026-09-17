@@ -32,7 +32,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('web', 'server', 'agents', 'all', 'test', 'package', 'checksums', 'clean')]
+    [ValidateSet('web', 'server', 'agents', 'all', 'test', 'package', 'msi', 'checksums', 'clean')]
     [string[]]$Target = @('all'),
     [string]$Version = '',
     [string]$Dist = 'dist'
@@ -282,6 +282,58 @@ function Remove-BuildOutput {
     Get-ChildItem -Path 'web\dist' -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne '.gitkeep' } | Remove-Item -Recurse -Force
 }
 
+# New-Msi builds the Windows installers with the WiX Toolset. MSI rather than a
+# self-extracting .exe because the agent has to reach a fleet: msiexec takes the
+# server URL and enrollment token as properties, and Group Policy, Intune and
+# SCCM all deploy an MSI natively.
+#
+# WiX is not a build dependency for anything else, so this target is deliberately
+# not part of -Target all: a machine without it can still build and package.
+function New-Msi {
+    $wix = Get-Command wix -ErrorAction SilentlyContinue
+    if (-not $wix) {
+        $candidate = Join-Path $env:ProgramFiles 'WiX Toolset v7.0\bin\wix.exe'
+        if (Test-Path $candidate) { $wix = $candidate } else {
+            throw "wix.exe not found. Install it with: winget install --id WiXToolset.WiXCLI, then accept the EULA with: wix eula accept wix7"
+        }
+    } else { $wix = $wix.Source }
+
+    $agentExe  = Join-Path $Dist "rmm-agent-windows-amd64.exe"
+    $serverExe = Join-Path $Dist "rmm-server-windows-amd64.exe"
+    foreach ($exe in @($agentExe, $serverExe)) {
+        if (-not (Test-Path $exe)) { throw "$exe is missing; run -Target all first" }
+    }
+    Assert-Fresh $agentExe  "agents"
+    Assert-Fresh $serverExe "server"
+
+    # An MSI ProductVersion must be numeric (a.b.c.d), so a describe like
+    # v0.2.0-43-g1e3fc5d becomes 0.2.0.43. The full version still goes into the
+    # binaries themselves via -ldflags.
+    $msiVersion = Get-MsiVersion $Version
+    $src = Join-Path $Root "installer\windows"
+    foreach ($part in @(
+        @{ Name = "rmm-agent";  Wxs = "rmm-agent.wxs";  VarName = "AgentExe";  Exe = $agentExe },
+        @{ Name = "rmm-server"; Wxs = "rmm-server.wxs"; VarName = "ServerExe"; Exe = $serverExe }
+    )) {
+        $out = Join-Path $Dist ($part.Name + "-" + $Version + "-x64.msi")
+        & $wix build (Join-Path $src $part.Wxs) `
+            "-d" "Version=$msiVersion" `
+            "-d" ($part.VarName + "=" + $part.Exe) `
+            "-ext" "WixToolset.Util.wixext" "-arch" "x64" "-o" $out
+        if ($LASTEXITCODE -ne 0) { throw "wix build failed for $($part.Wxs)" }
+        Write-Host "  msi $out"
+    }
+}
+
+# Get-MsiVersion reduces a git describe to the numeric form Windows Installer
+# accepts. v0.2.0-43-g1e3fc5d -> 0.2.0.43; a plain tag v0.2.0 -> 0.2.0.
+function Get-MsiVersion([string]$v) {
+    $m = [regex]::Match($v, "^v?(d+).(d+).(d+)(?:-(d+))?")
+    if (-not $m.Success) { return "0.0.0.0" }
+    $rev = if ($m.Groups[4].Success) { $m.Groups[4].Value } else { "0" }
+    return "$($m.Groups[1].Value).$($m.Groups[2].Value).$($m.Groups[3].Value).$rev"
+}
+
 foreach ($t in $Target) {
     switch ($t) {
         'web'       { Build-Web }
@@ -290,6 +342,7 @@ foreach ($t in $Target) {
         'all'       { Build-Web; Build-Server; Build-Agents }
         'test'      { Invoke-Tests }
         'package'   { New-Packages }
+        'msi'       { New-Msi }
         'checksums' { Write-Checksums }
         'clean'     { Remove-BuildOutput }
     }

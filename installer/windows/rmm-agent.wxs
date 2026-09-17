@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Homelab RMM agent installer (MSI).
+
+  An MSI rather than a self-extracting .exe because this is the package that
+  has to reach a fleet: msiexec takes properties on the command line, and Group
+  Policy, Intune and SCCM all deploy an MSI natively, so the agent can be
+  pushed to machines that have never heard of the server.
+
+      msiexec /i rmm-agent.msi /qn SERVER="https://rmm.example.ts.net:8443" TOKEN="<enrollment token>"
+
+  FINGERPRINT is only needed when the server serves a self-signed certificate.
+  Leave it out when the certificate is publicly trusted (a Tailscale/Let's
+  Encrypt certificate is), and the agent uses system trust.
+
+  The package lays the binary down in an administrators-only directory and then
+  runs the agent's own `install` subcommand, rather than declaring the service
+  with ServiceInstall. That keeps one tested code path writing agent.json,
+  registering the service and confirming it started, instead of a second
+  description of the same thing that can drift.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Homelab RMM Agent"
+      Manufacturer="Homelab RMM"
+      Version="$(var.Version)"
+      UpgradeCode="AB333BB4-D561-4797-9BDF-9F67EBE1F65B"
+      Scope="perMachine"
+      Compressed="yes">
+
+    <SummaryInformation Description="Homelab RMM monitoring and management agent" />
+
+    <!-- Upgrading replaces the files; the agent keeps its identity because
+         agent.json lives in %ProgramData%, which this package never touches. -->
+    <MajorUpgrade
+        Schedule="afterInstallInitialize"
+        DowngradeErrorMessage="A newer version of the Homelab RMM Agent is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Enrollment details. SERVER and TOKEN are required for a first install;
+         an upgrade over an existing agent does not need them, because the
+         configuration it already wrote is what identifies the device. -->
+    <Property Id="SERVER" Secure="yes" />
+    <Property Id="TOKEN" Secure="yes" />
+    <Property Id="FINGERPRINT" Secure="yes" />
+
+    <!-- WIXUI-less: this is a silent/managed install. A first install with no
+         SERVER is a mistake worth stopping, rather than laying down a binary
+         that will never connect. -->
+    <Launch
+        Condition="Installed OR SERVER"
+        Message="SERVER is required, e.g. msiexec /i rmm-agent.msi /qn SERVER=&quot;https://rmm.example:8443&quot; TOKEN=&quot;...&quot;" />
+    <Launch
+        Condition="Installed OR TOKEN"
+        Message="TOKEN is required: create an enrollment token in the console under Devices, Enroll device." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="HomelabRMM">
+        <Component Id="AgentExe" Guid="7C2E0A14-7B7E-4C8B-9E5B-3A1D0C5E9F21" Bitness="always64">
+          <File Id="rmm_agent.exe" Name="rmm-agent.exe" Source="$(var.AgentExe)" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Homelab RMM Agent" Level="1">
+      <ComponentRef Id="AgentExe" />
+    </Feature>
+
+    <!-- The command lines are built into properties named after the deferred
+         actions, which is how a deferred custom action receives data: it runs
+         in a different process with no access to the install session. -->
+    <SetProperty Id="EnrollAgent"
+        Value="&quot;[INSTALLFOLDER]rmm-agent.exe&quot; install --server &quot;[SERVER]&quot; --token &quot;[TOKEN]&quot; --fingerprint &quot;[FINGERPRINT]&quot;"
+        Before="EnrollAgent" Sequence="execute" />
+    <CustomAction Id="EnrollAgent" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec64"
+        Execute="deferred" Impersonate="no" Return="check" />
+
+    <SetProperty Id="UnenrollAgent"
+        Value="&quot;[INSTALLFOLDER]rmm-agent.exe&quot; uninstall"
+        Before="UnenrollAgent" Sequence="execute" />
+    <!-- Return="ignore": an agent whose service is already gone must not block
+         its own removal, or the package can never be uninstalled cleanly. -->
+    <CustomAction Id="UnenrollAgent" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec64"
+        Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- Stop and deregister before the files go, install after they arrive. -->
+      <Custom Action="UnenrollAgent" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="EnrollAgent" After="InstallFiles" Condition="NOT Installed" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Homelab RMM server installer (MSI).
+
+  The server is normally one machine rather than a fleet, so the deployment
+  argument that decides the agent package does not apply here. It is an MSI
+  anyway for the things MSI gives for free: a real Add/Remove Programs entry,
+  upgrade semantics that replace the binary without touching the data
+  directory, and an uninstall that deregisters the service instead of leaving
+  it pointing at a file that is gone.
+
+      msiexec /i rmm-server.msi /qn PUBLICURL="https://rmm.example.ts.net:8443"
+
+  Everything has a working default, so PUBLICURL is the only value worth
+  setting, and even that can be changed later from Settings. The data
+  directory is deliberately NOT the agent's %ProgramData%\HomelabRMM: both
+  would collide on a machine that runs the server and an agent, which is the
+  normal case for a homelab.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Homelab RMM Server"
+      Manufacturer="Homelab RMM"
+      Version="$(var.Version)"
+      UpgradeCode="E041131B-FC89-41A2-8129-C26CD96673D2"
+      Scope="perMachine"
+      Compressed="yes">
+
+    <SummaryInformation Description="Homelab RMM control plane: console, API and agent endpoint" />
+
+    <MajorUpgrade
+        Schedule="afterInstallInitialize"
+        DowngradeErrorMessage="A newer version of the Homelab RMM Server is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- LISTEN binds every interface by default; restrict reachability with the
+         firewall (a Tailscale-only rule is what the docs recommend) rather than
+         by binding a single address, so the service still starts when that
+         interface is not up yet at boot. -->
+    <Property Id="LISTEN" Value="0.0.0.0:8443" Secure="yes" />
+    <Property Id="DATADIR" Value="C:\ProgramData\HomelabRMM-Server\data" Secure="yes" />
+    <Property Id="PUBLICURL" Secure="yes" />
+    <!-- Supply both to serve a certificate you already have, e.g. one minted by
+         `tailscale cert`. Left empty, the server generates a self-signed
+         certificate on first run and agents pin its fingerprint. -->
+    <Property Id="CERTFILE" Secure="yes" />
+    <Property Id="KEYFILE" Secure="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="HomelabRMM Server">
+        <Component Id="ServerExe" Guid="B4D9F1C7-2E6A-4F3B-8D5C-1A7E9B2C4D60" Bitness="always64">
+          <File Id="rmm_server.exe" Name="rmm-server.exe" Source="$(var.ServerExe)" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Homelab RMM Server" Level="1">
+      <ComponentRef Id="ServerExe" />
+    </Feature>
+
+    <!-- PUBLICURL and the certificate pair are optional, so they are appended
+         only when set: passing an empty public-url flag would seed the setting
+         with an empty string on first run. -->
+    <!-- Each optional group becomes its own property holding the flag AND its
+         value, or nothing at all. An unset property expands to the empty
+         string in a formatted field, so the command line below composes
+         without needing one variant per combination. -->
+    <SetProperty Id="PUBLICURLARG" Value=" --public-url &quot;[PUBLICURL]&quot;"
+        Before="SetInstallServerService" Sequence="execute" Condition="PUBLICURL" />
+    <SetProperty Id="CERTARG" Value=" --cert &quot;[CERTFILE]&quot; --key &quot;[KEYFILE]&quot;"
+        Before="SetInstallServerService" Sequence="execute" Condition="CERTFILE AND KEYFILE" />
+    <SetProperty Id="InstallServerService"
+        Value="&quot;[INSTALLFOLDER]rmm-server.exe&quot; install --listen &quot;[LISTEN]&quot; --data &quot;[DATADIR]&quot;[PUBLICURLARG][CERTARG]"
+        Before="InstallServerService" Sequence="execute" />
+    <CustomAction Id="InstallServerService" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec64"
+        Execute="deferred" Impersonate="no" Return="check" />
+
+    <SetProperty Id="RemoveServerService"
+        Value="&quot;[INSTALLFOLDER]rmm-server.exe&quot; uninstall"
+        Before="RemoveServerService" Sequence="execute" />
+    <CustomAction Id="RemoveServerService" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec64"
+        Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RemoveServerService" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="InstallServerService" After="InstallFiles" Condition="NOT Installed" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>
