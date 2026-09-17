@@ -187,12 +187,14 @@ includes **viewers**, and the parameters carry the `command` bodies and any `fil
 The console says so in the Add-check dialog. Have the check read a secret on the device instead.
 
 **Audit.** Every login, script run, shell and desktop session, power action, patch operation,
+file operation (`file.download`, `file.upload`, `file.delete`, `file.mkdir`, `file.rename`),
 settings change and user change is written to the `audit` table with user and source address,
 along with `setup.refused` (a wrong setup code), `agent.enrolled`, `agent.rekeyed` and
-`agent.duplicate_hostname`. A **service action or process kill is audited whether or not it
-worked**: the attempt is what the log is read for, and a refusal carries
+`agent.duplicate_hostname`. A **service action, process kill or file operation is audited
+whether or not it worked**: the attempt is what the log is read for, and a refusal carries
 `"outcome":"failed"` with the device's own error, so "nobody tried to stop the antivirus" and
-"somebody tried and was refused" are not the same empty log.
+"somebody tried and was refused" are not the same empty log — and a sweep for unreadable paths
+(SAM, a password database, an `.ssh` key) leaves the same trail as a successful one.
 
 **Agent hardening.** Helper tools are resolved by absolute path in `System32` on Windows so a
 writable directory on PATH cannot shadow `shutdown.exe`. The same rule covers every PowerShell the

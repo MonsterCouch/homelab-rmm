@@ -158,6 +158,20 @@ the new version and fix the compare links at the bottom).
    the biometric gate) and the screens (server list, trust review, pin mismatch, QR scan,
    Connection test, settings), then `android/README.md` and a `make apk` target. Build what
    exists with `cd android && ./gradlew :trust:test :app:assembleDebug`.
+6c. **Nine findings from the metrics, files and desktop validation are recorded but not**
+   **fixed**, each for a stated reason rather than an oversight. Needing a protocol or schema
+   change: `swap_used` is collected every 30 s but never stored, charted or alertable; a
+   listing carries no Windows file attributes, so hidden/system/reparse are invisible and every
+   entry claims `rwxrwxrwx`; `net_rx`/`net_tx` report 0 B/s rather than "unknown" when the
+   counter resets, so the graph dips at every agent restart. Inherent to running as SYSTEM in
+   session 0: drives that exist only in the interactive user's session (mapped network drives,
+   `subst`, a cloud filesystem) are missing from both the metrics and the drive-root listing.
+   Needing real work: the remote pointer is invisible in the desktop stream (GDI capture
+   excludes the cursor and no helper sends the documented `cursor` message); a read-only viewer
+   cannot open a desktop session at all although the viewer implements a view-only mode, which
+   wants the input-bearing messages gated rather than the whole socket; an agent config push
+   still drops up to one metrics sample and re-phases the series; alternate data streams are
+   downloadable by path but never listed.
 6b. Three console tasks from the phone pass were not reached: the BaselineStatus compliance
    matrix still renders as a wide table on a phone (C18), the long tail of destructive-action
    adjacency and bulk bars (C19), and the Dashboard/search polish beyond what landed (C16,

@@ -22,8 +22,8 @@ Text frames (JSON):
 | message | meaning |
 |---|---|
 | `{"t":"screen","w":1920,"h":1080,"monitor":0,"monitors":[{"index":0,"x":0,"y":0,"w":1920,"h":1080,"primary":true},...]}` | sent first, after a monitor switch and whenever the resolution changes. `w`/`h` are the current monitor's size; every tile that follows is in that monitor's pixel space. |
-| `{"t":"cursor","x":10,"y":20,"shape":"arrow"}` | optional cursor position (helper may omit; the viewer draws its own cursor). |
-| `{"t":"clipboard","text":"..."}` | optional: remote clipboard changed (text only). |
+| `{"t":"cursor","x":10,"y":20,"shape":"arrow"}` | optional cursor position. **No helper sends this yet on any platform**, and the Windows GDI capture excludes the cursor from the pixels, so the remote pointer is currently invisible in the stream. |
+| `{"t":"clipboard","text":"..."}` | optional: remote clipboard changed (text only). **No helper sends this yet on any platform**, so the viewer's "Remote clipboard" control never becomes available. The viewer-to-helper direction (pasting *into* the session) does work. |
 | `{"t":"error","message":"..."}` | fatal; the helper closes afterwards. |
 
 Binary frames: first byte is the kind.

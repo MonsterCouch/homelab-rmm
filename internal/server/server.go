@@ -393,8 +393,12 @@ func (s *Server) onInventory(id string, inv *protocol.Inventory) {
 }
 
 func (s *Server) onMetrics(id string, m *protocol.Metrics) {
-	if m.TS == 0 {
-		m.TS = now()
+	// The timestamp is whatever the device said, and a device with a skewed
+	// clock used to write samples the retention sweep never reaches and the
+	// console never draws, because its window ends at now. Trust the agent's
+	// value only when it is plausible.
+	if t := now(); m.TS == 0 || m.TS > t+metricsClockSkew || m.TS < t-metricsMaxBacklog {
+		m.TS = t
 	}
 	if err := s.db.saveMetrics(id, m); err != nil {
 		slog.Warn("save metrics", "agent", id, "err", err)
@@ -412,3 +416,11 @@ func (s *Server) onAgentEvent(id string, ev *protocol.Event) {
 	s.hub.broadcast(hubEvent{Kind: "event", AgentID: id, Data: ev})
 	s.alerts.event(id, ev)
 }
+
+// Bounds on the timestamp a device reports with a metrics sample. A sample is
+// normally seconds old; an agent that reconnects after an outage legitimately
+// carries older ones, but nothing legitimately arrives from the future.
+const (
+	metricsClockSkew  = 5 * 60        // seconds a device's clock may run ahead
+	metricsMaxBacklog = 7 * 24 * 3600 // a week: older than the charts reach anyway
+)

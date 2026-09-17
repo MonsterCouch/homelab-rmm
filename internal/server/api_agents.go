@@ -274,6 +274,9 @@ func (s *Server) handleFsDownload(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	var first protocol.FsReadResult
 	if err := s.hub.Request(ctx, id, protocol.ReqFsRead, protocol.FsRead{Path: p, Offset: 0, Length: fsChunk}, &first); err != nil {
+		// A download the device refused is exactly what someone sweeping for
+		// SAM, a KeePass database or an .ssh key produces, so record it.
+		s.audit(r, "file.download", id, auditFailure(map[string]any{"path": p}, err))
 		fail(w, err)
 		return
 	}
@@ -350,6 +353,9 @@ func (s *Server) fsSimple(w http.ResponseWriter, r *http.Request, typ, action st
 	ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
 	defer cancel()
 	if err := s.hub.Request(ctx, r.PathValue("id"), typ, in, nil); err != nil {
+		// Audit the attempt, not only the success: probing a fleet for paths
+		// that cannot be read or removed otherwise leaves no trace at all.
+		s.audit(r, action, r.PathValue("id"), auditFailure(map[string]any{"request": string(in)}, err))
 		fail(w, err)
 		return
 	}
