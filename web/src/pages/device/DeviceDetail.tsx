@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, NavLink, useNavigate, useParams } from 'react-router-dom';
 import { api, ApiError } from '../../api/client';
 import type { Agent, Metrics, PowerAction } from '../../api/types';
@@ -25,6 +25,7 @@ import { DevicePatches } from './DevicePatches';
 import { DeviceRuns } from './DeviceRuns';
 import { DeviceEvents } from './DeviceEvents';
 import { Compliance } from './Compliance';
+import '../../styles/mobile-pages.css';
 
 export interface TabProps {
   agent: Agent;
@@ -67,6 +68,20 @@ export function DeviceDetail() {
   const [power, setPower] = useState<PowerAction | null>(null);
   const [runOpen, setRunOpen] = useState(false);
 
+  const activeTab: TabId = (TABS.find((t) => t.id === tab)?.id ?? 'overview') as TabId;
+  // Twelve tabs are 985px of strip in a 366px box, so opening
+  // /devices/<id>/events directly would otherwise leave the active tab at
+  // left 933 with scrollLeft 0 — off-screen and unsignalled. The strip only
+  // exists once the agent has loaded, hence the id in the dependencies.
+  const tabsRef = useRef<HTMLDivElement>(null);
+  const agentId = agent.data?.id;
+  useEffect(() => {
+    const el = tabsRef.current?.querySelector<HTMLElement>('a.active');
+    if (!el) return;
+    const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    el.scrollIntoView({ inline: 'center', block: 'nearest', behavior: reduce ? 'auto' : 'smooth' });
+  }, [activeTab, agentId]);
+
   const a = agent.data;
   if (agent.error && !a) {
     const notFound = agent.error.toLowerCase().includes('not found');
@@ -81,7 +96,6 @@ export function DeviceDetail() {
   }
   if (!a) return <Loading />;
 
-  const activeTab: TabId = (TABS.find((t) => t.id === tab)?.id ?? 'overview') as TabId;
   const needsOnline = TABS.find((t) => t.id === activeTab)?.needsOnline;
 
   const doRefresh = async () => {
@@ -141,11 +155,14 @@ export function DeviceDetail() {
           <span className="faint">/</span>
           <OnlineDot online={a.online} />
           <h1>{a.display_name}</h1>
-          <span className="row" style={{ gap: 6 }}>
+          {/* Both the OS label and the last IP are on the Overview tab; on a
+              phone they cost a row of a head that repeats on all twelve
+              tabs, so mobile-pages.css hides them below 700px. */}
+          <span className="row dev-os" style={{ gap: 6 }}>
             <OSIcon os={a.os} />
             <span className="muted">{a.platform || osLabel(a.os)}</span>
           </span>
-          <span className="muted mono small">{a.last_ip}</span>
+          <span className="muted mono small dev-ip">{a.last_ip}</span>
           {a.group_name && <Chip outline>{a.group_name}</Chip>}
           {a.pending_reboot && <Chip tone="warn">reboot required</Chip>}
           {a.maintenance_until > Date.now() / 1000 && <Chip tone="purple">maintenance until {relTime(a.maintenance_until)}</Chip>}
@@ -153,14 +170,16 @@ export function DeviceDetail() {
         </div>
         {canWrite && (
           <>
-            <Button size="sm" onClick={() => setRunOpen(true)} disabled={!a.online}>
+            {/* Below 700px these three fold into the More menu, so the head
+                is one row: breadcrumb + dot + name, Power, More. */}
+            <Button size="sm" className="dev-head-btn" onClick={() => setRunOpen(true)} disabled={!a.online}>
               Run script
             </Button>
-            <Button size="sm" onClick={doRefresh} disabled={!a.online} title="Refresh inventory">
+            <Button size="sm" className="dev-head-btn" onClick={doRefresh} disabled={!a.online} title="Refresh inventory">
               <IconRefresh /> Inventory
             </Button>
             {!a.online && (
-              <Button size="sm" onClick={doWol} title="Wake-on-LAN via another agent on the subnet">
+              <Button size="sm" className="dev-head-btn" onClick={doWol} title="Wake-on-LAN via another agent on the subnet">
                 <IconWifi /> Wake
               </Button>
             )}
@@ -183,6 +202,16 @@ export function DeviceDetail() {
                 </button>
               }
             >
+              {/* The phone home for the buttons hidden above. Rendered
+                  always, displayed only below 700px, so the menu needs no
+                  media-query state in JS. */}
+              <button className="phone-only" disabled={!a.online} onClick={() => setRunOpen(true)}>
+                Run script
+              </button>
+              <button className="phone-only" disabled={!a.online} onClick={doRefresh}>
+                Refresh inventory
+              </button>
+              <hr className="phone-only" />
               <button onClick={doWol}>Wake-on-LAN</button>
               <hr />
               <button className="danger" onClick={doDelete}>
@@ -192,7 +221,7 @@ export function DeviceDetail() {
           </>
         )}
       </div>
-      <div className="tabs">
+      <div className="tabs" ref={tabsRef}>
         {TABS.map((t) => (
           <NavLink key={t.id} to={`/devices/${a.id}${t.id === 'overview' ? '' : `/${t.id}`}`} end className={({ isActive }) => (isActive ? 'active' : '')}>
             {t.label}

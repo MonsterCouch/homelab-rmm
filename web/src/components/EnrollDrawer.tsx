@@ -5,8 +5,10 @@ import { useAsync } from '../hooks/useAsync';
 import { relTime } from '../lib/format';
 import { errMsg, useToast } from '../state/toast';
 import { useConfirm, Drawer } from './Modal';
+import { PairCard } from './PairCard';
 import { Button, CopyButton, Field, Skeleton } from './ui';
 import { IconTrash } from './Icons';
+import '../styles/mobile-pages.css';
 
 export function EnrollDrawer({ onClose, groups }: { onClose: () => void; groups: Group[] }) {
   const toast = useToast();
@@ -115,6 +117,9 @@ export function EnrollDrawer({ onClose, groups }: { onClose: () => void; groups:
               </div>
               <div>
                 <div className="field-label mb">Server certificate fingerprint (SHA-256)</div>
+                {/* Never truncated: this is the value compared by hand
+                    against the installer output and against the Android
+                    app's Trust review screen. */}
                 <div className="code-block">
                   {list.data?.fingerprint || '—'}
                   <span className="copy">
@@ -128,6 +133,13 @@ export function EnrollDrawer({ onClose, groups }: { onClose: () => void; groups:
             </div>
           </div>
         )}
+
+        <div className="card">
+          <div className="card-head">Pair a phone</div>
+          <div className="card-body">
+            {list.data ? <PairCard url={list.data.public_url} fingerprint={list.data.fingerprint} /> : <Skeleton rows={1} cols={2} />}
+          </div>
+        </div>
 
         <div className="card">
           <div className="card-head">

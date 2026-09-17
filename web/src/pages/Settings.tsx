@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
 import type { Settings as SettingsT } from '../api/types';
+import { PairCard } from '../components/PairCard';
 import { Button, CopyButton, ErrorBox, Field, Loading, Switch, TagInput } from '../components/ui';
 import { useAsync } from '../hooks/useAsync';
 import { bytes, duration } from '../lib/format';
 import { errMsg, useToast } from '../state/toast';
+import '../styles/mobile-pages.css';
 
 export function Settings() {
   const toast = useToast();
@@ -187,11 +189,20 @@ export function Settings() {
                   <dt>Public URL</dt>
                   <dd className="mono">{system.data.public_url}</dd>
                   <dt>Certificate fingerprint</dt>
-                  <dd className="row" style={{ gap: 6, flexWrap: 'nowrap' }}>
-                    <code className="truncate" style={{ maxWidth: 320 }} title={system.data.fingerprint}>
-                      {system.data.fingerprint || '—'}
-                    </code>
-                    {system.data.fingerprint && <CopyButton text={system.data.fingerprint} size="xs" />}
+                  {/* SHA-256 of the leaf DER: the value every agent pins and
+                      the value the Android app pins. It is compared character
+                      by character against another screen, so it is shown in
+                      full rather than truncated into a title tooltip that a
+                      touch screen never opens. */}
+                  <dd>
+                    {system.data.fingerprint ? (
+                      <div className="fp-block">
+                        <code>{system.data.fingerprint}</code>
+                        <CopyButton text={system.data.fingerprint} label="Copy fingerprint" size="md" />
+                      </div>
+                    ) : (
+                      <span className="muted">— (this server is not terminating TLS itself)</span>
+                    )}
                   </dd>
                   <dt>Data directory</dt>
                   <dd className="mono">{system.data.data_dir}</dd>
@@ -207,6 +218,12 @@ export function Settings() {
               ) : (
                 <Loading />
               )}
+            </div>
+          </div>
+          <div className="card">
+            <div className="card-head">Pair a phone</div>
+            <div className="card-body">
+              {system.data ? <PairCard url={system.data.public_url} fingerprint={system.data.fingerprint} /> : <Loading />}
             </div>
           </div>
         </div>

@@ -10,6 +10,7 @@ import { useLiveReload } from '../../hooks/useEvents';
 import { bytes, relTime } from '../../lib/format';
 import { errMsg, useToast } from '../../state/toast';
 import type { TabProps } from './DeviceDetail';
+import '../../styles/mobile-pages.css';
 
 export function sevTone(s: string): 'danger' | 'warn' | 'info' | '' {
   const v = s.toLowerCase();

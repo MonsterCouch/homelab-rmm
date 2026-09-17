@@ -9,6 +9,7 @@ import { duration, relTime } from '../lib/format';
 import { useAuth } from '../state/auth';
 import { ComplianceChip } from '../components/baselines/state';
 import { Bar, Button, Chip, Empty, ErrorBox, RunStatusChip, SeverityChip, Skeleton } from '../components/ui';
+import '../styles/mobile-pages.css';
 
 export function Dashboard() {
   const navigate = useNavigate();
@@ -51,39 +52,38 @@ export function Dashboard() {
         </div>
       ) : (
         <>
-          <GettingStarted devices={total} />
+          {/* The stat row comes first: on a phone it is the whole reason the
+              app was opened, and the onboarding checklist below used to push
+              the open-alert count more than a screen down. Each tile is a
+              real <Link>, so it has middle-click, long-press and a real focus
+              ring instead of a role="link" div. */}
           <div className="grid cols-4 mb">
-            <div className="card stat link" role="link" tabIndex={0} onClick={() => navigate('/devices?online=1')} onKeyDown={(e) => e.key === 'Enter' && navigate('/devices?online=1')}>
+            <Link className="card stat link" to="/devices?online=1">
               <span className="label">Devices online</span>
               <span className={`value ${data.agents_online > 0 ? 'ok' : ''}`}>{data.agents_online}</span>
               <span className="foot">{data.agents_offline} offline · {total} total</span>
-            </div>
-            <div className="card stat link" role="link" tabIndex={0} onClick={() => navigate('/alerts')} onKeyDown={(e) => e.key === 'Enter' && navigate('/alerts')}>
+            </Link>
+            <Link className="card stat link" to="/alerts">
               <span className="label">Open alerts</span>
               <span className={`value ${data.critical_alerts > 0 ? 'danger' : data.open_alerts > 0 ? 'warn' : ''}`}>{data.open_alerts}</span>
               <span className="foot">{data.critical_alerts} critical · {data.open_alerts - data.critical_alerts} warning/info</span>
-            </div>
-            <div className="card stat link" role="link" tabIndex={0} onClick={() => navigate('/patches')} onKeyDown={(e) => e.key === 'Enter' && navigate('/patches')}>
+            </Link>
+            <Link className="card stat link" to="/patches">
               <span className="label">Need patches</span>
               <span className={`value ${data.devices_need_patches > 0 ? 'warn' : ''}`}>{data.devices_need_patches}</span>
               <span className="foot">{data.pending_reboot} pending reboot</span>
-            </div>
+            </Link>
             {/* The failed count is the reason to open this tile, so it carries the
                 filter with it instead of dropping the reader in an unfiltered list. */}
-            <div
-              className="card stat link"
-              role="link"
-              tabIndex={0}
-              onClick={() => navigate(data.runs_failed_24h > 0 ? '/runs?status=failed' : '/runs')}
-              onKeyDown={(e) => e.key === 'Enter' && navigate(data.runs_failed_24h > 0 ? '/runs?status=failed' : '/runs')}
-            >
+            <Link className="card stat link" to={data.runs_failed_24h > 0 ? '/runs?status=failed' : '/runs'}>
               <span className="label">Runs (24h)</span>
               <span className="value">{data.runs_24h}</span>
               <span className="foot" style={data.runs_failed_24h > 0 ? { color: 'var(--danger)' } : undefined}>
                 {data.runs_failed_24h} failed
               </span>
-            </div>
+            </Link>
           </div>
+          <GettingStarted devices={total} />
           <div className="grid cols-3">
             <div className="card" style={{ gridColumn: 'span 1' }}>
               <div className="card-head">
@@ -125,7 +125,7 @@ export function Dashboard() {
               </div>
               <div className="list">
                 {recentRuns.map((r) => (
-                  <div key={r.id} className="list-item" style={{ cursor: 'pointer' }} role="link" tabIndex={0} onClick={() => navigate(`/runs?id=${r.id}`)} onKeyDown={(e) => e.key === 'Enter' && navigate(`/runs?id=${r.id}`)}>
+                  <Link key={r.id} className="list-item" to={`/runs?id=${r.id}`}>
                     <RunStatusChip status={r.status} />
                     <div className="grow">
                       <div className="title truncate">{r.script_name}</div>
@@ -133,7 +133,7 @@ export function Dashboard() {
                         {r.agent_name || r.agent_id} · {r.trigger} · {relTime(r.started_at)}
                       </div>
                     </div>
-                  </div>
+                  </Link>
                 ))}
                 {!recentRuns.length && <Empty title="No runs yet">Run a script from the library to see it here.</Empty>}
               </div>
