@@ -46,7 +46,7 @@ func seedDefaults(db *DB) error {
 	if err := db.SetSetting(seededKey, "1"); err != nil {
 		return fmt.Errorf("seed: record completion: %w", err)
 	}
-	slog.Info("seeded defaults", "scripts", len(defaultScripts), "alert_rules", len(defaultAlertRules), "groups", len(defaultGroups), "patch_policies", len(defaultPatchPolicies))
+	slog.Info("seeded defaults", "scripts", len(allSeedScripts()), "alert_rules", len(defaultAlertRules), "groups", len(defaultGroups), "patch_policies", len(defaultPatchPolicies))
 	return nil
 }
 
@@ -165,13 +165,23 @@ var defaultBaselines = []seedBaseline{
 	},
 }
 
+// allSeedScripts is the whole seeded library: the cross-platform and Linux
+// entries in this file, then the Windows ones. Homelab RMM is Windows-first,
+// so that half lives in its own file and is where the library grows.
+func allSeedScripts() []Script {
+	out := make([]Script, 0, len(defaultScripts)+len(windowsScripts))
+	out = append(out, defaultScripts...)
+	out = append(out, windowsScripts...)
+	return out
+}
+
 func seedScripts(db *DB) error {
 	empty, err := tableEmpty(db, "scripts")
 	if err != nil || !empty {
 		return err
 	}
-	for i := range defaultScripts {
-		sc := defaultScripts[i] // copy: SaveScript sets ID and timestamps
+	for _, sc := range allSeedScripts() {
+		sc := sc // SaveScript sets ID and timestamps on the copy
 		if err := db.SaveScript(&sc); err != nil {
 			return fmt.Errorf("%q: %w", sc.Name, err)
 		}

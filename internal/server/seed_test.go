@@ -16,7 +16,7 @@ func TestSeedBashScriptsParse(t *testing.T) {
 		t.Skip("bash not installed")
 	}
 	dir := t.TempDir()
-	for _, sc := range defaultScripts {
+	for _, sc := range allSeedScripts() {
 		if sc.Language != "bash" && sc.Language != "sh" {
 			continue
 		}
@@ -30,13 +30,18 @@ func TestSeedBashScriptsParse(t *testing.T) {
 	}
 }
 
-// TestSeedPowerShellScriptsParse uses PowerShell's own parser (pwsh is on
-// GitHub's ubuntu runners) so a syntax error in a Windows script is caught
-// before it ships. Skipped where pwsh is absent.
+// TestSeedPowerShellScriptsParse uses PowerShell's own parser so a syntax
+// error in a Windows script is caught before it ships. pwsh is what GitHub's
+// ubuntu runners have; on Windows the same parser ships as Windows PowerShell
+// 5.1, and that is the platform most of this library targets, so look for
+// both rather than skipping exactly where the check matters most.
 func TestSeedPowerShellScriptsParse(t *testing.T) {
 	pwsh, err := exec.LookPath("pwsh")
 	if err != nil {
-		t.Skip("pwsh not installed")
+		pwsh, err = exec.LookPath("powershell")
+	}
+	if err != nil {
+		t.Skip("neither pwsh nor powershell is installed")
 	}
 	dir := t.TempDir()
 	checker := filepath.Join(dir, "check.ps1")
@@ -53,7 +58,7 @@ exit 0
 	if err := os.WriteFile(checker, []byte(checkerBody), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for _, sc := range defaultScripts {
+	for _, sc := range allSeedScripts() {
 		if sc.Language != "powershell" {
 			continue
 		}
@@ -61,7 +66,7 @@ exit 0
 		if err := os.WriteFile(file, []byte(sc.Body), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		out, err := exec.Command(pwsh, "-NoProfile", "-NonInteractive", "-File", checker, "-Path", file).CombinedOutput()
+		out, err := exec.Command(pwsh, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", checker, "-Path", file).CombinedOutput()
 		if err != nil {
 			t.Errorf("%q: PowerShell parse failed: %v\n%s", sc.Name, err, out)
 		}
@@ -89,8 +94,8 @@ func TestSeedDefaults(t *testing.T) {
 		if err := seedDefaults(db); err != nil {
 			t.Fatalf("run %d: %v", i, err)
 		}
-		if got := countRows(t, db, "scripts"); got != len(defaultScripts) {
-			t.Fatalf("run %d: scripts = %d, want %d", i, got, len(defaultScripts))
+		if got := countRows(t, db, "scripts"); got != len(allSeedScripts()) {
+			t.Fatalf("run %d: scripts = %d, want %d", i, got, len(allSeedScripts()))
 		}
 		if got := countRows(t, db, "alert_rules"); got != len(defaultAlertRules) {
 			t.Fatalf("run %d: alert_rules = %d, want %d", i, got, len(defaultAlertRules))
@@ -108,8 +113,8 @@ func TestSeedDefaults(t *testing.T) {
 	if len(defaultAlertRules) != 7 || len(defaultGroups) != 2 || len(defaultPatchPolicies) != 1 {
 		t.Fatalf("unexpected default counts: rules=%d groups=%d policies=%d", len(defaultAlertRules), len(defaultGroups), len(defaultPatchPolicies))
 	}
-	if len(defaultScripts) < 14 {
-		t.Fatalf("script library has %d entries, want at least 14", len(defaultScripts))
+	if len(allSeedScripts()) < 30 {
+		t.Fatalf("script library has %d entries, want at least 30", len(allSeedScripts()))
 	}
 }
 
@@ -140,7 +145,7 @@ func TestSeedRespectsOperatorDeletions(t *testing.T) {
 	if err := seedDefaults(db); err != nil {
 		t.Fatal(err)
 	}
-	if got := countRows(t, db, "scripts"); got != len(defaultScripts) {
+	if got := countRows(t, db, "scripts"); got != len(allSeedScripts()) {
 		t.Fatalf("empty scripts table not refilled: %d", got)
 	}
 	if got := countRows(t, db, "alert_rules"); got != len(defaultAlertRules) {
@@ -165,7 +170,7 @@ func TestSeedScriptsAreWellFormed(t *testing.T) {
 		t.Fatal(err)
 	}
 	validOS := map[string]bool{"": true, "windows": true, "linux": true}
-	validCategory := map[string]bool{"Maintenance": true, "Diagnostics": true, "Updates": true, "Security": true, "Users": true}
+	validCategory := map[string]bool{"Maintenance": true, "Diagnostics": true, "Updates": true, "Security": true, "Users": true, "Software": true}
 	seenName := map[string]bool{}
 	seenCategory := map[string]bool{}
 	for _, sc := range scripts {
