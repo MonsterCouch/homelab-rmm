@@ -1,7 +1,10 @@
 # Handoff
 
-State of Homelab RMM as of 2026-09-15, written for whoever picks the project up on a
-workstation. Everything below is true of `main` at `9df12df` (release **v0.2.0**).
+State of Homelab RMM as of 2026-09-16, written for whoever picks the project up on a
+workstation. Everything below is true of `main` at `99e44f6`, which is 40 commits ahead of
+`origin/main` and **deliberately not pushed** (the owner's free GitHub Actions minutes are
+nearly spent; every push to `main` runs the full CI workflow). Released version is still
+**v0.2.0**; everything since is in `CHANGELOG.md` under `[Unreleased]`.
 
 ## What exists
 
@@ -21,7 +24,17 @@ automation combined with ScreenConnect's remote desktop.
   `web/src/pages/Baseline*.tsx`): desired-state checks with drift alerts and self-healing.
   Contract and kind reference: `docs/BASELINES.md`.
 - **Console** (`web/`): Vite + React + TypeScript, embedded via `web/embed.go` from `web/dist`.
-- Size: about 40k lines of Go and 15k of TypeScript. Twelve commits; history is linear.
+  It now carries a phone pass: a DataTable card renderer under ~700 px, sheet-style modals,
+  coarse-pointer tap targets, a terminal key bar, a trackpad gesture model for the remote
+  desktop, and `web/src/lib/host.ts`, the bridge the Android shell talks to.
+- **Android** (`android/`, its own Gradle build): the pinned-trust foundation of a WebView
+  shell around the console. `:trust` is a pure-JVM module (fingerprint, sealed server list,
+  pairing URI, trust store) with 51 passing tests; the app module has the AndroidKeyStore
+  server store, `PinnedHttp`, manifest, network security config and signing config, and
+  builds an installable APK. The WebView stack and the real screens are NOT written yet -
+  the Activities are placeholders whose comments name the task that replaces each one.
+  Design and task list: `docs/ANDROID.md`.
+- Size: about 45k lines of Go, 17k of TypeScript, 2.8k of Kotlin. History is linear.
 
 Read in this order: `README.md`, `docs/ARCHITECTURE.md`, `docs/API.md`,
 `docs/BASELINES.md`, `docs/DESKTOP-PROTOCOL.md`, `docs/SECURITY.md`,
@@ -86,14 +99,36 @@ the new version and fix the compare links at the bottom).
 - Independent adversarial reviews attacked the server live (install-script injection, role
   gates, enrolment-token races, forwarded headers, setup takeover, CSRF) and the fixes are
   pinned by `internal/server/security_test.go` and `baselines_verify_test.go`.
+- **2026-09-15/16: the first real-Windows run.** An agent was installed as the service
+  `HomelabRMMAgent` on a Windows 11 Home 25H2 workstation and thirteen subsystems were
+  exercised live against it - service lifecycle and installer, inventory, metrics, scripts,
+  services and processes, event log, files, patching (scan only), ConPTY shell, remote
+  desktop, baselines, power/WoL, and the agent's Windows security posture - each compared
+  field by field against independent ground truth from PowerShell, WMI and the registry.
+  That produced 95 findings, every one of them fixed across ten independently reviewed
+  batches. `CHANGELOG.md` `[Unreleased]` is the list.
+- `go test ./...` passes on Windows for the first time. It never had: the server test
+  fixture left its SQLite handle open, and Windows cannot delete an open file, so 91
+  passing tests were reported as cleanup failures.
+- The console's phone pass was measured with Playwright at 390x844 and 412x915 against a
+  real server: zero horizontal overflow on twelve pages, tables replaced by cards, and the
+  1280-wide layout unchanged.
 
 ## What has NOT been verified
 
-- **Nothing has run on a real Windows machine.** Every Windows path (SCM, registry, WMI,
-  WTS, ConPTY, wevtutil, the Windows Update Agent PowerShell, the session-0 desktop helper,
-  SendInput, the Windows baseline kinds, `tools/build.ps1`, the PowerShell installer) is
-  cross-compiled, vet-checked and reviewed line by line only. Install one Windows agent
-  first and read `%ProgramData%\HomelabRMM\agent.log`.
+- Windows is now exercised (see above), but four paths on it still are not, because each
+  needs an action too destructive for the owner's live workstation or a machine it lacks:
+  **installing** a patch (only the scan ran), any baseline **remediation**, the
+  **power** endpoint (reboot/shutdown/lock/logoff), and killing a **critical process**.
+  All four were audited statically and their guards are unit-tested.
+- `tools\build.ps1` and `deploy\uninstall.ps1` were fixed but never executed: Bitdefender
+  quarantines PowerShell activity on the validation machine. Run them once on a clean box.
+- The Android app has never run on a device or an emulator. In particular **the gating
+  unknown of `docs/ANDROID.md` is still open**: whether a `wss://` handshake to a pinned
+  self-signed host reaches `WebViewClient.onReceivedSslError`. The Chromium source path
+  says it should; only a device settles it, and the app's own Connection test answers it.
+  If it turns out false, the terminal and the remote desktop cannot work inside the app
+  and the fallback is `tailscale cert` on the server, not a relay in the app.
 - Linux paths that need systemd, ufw/firewalld or a package install were unit-tested against
   canned output; the container used for development had no systemd and no network for apt.
 - Wayland desktops are refused by design (X11 works).
@@ -116,6 +151,15 @@ the new version and fix the compare links at the bottom).
 5. Agent self-update: the agent implements `agent.update` (download, SHA-256 check, swap),
    but nothing on the server triggers it yet.
 6. Console `--text-faint` contrast is below WCAG AA for de-emphasised text app-wide.
+6a. **The Android app is one stage of three.** `docs/ANDROID.md` holds the full task list;
+   what remains is the WebView stack (the single pin call site, the host bridge, downloads,
+   the biometric gate) and the screens (server list, trust review, pin mismatch, QR scan,
+   Connection test, settings), then `android/README.md` and a `make apk` target. Build what
+   exists with `cd android && ./gradlew :trust:test :app:assembleDebug`.
+6b. Three console tasks from the phone pass were not reached: the BaselineStatus compliance
+   matrix still renders as a wide table on a phone (C18), the long tail of destructive-action
+   adjacency and bulk bars (C19), and the Dashboard/search polish beyond what landed (C16,
+   C17 partially). The ranked defect list with evidence is in the design workflow output.
 7. Product gaps ranked by an independent review, none started: view-only / observe mode for
    the desktop, in-session file transfer and clipboard sync, more notification channels than
    SMTP (webhook automations exist), fleet-wide patch approval UI, CSV export exists but
