@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
+import { useCoarsePointer } from '../hooks/useMediaQuery';
 import { Button } from './ui';
 import { IconX } from './Icons';
 
@@ -39,8 +40,13 @@ const FOCUSABLE = 'a[href], button:not([disabled]), input:not([type=hidden]):not
  * Focus the first field when opened, keep Tab cycling inside the dialog
  * (aria-modal alone does not stop keyboard focus from leaving) and restore
  * focus to the opener on close.
+ *
+ * `autoFocus` is off on a touch screen: focusing a field there opens the soft
+ * keyboard on top of the dialog that just appeared, and the taller dialogs
+ * already measure 783px in an 844px viewport. The dialog itself is focused
+ * instead, so the Tab trap and Escape still work for a Bluetooth keyboard.
  */
-function useDialogFocus(ref: React.RefObject<HTMLElement>) {
+function useDialogFocus(ref: React.RefObject<HTMLElement>, autoFocus = true) {
   useEffect(() => {
     // React applies autoFocus during commit, before this effect, which
     // would make the dialog's own button look like the opener; dialogs
@@ -49,9 +55,10 @@ function useDialogFocus(ref: React.RefObject<HTMLElement>) {
     const el = ref.current;
     if (!el) return;
     if (prev && el.contains(prev)) prev = null;
-    const first =
-      el.querySelector<HTMLElement>('[data-autofocus]') ??
-      el.querySelector<HTMLElement>('input:not([type=hidden]):not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not(.modal-close):not([disabled])');
+    const first = autoFocus
+      ? el.querySelector<HTMLElement>('[data-autofocus]') ??
+        el.querySelector<HTMLElement>('input:not([type=hidden]):not([disabled]), select:not([disabled]), textarea:not([disabled]), button:not(.modal-close):not([disabled])')
+      : null;
     (first ?? el).focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Tab') return;
@@ -77,7 +84,7 @@ function useDialogFocus(ref: React.RefObject<HTMLElement>) {
       el.removeEventListener('keydown', onKey);
       prev?.focus?.();
     };
-  }, [ref]);
+  }, [ref, autoFocus]);
 }
 
 interface ModalProps {
@@ -93,10 +100,15 @@ export function Modal({ title, onClose, children, footer, size = 'md', center }:
   const id = useDialogStack();
   useEscape(id, onClose);
   const ref = useRef<HTMLDivElement>(null);
-  useDialogFocus(ref);
+  // A finger is not a mouse: the backdrop gutter beside a dialog is exactly
+  // where a fat-finger miss lands, and dismissing on it discards a half-filled
+  // form that confirms a reboot or a patch install. Verified at 390px: a tap
+  // at (8,400) closed a half-filled New task dialog. Header X and Cancel stay.
+  const coarse = useCoarsePointer();
+  useDialogFocus(ref, !coarse);
   const titleId = useId();
   return createPortal(
-    <div className={`overlay ${center ? 'center' : ''}`} onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+    <div className={`overlay ${center ? 'center' : ''}`} onMouseDown={coarse ? undefined : (e) => e.target === e.currentTarget && onClose()}>
       <div className={`modal ${size !== 'md' ? size : ''}`} role="dialog" aria-modal="true" aria-labelledby={titleId} ref={ref} tabIndex={-1}>
         <div className="modal-head">
           <h2 id={titleId}>{title}</h2>
@@ -125,10 +137,11 @@ export function Drawer({ title, onClose, children, footer, wide, actions }: Draw
   const id = useDialogStack();
   useEscape(id, onClose);
   const ref = useRef<HTMLDivElement>(null);
-  useDialogFocus(ref);
+  const coarse = useCoarsePointer(); // see Modal: no scrim dismiss, no auto-focus on touch
+  useDialogFocus(ref, !coarse);
   const titleId = useId();
   return createPortal(
-    <div className="drawer-host" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+    <div className="drawer-host" onMouseDown={coarse ? undefined : (e) => e.target === e.currentTarget && onClose()}>
       <div className={`drawer ${wide ? 'wide' : ''}`} role="dialog" aria-modal="true" aria-labelledby={titleId} ref={ref} tabIndex={-1}>
         <div className="modal-head">
           <h2 id={titleId}>{title}</h2>

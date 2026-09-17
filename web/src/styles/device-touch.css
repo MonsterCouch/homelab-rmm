@@ -1,0 +1,205 @@
+/* Touch affordances for the terminal and the remote-desktop viewer
+   (tasks C7, C8, C14 of docs/ANDROID.md §8).
+
+   This file is imported by Terminal.tsx and Desktop.tsx rather than by
+   global.css, so the rules land after the global sheet in the cascade and no
+   other page is touched. Everything here is behind `(pointer: coarse)` or
+   `(max-width: 700px)` except the `dvh` height swap, which resolves to exactly
+   the same pixels as `vh` on a desktop browser, and the `touch-action` /
+   `overscroll-behavior` pair on the viewer, which no mouse can observe. */
+
+/* ---------- the fill-page host (C8b, C14) ----------
+
+   `.fill-page` is `calc(100vh - …)` and starts ~247 px down a phone page, so
+   it already overflows the fold by ~75 px before Gboard opens — and `vh` never
+   shrinks for a soft keyboard. `dvh` fixes the first half; the flex column
+   below fixes the second. `touch.ts:useFillHeight` is the belt-and-braces on
+   top, measuring the visual viewport directly. */
+.fill-page.device-fill {
+  height: calc(100dvh - var(--topbar-h) - 160px);
+}
+
+@media (max-width: 700px) {
+  /* `:has()` keeps this to the two pages that opt in; every other page keeps
+     `.main` exactly as global.css leaves it. */
+  .main:has(> .fill-page.device-fill) {
+    display: flex;
+    flex-direction: column;
+  }
+  .fill-page.device-fill {
+    height: auto;
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+  /* Toolbar first, then the status line, then the screen and the key bar:
+     "Connected · powershell" is unreadable when it sits below the fold. */
+  .fill-page.device-fill > .toolbar {
+    order: -2;
+    margin-bottom: 8px;
+  }
+  .fill-page.device-fill > .statusline {
+    order: -1;
+    padding-top: 0;
+    padding-bottom: 6px;
+  }
+  /* 366x35 of advice about Ctrl+C, on a device with no Ctrl key, which wraps
+     the toolbar onto a third row. */
+  .term-tip {
+    display: none;
+  }
+}
+
+/* ---------- the on-screen key bar (C8a, C14) ---------- */
+.touch-keybar {
+  display: none;
+}
+
+@media (pointer: coarse) {
+  .touch-keybar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+    margin-top: 6px;
+    padding: 6px 0 calc(6px + env(safe-area-inset-bottom));
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .touch-keybar::-webkit-scrollbar {
+    display: none;
+  }
+  .touch-keybar .btn.keycap {
+    flex: 0 0 auto;
+    min-height: 44px;
+    min-width: 44px;
+    padding: 0 8px;
+    justify-content: center;
+    font-family: var(--mono);
+    font-size: 14px;
+  }
+  .touch-keybar .btn.keycap.wide {
+    min-width: 56px;
+  }
+  .touch-keybar .btn.keycap.on {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+}
+
+/* ---------- remote desktop, touch (C14) ---------- */
+
+/* Without these a finger drag pans the console instead of moving the remote
+   cursor, and a pinch zooms the page. `touch-action` is inert for a mouse. */
+.desktop-wrap {
+  touch-action: none;
+  overscroll-behavior: contain;
+}
+.desktop-wrap canvas {
+  touch-action: none;
+}
+
+/* Zoomed past Fit the wrapper becomes a scrollport. Flex centring would put
+   the overflow half above and half left of the scroll origin, where it can
+   never be reached, so the child centres with `margin:auto` instead — which
+   collapses to 0 exactly when there is no free space. */
+.desktop-wrap.is-zoomed {
+  overflow: auto;
+  align-items: flex-start;
+  justify-content: flex-start;
+  -webkit-overflow-scrolling: touch;
+}
+.desktop-wrap.is-zoomed > canvas {
+  margin: auto;
+}
+
+/* A finger has no pointer of its own. The trackpad model needs a visible
+   cursor to aim, so the viewer draws one: a ring plus a dot, both outlined in
+   black so they read over any wallpaper. */
+.desktop-cursor {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+  z-index: 4;
+  will-change: transform;
+}
+.desktop-cursor::before,
+.desktop-cursor::after {
+  content: '';
+  position: absolute;
+  border-radius: 50%;
+}
+.desktop-cursor::before {
+  left: -11px;
+  top: -11px;
+  width: 22px;
+  height: 22px;
+  border: 2px solid rgba(255, 255, 255, 0.95);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.75), inset 0 0 0 1px rgba(0, 0, 0, 0.75);
+}
+.desktop-cursor::after {
+  left: -2px;
+  top: -2px;
+  width: 4px;
+  height: 4px;
+  background: #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.75);
+}
+/* The mouse cursor would otherwise sit under the finger's cursor as well. */
+.desktop-wrap.touch-mode canvas.show-cursor {
+  cursor: none;
+}
+
+/* The only thing that raises an Android soft keyboard is a focused text
+   field, so there is one — invisible, but never `display:none` or
+   `visibility:hidden`, which would make it unfocusable. */
+.desktop-kbd {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  min-height: 0 !important;
+  padding: 0 !important;
+  margin: 0;
+  border: 0 !important;
+  outline: none !important;
+  opacity: 0;
+  background: transparent;
+  color: transparent;
+  caret-color: transparent;
+  font-size: 16px; /* anything smaller makes iOS/Chrome zoom the page on focus */
+  z-index: 1;
+}
+
+/* The overflow sheet holding Monitor / Quality / Refresh / Ctrl+Alt+Del so the
+   viewer toolbar stays one row on a phone. */
+@media (pointer: coarse) {
+  .menu.desktop-overflow {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 10px;
+    min-width: 232px;
+    max-width: calc(100vw - 24px);
+  }
+  .menu.desktop-overflow > select,
+  .menu.desktop-overflow > label,
+  .menu.desktop-overflow > .btn {
+    width: 100% !important;
+    max-width: none !important;
+    min-height: 44px;
+  }
+  .menu.desktop-overflow > .btn {
+    justify-content: center;
+  }
+  .menu.desktop-overflow input[type='range'] {
+    flex: 1 1 auto;
+    width: auto !important;
+  }
+}

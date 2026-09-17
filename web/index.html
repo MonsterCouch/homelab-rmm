@@ -2,7 +2,12 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- viewport-fit=cover: an Android app targeting SDK 35 is edge-to-edge, so
+         the page must reach under the status bar and the gesture pill and pay
+         for it with env(safe-area-inset-*) (global.css). interactive-widget:
+         the soft keyboard shrinks the layout viewport instead of only the
+         visual one, which is what makes 100dvh track the keyboard. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
     <meta name="color-scheme" content="dark light" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <title>Homelab RMM</title>

@@ -55,10 +55,35 @@ export function Login() {
         {!needsTotp ? (
           <>
             <Field label="Username" htmlFor="li-user">
-              <input id="li-user" value={username} autoComplete="username" required autoFocus onChange={(e) => setUsername(e.target.value)} />
+              {/* Android capitalises the first letter of a text field by
+                  default, so "admin" is submitted as "Admin" and the first
+                  screen of the app answers "Invalid username or password". */}
+              <input
+                id="li-user"
+                value={username}
+                autoComplete="username"
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+                enterKeyHint="next"
+                required
+                autoFocus
+                onChange={(e) => setUsername(e.target.value)}
+              />
             </Field>
             <Field label="Password" htmlFor="li-pw">
-              <input id="li-pw" type="password" value={password} autoComplete="current-password" required onChange={(e) => setPassword(e.target.value)} />
+              <input
+                id="li-pw"
+                type="password"
+                value={password}
+                autoComplete="current-password"
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+                enterKeyHint="go"
+                required
+                onChange={(e) => setPassword(e.target.value)}
+              />
             </Field>
           </>
         ) : (
@@ -70,6 +95,10 @@ export function Login() {
               maxLength={8}
               value={code}
               autoComplete="one-time-code"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              enterKeyHint="go"
               required
               autoFocus
               className="mono"

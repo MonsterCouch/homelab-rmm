@@ -45,16 +45,61 @@ export function Setup() {
         </p>
         {error && <div className="form-error" role="alert">{error}</div>}
         <Field label="Username" htmlFor="su-user">
-          <input id="su-user" value={username} autoComplete="username" required autoFocus onChange={(e) => setUsername(e.target.value)} />
+          {/* Same as Login: Android would capitalise the first administrator's
+              username, and this form creates the account rather than failing. */}
+          <input
+            id="su-user"
+            value={username}
+            autoComplete="username"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            enterKeyHint="next"
+            required
+            autoFocus
+            onChange={(e) => setUsername(e.target.value)}
+          />
         </Field>
         <Field label="Email (optional)" htmlFor="su-email" hint="Used for alert notifications.">
-          <input id="su-email" type="email" value={email} autoComplete="email" onChange={(e) => setEmail(e.target.value)} />
+          <input
+            id="su-email"
+            type="email"
+            value={email}
+            autoComplete="email"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            enterKeyHint="next"
+            onChange={(e) => setEmail(e.target.value)}
+          />
         </Field>
         <Field label="Password" htmlFor="su-pw" hint="At least 8 characters.">
-          <input id="su-pw" type="password" value={password} autoComplete="new-password" required onChange={(e) => setPassword(e.target.value)} />
+          <input
+            id="su-pw"
+            type="password"
+            value={password}
+            autoComplete="new-password"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            enterKeyHint="next"
+            required
+            onChange={(e) => setPassword(e.target.value)}
+          />
         </Field>
         <Field label="Confirm password" htmlFor="su-pw2">
-          <input id="su-pw2" type="password" value={confirm} autoComplete="new-password" required onChange={(e) => setConfirm(e.target.value)} />
+          <input
+            id="su-pw2"
+            type="password"
+            value={confirm}
+            autoComplete="new-password"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            enterKeyHint={codeRequired ? 'next' : 'go'}
+            required
+            onChange={(e) => setConfirm(e.target.value)}
+          />
         </Field>
         {codeRequired && (
           <Field
@@ -62,7 +107,20 @@ export function Setup() {
             htmlFor="su-code"
             hint="The one-time code the server printed at startup — on the console, and as a WARN line in server.log in the data directory. Lost it? Restart the server before anyone creates a user and it prints a new one."
           >
-            <input id="su-code" value={code} autoComplete="off" required spellCheck={false} onChange={(e) => setCode(e.target.value)} />
+            {/* The code is lower-case hex printed by the server: autocapitalise
+                or autocorrect it and first-run setup fails on the phone. */}
+            <input
+              id="su-code"
+              value={code}
+              autoComplete="off"
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck={false}
+              inputMode="text"
+              enterKeyHint="go"
+              required
+              onChange={(e) => setCode(e.target.value)}
+            />
           </Field>
         )}
         <Button type="submit" variant="primary" busy={busy} style={{ width: '100%', marginTop: 6 }}>

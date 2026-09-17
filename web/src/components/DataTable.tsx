@@ -1,5 +1,7 @@
-import { useMemo, useState, type ReactNode } from 'react';
+import { Fragment, useMemo, useState, type ReactNode } from 'react';
+import { usePhone } from '../hooks/useMediaQuery';
 import { compare } from '../lib/format';
+import { host } from '../lib/host';
 import { IconDownload } from './Icons';
 import { Button, Checkbox, Empty, Skeleton } from './ui';
 
@@ -18,6 +20,24 @@ export interface Column<T> {
    * markup (an action column, a bar) is left out of the file.
    */
   csv?: (row: T) => string | number | boolean | undefined | null;
+  /**
+   * Where this column lands in the phone card renderer (below 700px), which
+   * replaces a table that would otherwise be three times the width of the
+   * screen. Unset means "a labelled field row", so an un-annotated table
+   * still shows everything — annotating a page only makes its cards shorter.
+   *
+   * - `primary`   the card's heading line (several are allowed, and they sit
+   *               on one line together: an online dot plus a device name)
+   * - `secondary` a subtitle under the heading, with no label
+   * - `hide`      not on the card at all; still on the desktop table and
+   *               still in the CSV export
+   *
+   * A column with no text header is an action column wherever it sits in the
+   * table: the card lifts it to its own full-width row near the top, because
+   * on Alerts those 33x19px Ack/Resolve buttons are the whole reason a phone
+   * is out of a pocket and they are off the right edge of the table.
+   */
+  mobile?: 'primary' | 'secondary' | 'hide';
 }
 
 interface Props<T> {
@@ -68,6 +88,7 @@ export function DataTable<T>({
   csvName,
 }: Props<T>) {
   const [sort, setSort] = useState<{ key: string; dir: 'asc' | 'desc' } | null>(defaultSort ?? null);
+  const phone = usePhone();
 
   const sorted = useMemo(() => {
     if (!rows) return [];
@@ -107,14 +128,76 @@ export function DataTable<T>({
 
   if (loading && !rows) {
     return (
-      <div className="table-wrap">
-        <Skeleton cols={Math.min(columns.length, 6)} />
+      <div className="dt">
+        <div className="table-wrap">
+          <Skeleton cols={Math.min(columns.length, 6)} />
+        </div>
+      </div>
+    );
+  }
+
+  const foot = (footer || csvName) && (
+    <div className="tbl-foot">
+      {footer}
+      <span style={{ marginLeft: 'auto' }} />
+      {csvName && (
+        <Button
+          size="xs"
+          disabled={!sorted.length}
+          title="Download these rows (current filters and sort) as CSV"
+          onClick={() => void downloadCsv(`${csvName}-${new Date().toISOString().slice(0, 10)}.csv`, toCsv(columns, sorted))}
+        >
+          <IconDownload /> Export CSV
+        </Button>
+      )}
+    </div>
+  );
+
+  // Below the phone breakpoint the table becomes a list of cards: Devices is
+  // 13 columns and 1211px wide in a 364px box, with no sticky first column, so
+  // scrolling right to the disk figure leaves the row anonymous.
+  if (phone) {
+    return (
+      <div className="dt">
+        {sorted.length ? (
+          <ul className="card-list">
+            {/* The table's select-all lives in the header checkbox, which the
+                card list has no room for; without this row the whole bulk
+                workflow would be per-row only on a phone. */}
+            {selectable && (
+              <li className="rc-all">
+                <Checkbox
+                  checked={!!allSelected}
+                  indeterminate={!!someSelected && !allSelected}
+                  onChange={toggleAll}
+                  label={allSelected ? 'Clear selection' : `Select all ${sorted.length}`}
+                />
+              </li>
+            )}
+            {sorted.map((r) => (
+              <RowCard
+                key={rowKey(r)}
+                row={r}
+                columns={columns}
+                selectable={selectable}
+                selected={selected?.has(rowKey(r))}
+                onToggle={() => toggleOne(rowKey(r))}
+                onRowClick={onRowClick}
+                rowClass={rowClass}
+              />
+            ))}
+          </ul>
+        ) : (
+          <Empty title={emptyTitle}>{emptyBody}</Empty>
+        )}
+        {foot}
       </div>
     );
   }
 
   return (
-    <div className="table-wrap" style={maxHeight ? { maxHeight, overflow: 'auto' } : undefined}>
+    <div className="dt">
+      <div className="table-wrap" style={maxHeight ? { maxHeight, overflow: 'auto' } : undefined}>
       <table className={`tbl ${compact ? 'compact' : ''}`}>
         <thead>
           <tr>
@@ -182,7 +265,7 @@ export function DataTable<T>({
                   </td>
                 )}
                 {columns.map((c) => (
-                  <td key={c.key} className={`${c.align === 'right' ? 'num' : ''} ${c.className ?? ''}`}>
+                  <td key={c.key} data-label={headerText(c)} className={`${c.align === 'right' ? 'num' : ''} ${c.className ?? ''}`}>
                     {c.render(r)}
                   </td>
                 ))}
@@ -198,24 +281,103 @@ export function DataTable<T>({
           )}
         </tbody>
       </table>
-      {(footer || csvName) && (
-        <div className="tbl-foot">
-          {footer}
-          <span style={{ marginLeft: 'auto' }} />
-          {csvName && (
-            <Button
-              size="xs"
-              disabled={!sorted.length}
-              title="Download these rows (current filters and sort) as CSV"
-              onClick={() => downloadCsv(`${csvName}-${new Date().toISOString().slice(0, 10)}.csv`, toCsv(columns, sorted))}
-            >
-              <IconDownload /> Export CSV
-            </Button>
-          )}
-        </div>
-      )}
+      </div>
+      {foot}
     </div>
   );
+}
+
+/**
+ * One row as a card. Reading order is identity first, then the actions — the
+ * actions have to be near the top and full size (they are `xs` buttons in the
+ * table), but putting them above the name of the device they act on is how a
+ * phone acknowledges the wrong alert.
+ */
+function RowCard<T>({
+  row,
+  columns,
+  selectable,
+  selected,
+  onToggle,
+  onRowClick,
+  rowClass,
+}: {
+  row: T;
+  columns: Column<T>[];
+  selectable?: boolean;
+  selected?: boolean;
+  onToggle: () => void;
+  onRowClick?: (row: T) => void;
+  rowClass?: (row: T) => string;
+}) {
+  const actions: ReactNode[] = [];
+  const heads: Column<T>[] = [];
+  const subs: Column<T>[] = [];
+  const fields: Column<T>[] = [];
+  for (const c of columns) {
+    if (isActionColumn(c)) {
+      const node = c.render(row);
+      if (node !== null && node !== undefined && node !== false && node !== '') actions.push(<Fragment key={c.key}>{node}</Fragment>);
+    } else if (c.mobile === 'hide') continue;
+    else if (c.mobile === 'primary') heads.push(c);
+    else if (c.mobile === 'secondary') subs.push(c);
+    else fields.push(c);
+  }
+  // Nothing annotated: the first text column is the card's identity.
+  if (!heads.length && fields.length) heads.push(fields.shift()!);
+
+  return (
+    <li
+      className={`${onRowClick ? 'clickable' : ''} ${selected ? 'selected' : ''} ${rowClass?.(row) ?? ''}`}
+      onClick={onRowClick ? () => onRowClick(row) : undefined}
+      tabIndex={onRowClick ? 0 : undefined}
+      onKeyDown={
+        onRowClick
+          ? (e) => {
+              if (e.target !== e.currentTarget) return;
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                onRowClick(row);
+              }
+            }
+          : undefined
+      }
+    >
+      <div className="rc-head">
+        {selectable && (
+          <span className="rc-check" onClick={(e) => e.stopPropagation()}>
+            <Checkbox checked={!!selected} onChange={onToggle} />
+          </span>
+        )}
+        <div className="rc-title">
+          {heads.map((c) => (
+            <Fragment key={c.key}>{c.render(row)}</Fragment>
+          ))}
+          {subs.map((c) => (
+            <div className="rc-sub" key={c.key}>
+              {c.render(row)}
+            </div>
+          ))}
+        </div>
+      </div>
+      {actions.length > 0 && <div className="rc-actions">{actions}</div>}
+      {fields.length > 0 && (
+        <dl className="rc-fields">
+          {fields.map((c) => (
+            <Fragment key={c.key}>
+              <dt>{headerText(c)}</dt>
+              <dd className={c.className ?? ''}>{c.render(row)}</dd>
+            </Fragment>
+          ))}
+        </dl>
+      )}
+    </li>
+  );
+}
+
+/** A column with no text header renders buttons or an icon, never a value. */
+function isActionColumn<T>(c: Column<T>): boolean {
+  return !(typeof c.header === 'string' && c.header.trim());
 }
 
 // ---------- CSV export ----------
@@ -259,9 +421,21 @@ export function toCsv<T>(columns: Column<T>[], rows: T[]): string {
   return lines.join('\r\n');
 }
 
-/** Hand the browser a file. Same-origin blob: the CSP allows no other source. */
-export function downloadCsv(filename: string, csv: string): void {
-  // The BOM is what makes Excel open a UTF-8 CSV as UTF-8.
+/**
+ * Hand the file to whoever can take it: the native shell first, then the
+ * browser. Same-origin blob: the CSP allows no other source.
+ *
+ * Inside the Android WebView the blob path is a dead end \u2014 `DownloadListener`
+ * never fires for a `blob:` URL and no HTTP client can resolve one \u2014 so every
+ * Export CSV button is a silent no-op there unless the text goes to the native
+ * side before the Blob exists. `host.saveText` writes it to
+ * MediaStore.Downloads and resolves true; in a browser there is no bridge, it
+ * resolves false, and nothing below changes.
+ */
+export async function downloadCsv(filename: string, csv: string): Promise<void> {
+  // The BOM is what makes Excel open a UTF-8 CSV as UTF-8 \u2014 it belongs in the
+  // file whichever side writes it.
+  if (await host.saveText(filename, 'text/csv;charset=utf-8', '\uFEFF' + csv)) return;
   const blob = new Blob(['\uFEFF', csv], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');

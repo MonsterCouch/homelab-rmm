@@ -44,6 +44,15 @@
   --radius-sm: 5px;
   --nav-w: 220px;
   --topbar-h: 52px;
+  /* Safe areas. Zero everywhere except an edge-to-edge Android WebView (the
+     shell targets SDK 35, where edge-to-edge is not optional) and a notched
+     phone browser; index.html has to carry viewport-fit=cover for env() to
+     resolve to anything but 0. Kept as tokens so the few places that need
+     them can use calc() without repeating the fallback. */
+  --safe-t: env(safe-area-inset-top, 0px);
+  --safe-r: env(safe-area-inset-right, 0px);
+  --safe-b: env(safe-area-inset-bottom, 0px);
+  --safe-l: env(safe-area-inset-left, 0px);
   --chart-cpu: #3b82f6;
   --chart-mem: #a78bfa;
   --chart-disk: #f59e0b;
@@ -100,6 +109,11 @@ html,
 body,
 #root {
   height: 100%;
+}
+html {
+  /* Android's default is a cyan rgba(51,181,229,.4) flash on every tap,
+     including rows and links that do nothing on tap. */
+  -webkit-tap-highlight-color: transparent;
 }
 body {
   margin: 0;
@@ -198,7 +212,9 @@ textarea {
 .app {
   display: grid;
   grid-template-columns: var(--nav-w) 1fr;
-  grid-template-rows: var(--topbar-h) 1fr;
+  /* The topbar row grows by the status-bar inset rather than the bar being
+     padded inside a fixed row, which would squash its 52px of content. */
+  grid-template-rows: calc(var(--topbar-h) + var(--safe-t)) 1fr;
   grid-template-areas:
     "nav top"
     "nav main";
@@ -211,6 +227,11 @@ textarea {
   display: flex;
   flex-direction: column;
   overflow-y: auto;
+  /* The rail spans both grid rows, so it starts at y=0 under the status bar,
+     and as an off-canvas drawer it is fixed to all four edges. */
+  padding-top: var(--safe-t);
+  padding-bottom: var(--safe-b);
+  padding-left: var(--safe-l);
 }
 .nav-brand {
   display: flex;
@@ -280,7 +301,7 @@ textarea {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 0 18px;
+  padding: var(--safe-t) calc(18px + var(--safe-r)) 0 calc(18px + var(--safe-l));
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
 }
@@ -338,8 +359,12 @@ textarea {
 .main {
   grid-area: main;
   overflow: auto;
-  padding: 18px 22px 40px;
+  padding: 18px calc(22px + var(--safe-r)) calc(40px + var(--safe-b)) calc(22px + var(--safe-l));
   min-width: 0;
+  /* A flick that runs out of page must not hand the gesture to the WebView
+     (pull-to-refresh / overscroll glow) - the document itself never scrolls,
+     .main does, so the chaining has to stop here. */
+  overscroll-behavior-y: contain;
 }
 .main.flush {
   padding: 0;
@@ -402,6 +427,17 @@ textarea {
 }
 .grid.auto {
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+}
+/* A fixed-ish aside plus one fluid column (device Overview, the script
+   editor). The second track is minmax(0, 1fr), never a bare 1fr: a bare 1fr
+   has an auto minimum, so at 390px the aside took 352px and the content track
+   resolved to 0 - every live stat tile, chart, disk and interface was laid
+   out off-screen instead of the page simply scrolling. */
+.grid.aside {
+  grid-template-columns: minmax(300px, 380px) minmax(0, 1fr);
+}
+.grid.aside-fixed {
+  grid-template-columns: 340px minmax(0, 1fr);
 }
 @media (max-width: 1200px) {
   .grid.cols-4 {
@@ -637,13 +673,16 @@ textarea {
 }
 
 /* ---------- forms ---------- */
-input[type="text"],
-input[type="password"],
-input[type="number"],
-input[type="email"],
-input[type="search"],
-input[type="url"],
-input[type="datetime-local"],
+/* An enumerated `input[type="…"]` list styles the ATTRIBUTE, and an <input>
+   written without one has IDL type "text" but no attribute - so every bare
+   field in the app (Login and Setup usernames included) fell through to the
+   raw native control. Negate the non-text types instead, which also picks up
+   tel/date/time/month/week for free.
+   The negations sit inside :where() so the whole selector keeps the
+   specificity of a bare `input` (0,0,1): ten bare :not([type=…]) would score
+   (0,10,1) and start winning against rules like `.topbar .search input`
+   (0,2,1), silently eating the search icon's padding. */
+input:not(:where([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"], [type="submit"], [type="button"], [type="image"], [type="reset"], [type="hidden"])),
 select,
 textarea,
 .input {
@@ -807,6 +846,23 @@ textarea.code {
   border-radius: var(--radius);
   background: var(--bg-elev);
 }
+/* A DataTable is a scroller plus a footer. The footer must NOT be inside the
+   horizontally scrolling wrapper: as a block child it is laid out at the
+   wrapper's width and then slides away with the table (measured left 13 ->
+   -834 on Devices at 390px), taking the row counts and Export CSV off the
+   left edge. So the frame moves out to .dt and .table-wrap keeps only its
+   overflow; a .table-wrap used on its own elsewhere is untouched. */
+.dt {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev);
+  overflow: hidden;
+}
+.dt > .table-wrap {
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
 table.tbl {
   width: 100%;
   border-collapse: collapse;
@@ -878,7 +934,9 @@ table.tbl {
   opacity: 1;
 }
 /* There is no hover on a touch screen: row actions that only appear on hover
-   are invisible buttons on a phone or a tablet. */
+   are invisible buttons on a phone or a tablet. (The rest of the touch pass -
+   tap targets and type scale - is one `@media (pointer: coarse)` block at the
+   end of the responsive section, where it wins every same-specificity tie.) */
 @media (hover: none) {
   .tbl .cell-actions {
     opacity: 1;
@@ -907,6 +965,111 @@ table.tbl {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ---------- table rows as cards (phones) ---------- */
+.card-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.card-list > li {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.card-list > li:last-child {
+  border-bottom: 0;
+}
+.card-list > li.selected {
+  background: var(--accent-soft);
+}
+.card-list > li.rc-all {
+  padding: 10px 12px;
+  background: var(--bg-elev2);
+  font-size: 13px;
+}
+.rc-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.rc-check {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+.rc-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-width: 0;
+  flex: 1;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.rc-sub {
+  flex-basis: 100%;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+/* The row actions are the point of the card on Alerts and Patches: they come
+   out of the last column, sit on their own line and stop being 19px high. */
+.rc-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.rc-actions .cell-actions {
+  display: contents;
+}
+.rc-actions .btn {
+  flex: 1 1 auto;
+  min-height: 44px;
+  padding: 8px 14px;
+  font-size: 13px;
+}
+.rc-actions .btn.icon {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  padding: 8px;
+}
+.rc-actions .dropdown {
+  flex: 1 1 auto;
+  display: flex;
+}
+.rc-fields {
+  display: grid;
+  grid-template-columns: minmax(80px, 38%) 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+.rc-fields dt {
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.rc-fields dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* Values the table renders in a fixed-width truncating box have the whole
+   card width here, and touch never fires the title tooltip they hide in. */
+.rc-fields dd .truncate,
+.rc-fields dd .ellipsis,
+.rc-title .truncate,
+.rc-title .ellipsis,
+.rc-sub .truncate,
+.rc-sub .ellipsis {
+  max-width: none !important;
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
 }
 
 /* ---------- chips / dots ---------- */
@@ -1144,7 +1307,10 @@ table.tbl {
 }
 .modal-body {
   padding: 16px;
-  max-height: calc(100vh - 220px);
+  /* dvh, not vh: with interactive-widget=resizes-content the Android soft
+     keyboard shrinks the layout viewport, and vh would keep sizing the dialog
+     to the whole screen and push its footer buttons under the keyboard. */
+  max-height: calc(100dvh - 220px);
   overflow: auto;
 }
 .modal-foot {
@@ -1565,7 +1731,7 @@ table.tbl {
   pointer-events: none;
 }
 .fill-page {
-  height: calc(100vh - var(--topbar-h) - 160px);
+  height: calc(100dvh - var(--topbar-h) - 160px);
   min-height: 420px;
   display: flex;
   flex-direction: column;
@@ -1696,11 +1862,12 @@ table.tbl {
 /* ---------- toasts ---------- */
 .toast-host {
   position: fixed;
-  right: 16px;
+  right: calc(16px + var(--safe-r));
   /* A page that fills the viewport puts its own read-out along the bottom (the
      terminal and the remote desktop status lines carry "fps · B/s"), so the
-     stack starts above it rather than on top of it. */
-  bottom: calc(16px + var(--statusline-h, 0px));
+     stack starts above it rather than on top of it - and above the gesture
+     pill, which the bottom inset measures. */
+  bottom: calc(16px + var(--statusline-h, 0px) + var(--safe-b));
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -1937,7 +2104,7 @@ table.tbl {
     display: inline-flex;
   }
   .topbar {
-    padding: 0 10px;
+    padding: var(--safe-t) calc(10px + var(--safe-r)) 0 calc(10px + var(--safe-l));
     gap: 4px;
   }
   /* A phone topbar fits the menu, the search, the bell and an avatar. */
@@ -1949,13 +2116,32 @@ table.tbl {
     min-width: 0;
   }
   .main {
-    padding: 12px 12px 32px;
+    padding: 12px calc(12px + var(--safe-r)) calc(32px + var(--safe-b)) calc(12px + var(--safe-l));
   }
+  /* minmax(0, 1fr), not 1fr: a bare 1fr keeps an auto minimum, so one wide
+     child (a nowrap table in a card) stretches the whole track and with it
+     the page - measured 709px of grid in a 366px column on device Overview. */
   .grid.cols-2,
   .grid.cols-3,
   .grid.cols-4,
-  .grid.auto {
-    grid-template-columns: 1fr;
+  .grid.auto,
+  .grid.aside,
+  .grid.aside-fixed {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  /* A table written straight into a card body (device Overview's disks and
+     network interfaces) has no .table-wrap to scroll inside, so its nowrap
+     cells have nowhere to go but through the side of the screen. */
+  .card-body > table.tbl th,
+  .card-body > table.tbl td {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  /* On a phone the device's live stats and charts come before the identity
+     edit form, which is the second thing anyone does and the first thing in
+     the source. */
+  .grid.aside > :first-child {
+    order: 2;
   }
   /* Five fixed-width selects in a row do not fit a phone: let every control
      take a share of the line and wrap. The inline max-widths the pages set are
@@ -1972,18 +2158,237 @@ table.tbl {
     font-size: 17px;
   }
   .toast-host {
-    left: 8px;
-    right: 8px;
+    left: calc(8px + var(--safe-l));
+    right: calc(8px + var(--safe-r));
     max-width: none;
   }
   .modal-body {
-    max-height: calc(100vh - 170px);
+    max-height: calc(100dvh - 170px);
   }
   .fill-page {
-    height: calc(100vh - var(--topbar-h) - 120px);
+    height: calc(100dvh - var(--topbar-h) - 120px);
   }
   .notif-menu {
     width: calc(100vw - 20px);
+  }
+
+  /* ----- dialogs are sheets on a phone -----
+     A 560px dialog in a 390px viewport left a 16px gutter that a fat-finger
+     miss lands in; the dialog now fills the width and rises from the bottom
+     edge, and the gutter that used to dismiss it is gone. (The dismiss-on-
+     backdrop handler itself is disabled on coarse pointers in Modal.tsx.) */
+  .overlay {
+    padding: 0;
+    align-items: flex-end;
+  }
+  .overlay.center {
+    align-items: flex-end;
+  }
+  .modal,
+  .modal.sm,
+  .modal.lg,
+  .modal.xl {
+    width: 100%;
+    max-width: none;
+    border-radius: 14px 14px 0 0;
+    border-bottom: 0;
+  }
+  .modal-foot {
+    position: sticky;
+    bottom: 0;
+    background: var(--bg-elev);
+    padding-bottom: calc(12px + var(--safe-b));
+  }
+  /* 640px of drawer in a 390px viewport is 92vw - an unusable 23px strip of
+     scrim that is, again, exactly what a mis-tap hits. */
+  .drawer,
+  .drawer.wide {
+    width: 100%;
+    border-left: 0;
+  }
+  .drawer .modal-foot {
+    position: static;
+  }
+}
+
+/* ---------- responsive: touch ----------
+   Measured at 390x844 before this block: .btn 30.9px tall, .btn.sm 23.6,
+   .btn.xs 19, .btn.icon 30x30, the dialog close 26x26, checkboxes 15x15,
+   .switch 34x19, .toast-close 11.3x16, .chip .x ~8x14, nav items 37.6,
+   inputs 33.6 - nothing in the console reached the 44px WCAG 2.5.5 / 48dp
+   Android minimum, and one alert-rule dialog held 71 targets under 40px.
+   This is the whole fix, in one block rather than fifty component edits.
+
+   Keyed on the POINTER, not on the width: a tablet and a touch laptop want
+   the same density as a phone, and a mouse at 390px does not. It sits at the
+   end of the responsive section so a rule here beats the base rule it
+   restates whenever the two have the same specificity. */
+@media (pointer: coarse) {
+  body {
+    font-size: 15px;
+  }
+  /* Nearly every size in this file is an absolute px value, so the tail below
+     12px has to be lifted by name rather than cascading from body. */
+  .small,
+  .tbl-foot,
+  .search-results .item .meta {
+    font-size: 13px;
+  }
+  .tbl th,
+  .chip,
+  .field .hint,
+  .field .err,
+  .stat .label,
+  .form-error {
+    font-size: 12.5px;
+  }
+  .badge,
+  .kbd,
+  .nav-foot,
+  .tabs .count {
+    font-size: 12px;
+  }
+  .nav-section,
+  .tbl th .arrow {
+    font-size: 11.5px;
+  }
+
+  .btn {
+    min-height: 44px;
+    padding: 8px 14px;
+    font-size: 14px;
+  }
+  .btn.sm {
+    min-height: 40px;
+    padding: 6px 12px;
+    font-size: 13.5px;
+  }
+  .btn.xs {
+    min-height: 36px;
+    padding: 5px 10px;
+    font-size: 13px;
+  }
+  .btn.icon,
+  .btn.icon.sm {
+    width: 44px;
+    height: 44px;
+    padding: 8px;
+  }
+  .btn svg {
+    width: 17px;
+    height: 17px;
+  }
+
+  /* 16px is also what stops a mobile browser zooming the page on focus. */
+  input:not(:where([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"], [type="submit"], [type="button"], [type="image"], [type="reset"], [type="hidden"])),
+  select,
+  textarea,
+  .input {
+    font-size: 16px;
+  }
+  input:not(:where([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"], [type="submit"], [type="button"], [type="image"], [type="reset"], [type="hidden"])),
+  select,
+  .input {
+    min-height: 44px;
+    padding: 10px 12px;
+  }
+  .tag-input {
+    min-height: 44px;
+  }
+  .tag-input input {
+    min-height: 36px;
+  }
+  textarea {
+    padding: 10px 12px;
+  }
+  input[type="checkbox"],
+  input[type="radio"] {
+    width: 22px;
+    height: 22px;
+  }
+  .tbl td.check,
+  .tbl th.check {
+    width: 48px;
+  }
+  .checks label {
+    min-height: 44px;
+  }
+  /* :has() is its own rule: one unsupported selector invalidates the whole
+     list it is written in. */
+  label:has(> input[type="checkbox"]),
+  label:has(> input[type="radio"]) {
+    min-height: 44px;
+  }
+  /* 48x28 with a 24px knob, so the travel is 48 - 24 - 2*2 = 20px. Restating
+     the geometry without restating the translate is how a switch ends up with
+     its knob hanging over the edge. */
+  .switch {
+    width: 48px;
+    height: 28px;
+    border-radius: 14px;
+  }
+  .switch::after {
+    width: 24px;
+    height: 24px;
+  }
+  .switch[aria-checked="true"]::after {
+    transform: translateX(20px);
+  }
+
+  .menu {
+    min-width: 220px;
+  }
+  .menu button,
+  .menu a {
+    min-height: 48px;
+    padding: 10px 12px;
+  }
+  .menu hr {
+    margin: 6px 0;
+  }
+  .tabs a,
+  .tabs button {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
+  .nav a.nav-item {
+    min-height: 48px;
+    padding: 11px 12px;
+  }
+  .search-results .item {
+    min-height: 48px;
+  }
+  /* Both of these are a glyph with no box of its own: give them one, and take
+     it back out of the flow with negative margins so the toast and the chip
+     keep their height. */
+  .toast-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    min-height: 44px;
+    margin: -10px -8px -10px 0;
+  }
+  .chip .x {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 28px;
+    min-height: 28px;
+    margin: -4px -6px -4px 0;
+  }
+  .cell-btn {
+    min-height: 40px;
+  }
+}
+
+/* A touch table that still scrolls (a tablet above the phone breakpoint) has
+   to cap its height, or `.tbl th{position:sticky;top:0}` resolves against a
+   wrapper that never scrolls vertically and the header never engages. */
+@media (max-width: 1000px) and (pointer: coarse) {
+  .dt > .table-wrap {
+    max-height: 70dvh;
   }
 }
 

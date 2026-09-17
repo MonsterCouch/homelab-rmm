@@ -21,8 +21,13 @@ const RANGES: { id: string; label: string; secs: number }[] = [
 export function Overview({ agent, reload, canWrite }: TabProps) {
   const inv = agent.inventory;
   const m = agent.last_metrics;
+  // .grid.aside, not an inline gridTemplateColumns: an inline style cannot be
+  // reached by the phone media query, and at 390px this one computed to
+  // "352px 0px" - every live stat tile, chart, disk and interface was laid out
+  // off-screen. The class also collapses to one column below 700px and moves
+  // this first column (the identity form) after the stats and charts.
   return (
-    <div className="grid" style={{ gridTemplateColumns: 'minmax(300px, 380px) 1fr', gap: 14 }}>
+    <div className="grid aside">
       <div className="stack" style={{ gap: 14 }}>
         <IdentityCard agent={agent} reload={reload} canWrite={canWrite} />
         <div className="card">

@@ -136,7 +136,10 @@ export function ScriptEditor() {
         )}
       </div>
       {error && <div className="form-error" role="alert">{error}</div>}
-      <div className="grid" style={{ gridTemplateColumns: '340px 1fr', gap: 16 }}>
+      {/* .grid.aside-fixed: the bare 1fr second track collapsed to 60px at
+          390px, leaving the code textarea about 30px wide, and an inline
+          style cannot be reached by the phone media query. */}
+      <div className="grid aside-fixed" style={{ gap: 16 }}>
         <div className="stack">
           <div className="card">
             <div className="card-body">

@@ -3,8 +3,13 @@ import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { Button } from '../../components/ui';
 import { IconClipboard, IconCopy, IconRefresh, IconStop } from '../../components/Icons';
+import { host } from '../../lib/host';
 import { useToast } from '../../state/toast';
 import type { TabProps } from './DeviceDetail';
+import { copyText, readClipboard } from './clipboard';
+import { KeyBar, KeyButton } from './KeyBar';
+import { coarsePointer, useFillHeight } from './touch';
+import '../../styles/device-touch.css';
 
 type Status = 'idle' | 'connecting' | 'connected' | 'closed' | 'error';
 
@@ -15,13 +20,65 @@ interface ShellMsg {
   session?: string;
 }
 
+interface StickyMods {
+  ctrl: boolean;
+  alt: boolean;
+}
+
+/**
+ * The on-screen key bar (task C8a). Everything here is a byte sequence the
+ * shell already understands, fed into the same `{t:'in',data}` frame the
+ * keyboard uses — no new server or agent surface.
+ */
+const TERM_KEYS: readonly { label: string; title: string; data: string; wide?: boolean }[] = [
+  { label: 'Esc', title: 'Escape', data: '\x1b', wide: true },
+  { label: 'Tab', title: 'Tab', data: '\t', wide: true },
+  { label: '↑', title: 'Up arrow', data: '\x1b[A' },
+  { label: '↓', title: 'Down arrow', data: '\x1b[B' },
+  { label: '←', title: 'Left arrow', data: '\x1b[D' },
+  { label: '→', title: 'Right arrow', data: '\x1b[C' },
+  { label: '^C', title: 'Ctrl+C — interrupt', data: '\x03' },
+  { label: '^D', title: 'Ctrl+D — end of input', data: '\x04' },
+  { label: '^Z', title: 'Ctrl+Z — suspend', data: '\x1a' },
+  { label: '^L', title: 'Ctrl+L — clear screen', data: '\x0c' },
+  { label: '^R', title: 'Ctrl+R — reverse search', data: '\x12' },
+  { label: 'Home', title: 'Home', data: '\x1b[H', wide: true },
+  { label: 'End', title: 'End', data: '\x1b[F', wide: true },
+  { label: 'PgUp', title: 'Page up', data: '\x1b[5~', wide: true },
+  { label: 'PgDn', title: 'Page down', data: '\x1b[6~', wide: true },
+  { label: '|', title: 'Pipe', data: '|' },
+  { label: '~', title: 'Tilde', data: '~' },
+  { label: '/', title: 'Slash', data: '/' },
+  { label: '-', title: 'Hyphen', data: '-' },
+];
+
+/**
+ * Apply the armed sticky modifiers to one typed character. Ctrl maps a letter
+ * the way a real terminal does (`charCodeAt - 64`), Alt prefixes ESC, which is
+ * what every shell reads as Meta. Sequences longer than one character (the key
+ * bar's own escape codes) are left alone.
+ */
+function applyMods(data: string, mods: StickyMods): string {
+  if (!mods.ctrl && !mods.alt) return data;
+  let out = data;
+  if (mods.ctrl && out.length === 1) {
+    const c = out.toUpperCase().charCodeAt(0);
+    if (c >= 64 && c <= 95) out = String.fromCharCode(c - 64); // @ A-Z [ \ ] ^ _
+    else if (out === '?') out = '\x7f'; // Ctrl+? is DEL
+    else if (out === ' ') out = '\x00'; // Ctrl+Space is NUL
+  }
+  if (mods.alt && out.length === 1) out = `\x1b${out}`;
+  return out;
+}
+
 function wsURL(path: string): string {
   return `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${path}`;
 }
 
 export function Terminal({ agent }: TabProps) {
   const toast = useToast();
-  const host = useRef<HTMLDivElement>(null);
+  const page = useRef<HTMLDivElement>(null);
+  const host_ = useRef<HTMLDivElement>(null);
   const term = useRef<XTerm | null>(null);
   const fit = useRef<FitAddon | null>(null);
   const ws = useRef<WebSocket | null>(null);
@@ -30,10 +87,39 @@ export function Terminal({ agent }: TabProps) {
   const [status, setStatus] = useState<Status>('idle');
   const [detail, setDetail] = useState('');
   const [size, setSize] = useState({ cols: 0, rows: 0 });
+  const [mods, setMods] = useState<StickyMods>({ ctrl: false, alt: false });
+  const modsRef = useRef(mods);
+  modsRef.current = mods;
 
   const send = useCallback((msg: Record<string, unknown>) => {
     const s = ws.current;
     if (s && s.readyState === WebSocket.OPEN) s.send(JSON.stringify(msg));
+  }, []);
+
+  /** Type raw bytes at the shell, consuming any armed sticky modifier. */
+  const sendData = useCallback(
+    (data: string) => {
+      const m = modsRef.current;
+      send({ t: 'in', data: applyMods(data, m) });
+      if (m.ctrl || m.alt) setMods({ ctrl: false, alt: false });
+    },
+    [send],
+  );
+
+  // The terminal is created exactly once; anything the mount effect needs from
+  // a later render is reached through a ref so the effect never re-runs and
+  // tears a live session down.
+  const sendDataRef = useRef(sendData);
+  sendDataRef.current = sendData;
+  const toastRef = useRef(toast);
+  toastRef.current = toast;
+
+  const refit = useCallback(() => {
+    try {
+      fit.current?.fit();
+    } catch {
+      /* container hidden */
+    }
   }, []);
 
   const connect = useCallback(() => {
@@ -88,7 +174,7 @@ export function Terminal({ agent }: TabProps) {
 
   // create the terminal once
   useEffect(() => {
-    const el = host.current;
+    const el = host_.current;
     if (!el) return;
     // The terminal stays dark in both themes (matches .term-wrap); a light
     // terminal on a light page reads worse than a dark island.
@@ -107,7 +193,19 @@ export function Terminal({ agent }: TabProps) {
     fit.current = f;
     setSize({ cols: t.cols, rows: t.rows });
 
-    t.onData((d) => send({ t: 'in', data: d }));
+    // C8(c). Without these Gboard offers a URL-ish keyboard with a "Go" key
+    // and autocorrects shell words; `inputmode=text` and `enterkeyhint=send`
+    // are the two attributes xterm does not set for us.
+    const ta = t.textarea;
+    if (ta) {
+      ta.setAttribute('inputmode', 'text');
+      ta.setAttribute('enterkeyhint', 'send');
+      ta.setAttribute('autocapitalize', 'none');
+      ta.setAttribute('autocorrect', 'off');
+      ta.setAttribute('spellcheck', 'false');
+    }
+
+    t.onData((d) => sendDataRef.current(d));
     t.onResize(({ cols, rows }) => {
       setSize({ cols, rows });
       send({ t: 'resize', cols, rows });
@@ -119,13 +217,21 @@ export function Terminal({ agent }: TabProps) {
       if (e.ctrlKey && (e.key === 'C' || e.key === 'c') && (e.shiftKey || t.hasSelection())) {
         const sel = t.getSelection();
         if (sel) {
-          void navigator.clipboard.writeText(sel).catch(() => undefined);
+          // This handler is SYNCHRONOUS. copyText is async and swallows its
+          // own failures, so nothing can throw back into xterm here — the old
+          // `navigator.clipboard.writeText(...)` threw a TypeError on a
+          // non-secure origin that its own .catch() could not see (C7).
+          void copyText(sel).then((ok) => {
+            if (!ok) toastRef.current.error('Copy failed', 'Select the text and copy it with the browser menu.');
+          });
           t.clearSelection();
           return false;
         }
       }
       if (e.ctrlKey && e.shiftKey && (e.key === 'V' || e.key === 'v')) {
-        void navigator.clipboard.readText().then((txt) => txt && t.paste(txt)).catch(() => undefined);
+        void readClipboard().then((txt) => {
+          if (txt) t.paste(txt);
+        });
         return false;
       }
       return true;
@@ -138,7 +244,11 @@ export function Terminal({ agent }: TabProps) {
       }
     });
     ro.observe(el);
-    t.writeln('\x1b[90mPress Connect to open a shell.\x1b[0m');
+    t.writeln(
+      coarsePointer()
+        ? '\x1b[90mTap Connect to open a shell on this device.\x1b[0m'
+        : '\x1b[90mPress Connect to open a shell.\x1b[0m',
+    );
     return () => {
       ro.disconnect();
       ws.current?.close();
@@ -148,12 +258,23 @@ export function Terminal({ agent }: TabProps) {
     };
   }, [send]);
 
-  // auto-connect on mount
+  // C8(d) SECURITY. Auto-connect spawns an audited shell session on a live
+  // device. On a phone, merely opening the tab — a mis-tap in a pocket — is
+  // not consent, so a coarse pointer has to ask for it explicitly.
   useEffect(() => {
+    if (coarsePointer()) return;
     const id = window.setTimeout(connect, 50);
     return () => window.clearTimeout(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // C8(b). Fill what the visual viewport actually leaves, and re-fit when the
+  // soft keyboard takes half of it.
+  useFillHeight(page, refit);
+
+  // The native shell's Paste push (C7): the only working paste path inside an
+  // Android WebView.
+  useEffect(() => host.onPaste((text) => text && term.current?.paste(text)), []);
 
   const disconnect = () => {
     send({ t: 'close' });
@@ -163,21 +284,24 @@ export function Terminal({ agent }: TabProps) {
   const copySel = async () => {
     const sel = term.current?.getSelection();
     if (!sel) return toast.info('Nothing selected');
-    await navigator.clipboard.writeText(sel);
-    toast.success('Copied');
+    if (await copyText(sel)) toast.success('Copied');
+    else toast.error('Copy failed', 'Select the text and copy it with the browser menu.');
+    term.current?.focus();
   };
   const paste = async () => {
-    try {
-      const txt = await navigator.clipboard.readText();
-      if (txt) term.current?.paste(txt);
-      term.current?.focus();
-    } catch {
+    const txt = await readClipboard();
+    if (txt === null) {
       toast.error('Clipboard read blocked', 'Use Ctrl+V or Ctrl+Shift+V inside the terminal instead.');
+      return;
     }
+    if (txt) term.current?.paste(txt);
+    term.current?.focus();
   };
 
+  const toggleMod = (k: keyof StickyMods) => setMods((m) => ({ ...m, [k]: !m[k] }));
+
   return (
-    <div className="fill-page">
+    <div className="fill-page device-fill term-page" ref={page}>
       <div className="toolbar">
         <select value={shell} onChange={(e) => setShell(e.target.value)} style={{ width: 130 }} aria-label="Shell">
           {shells.map((s) => (
@@ -202,9 +326,22 @@ export function Terminal({ agent }: TabProps) {
           <IconClipboard /> Paste
         </Button>
         <span className="grow" />
-        <span className="muted small">Tip: select text to copy; Ctrl+C with a selection copies instead of interrupting.</span>
+        <span className="muted small term-tip">Tip: select text to copy; Ctrl+C with a selection copies instead of interrupting.</span>
       </div>
-      <div className="term-wrap" ref={host} role="application" aria-label={`Terminal on ${agent.display_name}`} />
+      <div className="term-wrap" ref={host_} role="application" aria-label={`Terminal on ${agent.display_name}`} />
+      <KeyBar label="Terminal keys">
+        <KeyButton title="Ctrl — applies to the next key" on={mods.ctrl} onPress={() => toggleMod('ctrl')} wide>
+          Ctrl
+        </KeyButton>
+        <KeyButton title="Alt — applies to the next key" on={mods.alt} onPress={() => toggleMod('alt')} wide>
+          Alt
+        </KeyButton>
+        {TERM_KEYS.map((k) => (
+          <KeyButton key={k.title} title={k.title} wide={k.wide} onPress={() => sendData(k.data)}>
+            {k.label}
+          </KeyButton>
+        ))}
+      </KeyBar>
       <div className="statusline">
         <span className={`dot ${status === 'connected' ? 'on' : status === 'connecting' ? 'warn' : 'off'}`} />
         <span>
