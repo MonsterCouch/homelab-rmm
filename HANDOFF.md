@@ -113,6 +113,11 @@ the new version and fix the compare links at the bottom).
 - The console's phone pass was measured with Playwright at 390x844 and 412x915 against a
   real server: zero horizontal overflow on twelve pages, tables replaced by cards, and the
   1280-wide layout unchanged.
+- `tools\build.ps1` ran on real Windows for the first time (2026-09-16). A full
+  `-Target all,package` cross-compiled nine binaries, every one stamped
+  `v0.2.0-43-g1e3fc5d` where a Windows build used to stamp `dev`, wrote six archives and
+  SHA256SUMS, and the stale-binary guard then refused to package once a source file was
+  touched, naming the file and the target to rebuild.
 
 ## What has NOT been verified
 
@@ -121,8 +126,8 @@ the new version and fix the compare links at the bottom).
   **installing** a patch (only the scan ran), any baseline **remediation**, the
   **power** endpoint (reboot/shutdown/lock/logoff), and killing a **critical process**.
   All four were audited statically and their guards are unit-tested.
-- `tools\build.ps1` and `deploy\uninstall.ps1` were fixed but never executed: Bitdefender
-  quarantines PowerShell activity on the validation machine. Run them once on a clean box.
+- `deploy\uninstall.ps1` has still never been executed: it uninstalls the agent, so running it
+  here would take the validation host offline. Run it once on a machine you can spare.
 - The Android app has never run on a device or an emulator. In particular **the gating
   unknown of `docs/ANDROID.md` is still open**: whether a `wss://` handshake to a pinned
   self-signed host reaches `WebViewClient.onReceivedSslError`. The Chromium source path
@@ -137,11 +142,8 @@ the new version and fix the compare links at the bottom).
 ## Known open items
 
 1. **No LICENSE file.** Archives ship a placeholder. Pick one.
-2. `tools/build.ps1 -Target package` now carries the stale-binary guard (`Assert-Fresh` /
-   `Get-NewestSource`, the twin of `fresh` / `first_newer` in `tools/build.sh`), and the
-   version it stamps is no longer always `dev`. Neither has been executed: PowerShell is
-   quarantined on the validation machine. Run `tools\build.ps1 -Target all package` once,
-   then again without rebuilding, to see the guard fire.
+2. ~~Windows build tooling.~~ **Closed 2026-09-16**: `tools\build.ps1` was executed on real
+   Windows, stamps the real version, and its stale-binary guard fires. See "How it was verified".
 3. Drift alerts cannot link back to the baseline and check that raised them: the alerts API
    exposes no `dedupe_key` / `baseline_id` (the key `drift:<baseline>:<check>:<agent>`
    already holds both). Needs `internal/server/alerts.go` plus `web/src/api/types.ts`.
