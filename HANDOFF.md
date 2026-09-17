@@ -113,6 +113,15 @@ the new version and fix the compare links at the bottom).
 - The console's phone pass was measured with Playwright at 390x844 and 412x915 against a
   real server: zero horizontal overflow on twelve pages, tables replaced by cards, and the
   1280-wide layout unchanged.
+- The console phone work was reviewed against an isolated server and a second agent running in
+  the interactive session (2026-09-17), because the batches themselves were merged unreviewed -
+  a usage limit killed their reviewers. The terminal opens a real PowerShell and returns
+  `whoami`, its key bar carries Ctrl/Alt/Tab, the arrows and the control chords, and
+  auto-connect is correctly gated on pointer type: a phone-width visit to the Terminal tab
+  produced no `shell.open` audit row at all, while a mouse-width visit produced one. Remote
+  desktop streams live at phone width (2560x1440 source, ~9 fps) with its own key bar and
+  touch handling. No JavaScript errors in any of it, no console batch touched a file it did
+  not own, and nothing added a dependency, a service worker or a protocol change.
 - `tools\build.ps1` ran on real Windows for the first time (2026-09-16). A full
   `-Target all,package` cross-compiled nine binaries, every one stamped
   `v0.2.0-43-g1e3fc5d` where a Windows build used to stamp `dev`, wrote six archives and
