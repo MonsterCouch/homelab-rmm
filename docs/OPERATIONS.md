@@ -454,3 +454,63 @@ time (suppresses new alerts and policy-driven patch installs).
   usual reason someone reaches for it — is normal here and not what it is for. §6 has both the
   names the certificate actually carries and the rotation procedure.
 - Keep the server itself patched: it is a device like any other and can run the agent.
+
+## Installing on Windows with the MSI packages
+
+`tools\build.ps1 -Target all,msi` produces `dist\rmm-agent-<version>-x64.msi` and
+`dist\rmm-server-<version>-x64.msi`. The `msi` target needs the WiX Toolset
+(`winget install --id WiXToolset.WiXCLI`, then `wix eula accept wix7`) and is
+deliberately not part of `-Target all`, so a machine without WiX still builds
+everything else.
+
+MSI rather than a self-extracting `.exe` because the agent is the package that
+has to reach a fleet: `msiexec` takes the server URL and enrollment token as
+properties, and Group Policy, Intune and SCCM all deploy an MSI natively.
+
+**Agent.** Create an enrollment token in the console under Devices, Enroll
+device, then:
+
+```
+msiexec /i rmm-agent.msi /qn SERVER="https://rmm.example.ts.net:8443" TOKEN="<token>"
+```
+
+Add `FINGERPRINT="<64 hex>"` only when the server serves a self-signed
+certificate. Omit it when the certificate is publicly trusted — one from
+`tailscale cert` is — and the agent uses system trust, which also means nothing
+has to be re-pinned when that certificate renews.
+
+The package installs to `C:\Program Files\HomelabRMM`, an administrators-only
+directory, and then runs the agent's own `install` subcommand, so exactly one
+tested code path writes `agent.json`, registers the service and confirms it
+started. `%ProgramData%\HomelabRMM` is never touched by the installer, so a
+device keeps its identity across an upgrade: reinstalling or upgrading over an
+existing agent reuses the device key rather than enrolling a second time.
+
+Uninstall (`msiexec /x rmm-agent.msi /qn`, or Add/Remove Programs) deregisters
+the service and removes the files, and deliberately leaves `%ProgramData%` in
+place. Remove that directory by hand to retire a device for good.
+
+**Server.**
+
+```
+msiexec /i rmm-server.msi /qn PUBLICURL="https://rmm.example.ts.net:8443"
+```
+
+`LISTEN` defaults to `0.0.0.0:8443` and `DATADIR` to
+`C:\ProgramData\HomelabRMM-Server\data`, which is deliberately not the agent's
+`%ProgramData%\HomelabRMM`: the two collide on a machine running both, which is
+the normal case for a homelab. Pass `CERTFILE` and `KEYFILE` together to serve a
+certificate you already have.
+
+Bind to every interface and restrict reachability with the firewall rather than
+by binding one address, so the service still starts when that interface is not
+up yet at boot. For a Tailscale-only server:
+
+```
+New-NetFirewallRule -DisplayName 'Homelab RMM server (Tailscale only)' -Direction Inbound `
+    -Action Allow -Protocol TCP -LocalPort 8443 -InterfaceAlias 'Tailscale'
+```
+
+Neither package is code-signed, so SmartScreen and reputation-based antivirus
+will have an opinion on a fresh machine. That is expected; see the antivirus
+notes in the README.
