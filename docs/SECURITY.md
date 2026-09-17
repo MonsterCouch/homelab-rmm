@@ -31,7 +31,9 @@ agent, even with a certificate from a public CA, because only the pinned leaf is
 Browsers use ordinary TLS; the generated certificate is self-signed, so the browser warns until
 you trust it — an attacker who can present *another* self-signed certificate would produce the
 same warning, which is why you should import the real one once rather than click through every
-time.
+time. Expect that import to leave a *second* warning standing: the names in the generated
+certificate are fixed when it is written and often do not include the name you browse to — see
+"The name on the certificate is not the trust anchor" below.
 
 That protection is the `https://` case, which is what the console's install command produces for
 a server with a certificate. It does **not** hold for a `server_url` of `http://` — what a server
@@ -276,6 +278,52 @@ If that window is unacceptable in your environment:
 
 Verify a fingerprint out of band before pasting it; it is the trust anchor for that device.
 
+**The name on the certificate is not the trust anchor, and it usually will not match.** The
+names in the generated certificate are decided once, when the file is written, and never revised:
+`localHostnames()` (`internal/server/tls.go`) supplies `localhost`, `127.0.0.1`, the machine's
+**short** name from `os.Hostname()` (never an FQDN) and every non-loopback **IPv4** address the
+host had at that instant. IPv6 is filtered out entirely (`ipn.IP.To4() != nil`), so a tailnet
+`fd7a:…` address is never covered and a `100.x.y.z` one only if Tailscale was already up. The
+public URL's host is prepended to that list, but only on the run that actually *generates* the
+certificate — `--public-url`/`RMM_PUBLIC_URL` seeds the `public_url` setting immediately before
+the certificate block (`internal/server/server.go`), so a MagicDNS name
+(`<host>.<tailnet>.ts.net`) is a name on the certificate only when it was the `--public-url` host
+on **first run**. Setting Public URL later, from *Settings*, changes what install commands and
+alert mail say and nothing on disk. How would you know the name is not covered? From the log and
+nowhere else: at startup, and again at every settings save, the server warns `certificate does
+not cover the public URL` with the certificate's real names in `dns_sans=`/`ip_sans=`, and
+follows it with `certificate name mismatch`, whose `detail=` is the remediation sentence.
+`GET /api/system` returns that sentence as `cert_warning`, but no page in the console displays
+it today, so a Settings screen that looks clean proves nothing (`docs/OPERATIONS.md` §6 shows
+both lines).
+
+So reaching the server by any other name — the MagicDNS name, an FQDN, an address added after the
+certificate was written — produces a **hostname mismatch on top of the self-signed warning**, and
+that pair is the normal state of a healthy deployment rather than a symptom of one. Every pinned
+client here is built on exactly that: the agent sets `InsecureSkipVerify: true` and checks nothing
+but the fingerprint (`internal/agent/conn.go`), the install script's Windows callback compares one
+SHA-256 instead of returning `$true`, and the Android app accepts the WebView's `SSL_IDMISMATCH`
+alongside `SSL_UNTRUSTED` once the pin matches and turns its hostname verifier off
+(`docs/ANDROID.md` §2.2 rule 1). **A pinned client that also rejects on the name rejects every
+legitimate connection**, so if you are reviewing one of those code paths, the missing hostname
+check is the design and not an oversight. The fingerprint carries the whole decision — which is
+why it is worth comparing character by character, out of band, once.
+
+**Rotating the certificate rotates every pin at the same instant.** The fingerprint is the
+SHA-256 of the leaf, so replacing `server.crt`/`server.key` — regenerating the self-signed pair to
+cover a new name, or moving to a certificate from `--cert`/`--key` — invalidates every pin in the
+fleet simultaneously, and the failures do not look alike. Agents fail **quietly**: each logs
+`session ended err=… server certificate fingerprint mismatch: got <hex>` to `agent.log` and
+retries with a backoff capped at a minute, for as long as it takes; nothing reaches the server, so
+there is no server-side line either and the devices simply stop being online. The phone fails
+**loudly and safely**: the app shows its pin-mismatch dead end with the expected and the presented
+fingerprint side by side, and there is no way past it, because it never learns a pin from the
+connection it is verifying. Browsers warn again. Plan the change before enrolling a fleet, keep
+the old files until the fleet is back, and do not regenerate a certificate while chasing a name
+mismatch — the mismatch is normal (above) and the regeneration is not free. The procedure, and
+the alternative of a certificate the clients already trust (`tailscale cert`) with what that
+costs, are in `docs/OPERATIONS.md` §6.
+
 **Antivirus will have an opinion, and it is not wrong.** The one-line Windows form — a
 `Net.WebClient` `DownloadString` piped into `iex`, with certificate validation turned off first —
 is the shape of a dropper, and AMSI-aware scanners refuse it on sight (Bitdefender:
@@ -375,10 +423,12 @@ neither the script nor the download.
 3. **Use the least role** that gets the job done; create a separate `viewer` account for
    dashboards on a wall.
 4. **Trust the server certificate in your browser** once (`server.crt`), so a warning ever seen
-   again means something.
+   again means something. A name mismatch survives that import and is expected (above); a
+   changed issuer is not.
 5. **Short, single-use enrolment tokens**; delete leftovers.
 6. **Back up `server.key` with the database** and protect the backup like a password store; it
-   is what every agent pins.
+   is what every agent, and the phone, pins. Restoring it is what lets a rebuilt server keep the
+   fleet; generating a new pair strands every pinned client at once (`docs/OPERATIONS.md` §6).
 7. **Keep the server and agents updated**, and let the server manage itself as a device so it is
    patched with the rest.
 8. **Review the audit log** now and then; `login.failed` bursts and unexpected `shell.open` or
