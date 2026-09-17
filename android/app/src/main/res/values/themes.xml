@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- NoActionBar: MainActivity supplies its own MaterialToolbar so the server
+         label, the live-connection dot and the overflow live in one place.
+
+         DayNight rather than a fixed dark theme: web/index.html declares
+         `color-scheme: dark light` and the console ships its own themes, so the
+         native chrome follows the system and the bridge's `theme` frame keeps
+         the two in step. Algorithmic darkening is deliberately NOT enabled - it
+         would double-invert the console. -->
+    <style name="Theme.HomelabRmm" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <!-- targetSdk 35 forces edge-to-edge; the insets are applied to the
+             WebView container in code, because the IME arrives as an inset and
+             adjustResize alone no longer shrinks content. -->
+        <item name="android:windowLightStatusBar" tools:targetApi="23">false</item>
+    </style>
+
+</resources>

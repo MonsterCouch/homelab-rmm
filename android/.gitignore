@@ -1,0 +1,18 @@
+# Build output
+build/
+.gradle/
+.cxx/
+*.apk
+*.aab
+
+# Machine-local SDK location (docs/ANDROID.md §10)
+local.properties
+
+# Release signing. The keystore itself lives OUTSIDE this repository
+# (C:\Users\temp\.android-keys\homelab-rmm-release.jks by default) and must be
+# backed up: the AndroidKeyStore key that seals the server list is bound to the
+# signing identity, so losing the keystore destroys every stored pin.
+keystore.properties
+*.keystore
+*.jks
+*.p12

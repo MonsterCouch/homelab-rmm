@@ -1,0 +1,78 @@
+# The single version catalogue for the Android build.
+#
+# Lane: compileSdk 35 + build-tools 35.0.0 + JDK 17. Every androidx entry below
+# was checked by reading META-INF/com/android/build/gradle/aar-metadata.properties
+# (minCompileSdk / minAndroidGradlePluginVersion) inside the published .aar.
+#
+# The HARD CEILING is compileSdk 35, which is the newest platform installed on
+# this PC. Bumping anything marked DO NOT BUMP breaks the build with
+# "Dependency requires libraries and applications that depend on it to compile
+# against version 36 or later of the Android APIs", not with a deprecation.
+
+[versions]
+# --- toolchain -------------------------------------------------------------
+agp        = "8.13.2"   # requires Gradle >= 8.13, build-tools >= 35.0.0, JDK 17; supports up to API 36.1.
+                        # DO NOT BUMP to AGP 9.x: it requires Gradle >= 9.6.0 AND build-tools >= 36.0.0,
+                        # and build-tools 36.0.0 is not installed here.
+kotlin     = "2.3.21"   # KGP 2.3.20-2.3.21 -> Gradle 7.6.3-9.3.0, AGP 8.2.2-9.0.0. Covers both picks.
+coroutines = "1.10.2"
+
+# --- SDK levels ------------------------------------------------------------
+compileSdk = "35"
+targetSdk  = "35"
+minSdk     = "30"       # DO NOT LOWER. Three independent floors, all verified:
+                        #  (1) SslError.getCertificate().getX509Certificate() is API 29+;
+                        #  (2) BiometricPrompt BIOMETRIC_STRONG|DEVICE_CREDENTIAL is only
+                        #      expressible without branching at API 30+ (build() throws below it);
+                        #  (3) MediaStore.Downloads is API 29+, and Android 11 gives the real
+                        #      WindowInsets IME APIs the xterm.js keyboard handling wants.
+
+# --- androidx, at the compileSdk-35 ceiling --------------------------------
+core       = "1.16.0"          # minCompileSdk=35. DO NOT BUMP: 1.17.0 needs 36, 1.19.0 needs 37.
+activity   = "1.10.1"          # minCompileSdk=35. DO NOT BUMP: 1.13.0 needs 36.
+appcompat  = "1.8.0"           # minCompileSdk=34.
+lifecycle  = "2.9.4"           # minCompileSdk=34.
+webkit     = "1.17.0"          # minCompileSdk=33 - the latest release, no ceiling problem.
+biometric  = "1.2.0-alpha05"   # minCompileSdk=33. DO NOT BUMP: 1.4.0-alpha07 needs 36.
+                               # The stable line stalled at 1.1.0 in 2021; alpha05 is the current head.
+datastore  = "1.2.1"           # minCompileSdk=34.
+material   = "1.14.0"          # minCompileSdk unenforced; its POM pulls core 1.16.0 / appcompat 1.7.0.
+zxing      = "4.3.0"           # com.journeyapps:zxing-android-embedded, fully offline.
+
+# --- test ------------------------------------------------------------------
+junit      = "4.13.2"
+
+[libraries]
+androidx-core-ktx          = { module = "androidx.core:core-ktx",                     version.ref = "core" }
+androidx-activity-ktx      = { module = "androidx.activity:activity-ktx",             version.ref = "activity" }
+androidx-appcompat         = { module = "androidx.appcompat:appcompat",               version.ref = "appcompat" }
+androidx-webkit            = { module = "androidx.webkit:webkit",                     version.ref = "webkit" }
+androidx-biometric         = { module = "androidx.biometric:biometric",               version.ref = "biometric" }
+androidx-datastore-prefs   = { module = "androidx.datastore:datastore-preferences",   version.ref = "datastore" }
+androidx-lifecycle-process = { module = "androidx.lifecycle:lifecycle-process",       version.ref = "lifecycle" }
+androidx-lifecycle-runtime = { module = "androidx.lifecycle:lifecycle-runtime-ktx",   version.ref = "lifecycle" }
+kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+material                   = { module = "com.google.android.material:material",       version.ref = "material" }
+zxing-embedded             = { module = "com.journeyapps:zxing-android-embedded",     version.ref = "zxing" }
+junit                      = { module = "junit:junit",                                version.ref = "junit" }
+
+[plugins]
+android-application = { id = "com.android.application",      version.ref = "agp" }
+kotlin-android      = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-jvm          = { id = "org.jetbrains.kotlin.jvm",     version.ref = "kotlin" }
+
+# ---------------------------------------------------------------------------
+# DO NOT ADD
+#
+#   androidx.security:security-crypto - 1.1.0, its first and final stable
+#   release, deprecated ALL of its APIs "in favour of existing platform APIs and
+#   direct use of Android Keystore", and its POM drags in tink-android. The
+#   replacement is store/Keystore.kt + datastore-preferences (docs/ANDROID.md §2.3).
+#
+#   com.squareup.okhttp3:okhttp - two native call sites (probe, download) do not
+#   justify the dependency; net/PinnedHttp.kt is HttpsURLConnection (§2.6, §3.3).
+#
+# If build-tools 36.0.0 + platform 36 are ever installed, the whole ladder can
+# move together: AGP 9.4.0 / Gradle 9.6+ / core 1.17.0 / activity 1.13.0 /
+# biometric 1.4.0-alpha07. Moving one entry alone will not work.
+# ---------------------------------------------------------------------------

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DEBUG VARIANT ONLY (applicationId io.github.monstercouch.homelabrmm.debug).
+  This file shadows src/main/res/xml/network_security_config.xml by resource
+  merging; the release APK never contains it.
+
+  Why it exists: the live dev server on this workstation runs with the insecure flag over
+  plain HTTP at 127.0.0.1:18080 with an empty fingerprint. The release build
+  blocks cleartext by design and so cannot reach it at all. The only way to
+  exercise the app against that server is:
+
+      adb reverse tcp:18080 tcp:18080
+      .\gradlew.bat :app:installDebug
+
+  after which the phone's own 127.0.0.1:18080 is the PC's dev server.
+
+  The exception is exactly two loopback names and nothing else: the base config
+  still refuses cleartext everywhere, includeSubdomains is false, and there are
+  still NO trust-anchor overrides. A debug build must not be a build where
+  pinning is softer - it is a build that can reach one loopback port.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

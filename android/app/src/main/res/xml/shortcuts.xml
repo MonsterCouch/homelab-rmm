@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Static App Shortcuts. "Last device" is inherently per-install state, so it is
+  pushed as a DYNAMIC shortcut from MainActivity instead of being declared here.
+
+  Each shortcut lands on MainActivity with an rmm_path extra; MainActivity gates
+  on biometrics first and only then navigates, so a shortcut is never a way past
+  the lock.
+
+  targetPackage is @string/app_id, not a literal: the debug variant carries
+  applicationIdSuffix ".debug", and a hardcoded package would leave the debug
+  build's shortcuts pointing at an application that is not installed. The value
+  is emitted per build type by resValue() in app/build.gradle.kts.
+-->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <shortcut
+        android:shortcutId="alerts"
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_alerts"
+        android:shortcutShortLabel="@string/shortcut_alerts_short"
+        android:shortcutLongLabel="@string/shortcut_alerts_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="@string/app_id"
+            android:targetClass="io.github.monstercouch.homelabrmm.MainActivity">
+            <extra android:name="rmm_path" android:value="/alerts" />
+        </intent>
+    </shortcut>
+
+    <shortcut
+        android:shortcutId="devices"
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_devices"
+        android:shortcutShortLabel="@string/shortcut_devices_short"
+        android:shortcutLongLabel="@string/shortcut_devices_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="@string/app_id"
+            android:targetClass="io.github.monstercouch.homelabrmm.MainActivity">
+            <extra android:name="rmm_path" android:value="/devices" />
+        </intent>
+    </shortcut>
+
+</shortcuts>

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext is blocked outright. The release build therefore CANNOT reach
+  http://127.0.0.1:18080, the live `-insecure` dev server (two hyphens). That is correct
+  behaviour, not a defect - use the .debug variant, which overrides this file
+  from src/debug/res, over `adb reverse tcp:18080 tcp:18080`.
+
+  There are deliberately NO trust-anchor overrides here. The server list is a
+  runtime value that the operator pairs on the phone; compiled-in XML cannot
+  express it. That is precisely why pinning lives in code, in exactly one place
+  (:trust's TrustStore, reached from RmmWebViewClient.onReceivedSslError and
+  from net/PinnedHttp.kt), rather than being split between a static file and a
+  code path that could drift apart.
+
+  Omitting <trust-anchors> leaves the platform default: system CAs only. A
+  user-installed CA is not trusted at targetSdk 24+ without an entry here, and
+  no such entry exists or may be added.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

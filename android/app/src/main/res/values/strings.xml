@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Homelab RMM</string>
+
+    <string name="title_servers">Servers</string>
+    <string name="title_add_server">Add server</string>
+    <string name="title_trust_review">Trust review</string>
+    <string name="title_conn_test">Connection test</string>
+    <string name="title_scan">Scan pairing code</string>
+
+    <string name="shortcut_alerts_short">Alerts</string>
+    <string name="shortcut_alerts_long">Open alerts</string>
+    <string name="shortcut_devices_short">Devices</string>
+    <string name="shortcut_devices_long">Open devices</string>
+
+    <string name="foundation_placeholder">Homelab RMM\n\nFoundation build: the trust kernel, sealed server store, pinned HTTP client and manifest are in place. The WebView shell, biometric gate and native navigation land in the next stage.</string>
+</resources>

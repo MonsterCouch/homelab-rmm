@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Install-time permissions. Nothing else is declared: no location, no
+         storage (downloads go to MediaStore.Downloads, which needs none at
+         API 29+), no POST_NOTIFICATIONS until v1.1 actually posts one. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+
+    <!-- CAMERA is requested at the instant of scanning and never before.
+         Manual fingerprint entry is the primary, guaranteed pairing path, so
+         denying the camera forever leaves the app fully usable. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+
+    <!-- MANDATORY, not decoration. At minSdk 30, Android 11 package-visibility
+         filtering makes getLaunchIntentForPackage("com.tailscale.ipn") and
+         resolveActivity() return null without this, and the "Open Tailscale"
+         button on the unreachable screen silently does nothing. -->
+    <queries>
+        <package android:name="com.tailscale.ipn" />
+    </queries>
+
+    <application
+        android:name=".App"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:theme="@style/Theme.HomelabRmm"
+        android:supportsRtl="true"
+
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:usesCleartextTraffic="false">
+        <!-- android:fullBackupContent is deliberately NOT set: it is redundant
+             alongside allowBackup="false", and @xml/data_extraction_rules must
+             exist as a real file or resource linking fails in assembleRelease.
+
+             The network security config declares cleartextTrafficPermitted=false
+             with NO trust-anchor overrides. The server list is a runtime value
+             and compiled-in XML cannot express it - which is precisely why
+             pinning lives in code, in one place, in :trust. -->
+
+        <!-- Deliberate. Safe Browsing sends URL hashes to Google; every hostname
+             here is a private tailnet name, and there is no user-navigable web
+             inside this app to protect. -->
+        <meta-data
+            android:name="android.webkit.WebView.EnableSafeBrowsing"
+            android:value="false" />
+
+        <!-- The only long-lived Activity: toolbar, WebView host, bottom bar,
+             lock overlay.
+
+             configChanges is the single highest-value line in this file. Without
+             it, rotating the phone destroys the WebView, which kills /ws/shell
+             (the shell on the agent dies with it) and restarts the desktop
+             stream from a full frame - at exactly the moment a user rotates for
+             a wider terminal.
+
+             adjustResize stays for API 30-34. From API 35 the window is
+             edge-to-edge and adjustResize alone no longer shrinks content, so
+             MainActivity also applies the IME inset to the WebView container
+             itself; the two must both be present. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|uiMode|density|fontScale|navigation|touchscreen"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
+        </activity>
+
+        <activity
+            android:name=".ServersActivity"
+            android:exported="false"
+            android:label="@string/title_servers"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- Exported for the homelabrmm://pair deep link only. The link PREFILLS
+             the form; it never auto-adds an entry and never auto-navigates.
+             Everything still converges on Trust review, where a human confirms
+             the fingerprint and a pinned probe must succeed before anything is
+             stored. -->
+        <activity
+            android:name=".AddServerActivity"
+            android:exported="true"
+            android:label="@string/title_add_server"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="homelabrmm" android:host="pair" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".TrustReviewActivity"
+            android:exported="false"
+            android:label="@string/title_trust_review"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".ConnTestActivity"
+            android:exported="false"
+            android:label="@string/title_conn_test" />
+
+        <activity
+            android:name=".ScanActivity"
+            android:exported="false"
+            android:label="@string/title_scan"
+            android:screenOrientation="fullSensor"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!-- No services, no receivers, no content providers in v1. The alert
+             worker arrives in v1.1 and is scoped to exactly two endpoints. -->
+
+    </application>
+
+</manifest>

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The debug variant needs android:usesCleartextTraffic="true" so that nothing
+  depends on the (correct, but subtle) rule that a network security config takes
+  precedence over that attribute. The debug network_security_config.xml is what
+  actually decides: cleartext to 127.0.0.1 and localhost, refused everywhere
+  else. The release manifest keeps usesCleartextTraffic="false".
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application
+        android:usesCleartextTraffic="true"
+        tools:replace="android:usesCleartextTraffic" />
+
+</manifest>

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The console's own ink, so the native chrome and the WebView do not
+         disagree about what the product looks like. -->
+    <color name="rmm_bg">#1b1b1b</color>
+    <color name="rmm_surface">#242424</color>
+    <color name="rmm_ink">#e8e8e8</color>
+    <color name="rmm_accent">#4f9cf9</color>
+    <color name="ic_launcher_background">#1b1b1b</color>
+</resources>

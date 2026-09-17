@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Referenced from android:dataExtractionRules. THIS FILE MUST EXIST: a manifest
+  reference to a missing resource fails resource linking in assembleRelease.
+
+  Nothing leaves the device. allowBackup="false" already stops cloud backup, but
+  device-to-device transfer on Android 12+ is governed by this file alone, and it
+  would otherwise copy the sealed server list and the WebView cookie jar onto
+  another handset. The AndroidKeyStore key cannot travel with them, so a
+  transferred blob would be unopenable anyway - but an unopenable blob that
+  triggers the tamper path on a new phone is a worse first-run experience than
+  an honest empty list.
+
+  Both sections exclude every domain explicitly. An empty <cloud-backup/> or
+  <device-transfer/> element means "include everything", which is the opposite
+  of what is wanted here.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+        <exclude domain="file" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="external" />
+    </device-transfer>
+</data-extraction-rules>

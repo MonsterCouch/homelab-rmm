@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A shield with a terminal caret: pinned trust around a remote shell.
+     Adaptive-icon foreground, 108x108dp with the inner 72x72dp safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:fillColor="#4f9cf9"
+        android:pathData="M54,26 L76,34 L76,54 C76,68 66,78 54,83 C42,78 32,68 32,54 L32,34 Z" />
+
+    <path
+        android:fillColor="#1b1b1b"
+        android:pathData="M45,45 L53,53 L45,61 L41.5,57.5 L46,53 L41.5,48.5 Z" />
+
+    <path
+        android:fillColor="#1b1b1b"
+        android:pathData="M56,58 L67,58 L67,62 L56,62 Z" />
+
+</vector>
