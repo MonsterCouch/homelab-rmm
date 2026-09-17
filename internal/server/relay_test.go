@@ -402,9 +402,7 @@ func TestShellSocketCapsAFrame(t *testing.T) {
 // left the handler parked in ReadJSON for ever and the shell running on the
 // device, invisible to everyone.
 func TestShellSocketDropsAViewerThatStoppedAnswering(t *testing.T) {
-	oldPing, oldIdle := shellPingPeriod, shellIdleTimeout
-	t.Cleanup(func() { shellPingPeriod, shellIdleTimeout = oldPing, oldIdle })
-	shellPingPeriod, shellIdleTimeout = 60*time.Millisecond, 600*time.Millisecond
+	compressTheViewerClock(t)
 
 	s, ts, b := newTestServerWith(t, Config{})
 	var tok struct{ Token string }
@@ -432,7 +430,7 @@ func TestShellSocketDropsAViewerThatStoppedAnswering(t *testing.T) {
 		}
 	}()
 	waitShellOut(t, msgs, "PS> ")
-	time.Sleep(3 * shellIdleTimeout)
+	time.Sleep(3 * viewerIdleTimeout)
 	live.WriteJSON(map[string]any{"t": "in", "data": "whoami\r"})
 	waitShellOut(t, msgs, "echo:whoami")
 
@@ -476,4 +474,139 @@ func waitShellOut(t *testing.T, msgs chan map[string]any, want string) {
 			t.Fatalf("timed out waiting for %q", want)
 		}
 	}
+}
+
+// compressTheViewerClock makes the browser-socket keepalive run on a scale a
+// test can wait out. Both knobs are package-level and no test in this package
+// runs in parallel, so they are restored rather than copied.
+func compressTheViewerClock(t *testing.T) {
+	t.Helper()
+	oldPing, oldIdle := viewerPingPeriod, viewerIdleTimeout
+	t.Cleanup(func() { viewerPingPeriod, viewerIdleTimeout = oldPing, oldIdle })
+	viewerPingPeriod, viewerIdleTimeout = 80*time.Millisecond, 800*time.Millisecond
+}
+
+// viewerFrames drains a desktop viewer socket into a channel and closes it
+// when the socket ends. answerPings=false suppresses the automatic pong every
+// websocket client sends from inside its read loop, which is what a phone
+// whose radio went to sleep behind a NAT looks like from this end: the TCP
+// connection is still there, the peer is not.
+func viewerFrames(c *websocket.Conn, answerPings bool) chan wsFrame {
+	if !answerPings {
+		c.SetPingHandler(func(string) error { return nil })
+	}
+	ch := make(chan wsFrame, 16)
+	go func() {
+		defer close(ch)
+		for {
+			mt, data, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			ch <- wsFrame{mt, data}
+		}
+	}()
+	return ch
+}
+
+// waitViewerFrame waits for a frame of type mt containing want.
+func waitViewerFrame(t *testing.T, frames chan wsFrame, mt int, want string) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				t.Fatalf("the desktop viewer socket closed while waiting for %q", want)
+			}
+			if f.mt == mt && strings.Contains(string(f.data), want) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for %q on the desktop viewer socket", want)
+		}
+	}
+}
+
+func waitHelper(t *testing.T, helpers chan *websocket.Conn) *websocket.Conn {
+	t.Helper()
+	select {
+	case h := <-helpers:
+		return h
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper never connected")
+		return nil
+	}
+}
+
+// The desktop viewer socket had a read limit but no read deadline and no ping
+// of any kind, so a phone that slept mid-session left this handler bridging
+// into a socket nobody would ever read again while the helper went on
+// capturing the device's screen - the same hole the terminal had, on the more
+// expensive of the two sessions. It is now bounded the same way.
+func TestDesktopViewerSocketDropsAViewerThatStoppedAnswering(t *testing.T) {
+	compressTheViewerClock(t)
+
+	s, ts, b := newTestServerWith(t, Config{})
+	var tok struct{ Token string }
+	b.mustJSON("POST", "/api/enroll", map[string]any{"name": "lab", "uses": 5}, &tok)
+	id, helpers := desktopAgent(t, ts, tok.Token, "sleepybox", "")
+	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(id) })
+
+	// A viewer that is only watching sends nothing for minutes at a time, but
+	// it still answers pings, and it keeps its session.
+	live, _, err := websocket.DefaultDialer.Dial(wsURL(ts)+"/ws/desktop/"+id, wsCookies(t, ts, b))
+	if err != nil {
+		t.Fatalf("viewer dial: %v", err)
+	}
+	defer live.Close()
+	liveHelper := waitHelper(t, helpers)
+	defer liveHelper.Close()
+	liveFrames := viewerFrames(live, true)
+	waitViewerFrame(t, liveFrames, websocket.TextMessage, "connected")
+
+	time.Sleep(3 * viewerIdleTimeout)
+	tile := []byte{1, 0, 0, 0, 0, 64, 0, 64, 0, 0, 0xff, 0xd8}
+	if err := liveHelper.WriteMessage(websocket.BinaryMessage, tile); err != nil {
+		t.Fatalf("helper write after %s of quiet: %v", 3*viewerIdleTimeout, err)
+	}
+	waitViewerFrame(t, liveFrames, websocket.BinaryMessage, string(tile))
+	live.Close()
+
+	// A viewer whose radio slept answers nothing. The helper is on the
+	// operator's own desktop, so it must be told to stop rather than left
+	// screen-scraping for a viewer that no longer exists.
+	gone, _, err := websocket.DefaultDialer.Dial(wsURL(ts)+"/ws/desktop/"+id, wsCookies(t, ts, b))
+	if err != nil {
+		t.Fatalf("second viewer dial: %v", err)
+	}
+	defer gone.Close()
+	goneHelper := waitHelper(t, helpers)
+	defer goneHelper.Close()
+	// Wait for the marker before going quiet, so what is measured below is the
+	// bridged session timing out and not the handshake racing the deadline.
+	waitViewerFrame(t, viewerFrames(gone, false), websocket.TextMessage, "connected")
+
+	start := time.Now()
+	goneHelper.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, _, err = goneHelper.ReadMessage()
+	if err == nil {
+		t.Fatal("the helper was left streaming to a viewer that had stopped answering")
+	}
+	if waited := time.Since(start); waited > 5*time.Second {
+		t.Errorf("the device went on capturing for %s after the viewer stopped answering", waited)
+	}
+	var ce *websocket.CloseError
+	if !errors.As(err, &ce) {
+		t.Fatalf("the helper should be closed with a code, got %T %v", err, err)
+	}
+	if ce.Code != websocket.CloseGoingAway || !strings.Contains(ce.Text, "stopped answering") {
+		t.Errorf("helper close = %d (%q), want %d and a reason saying the viewer stopped answering",
+			ce.Code, ce.Text, websocket.CloseGoingAway)
+	}
+	waitFor(t, "pending desktop sessions cleaned up", func() bool {
+		s.desktops.mu.Lock()
+		defer s.desktops.mu.Unlock()
+		return len(s.desktops.pending) == 0
+	})
 }
