@@ -207,7 +207,13 @@ function LiveStats({ agent }: { agent: Agent }) {
       <div className="card stat">
         <span className="label">CPU</span>
         <span className="value">{agent.online && m ? pct(m.cpu) : '—'}</span>
-        <span className="foot">load {m?.load1?.toFixed(2) ?? '—'} · {num(m?.procs)} procs</span>
+        {/* Windows has no load average and the agent never collects one, so
+            showing it there printed a hard-coded "load 0.00" that looked like
+            a real measurement of a perpetually idle machine. */}
+        <span className="foot">
+          {agent.os === 'windows' ? '' : `load ${m?.load1?.toFixed(2) ?? '—'} · `}
+          {num(m?.procs)} procs
+        </span>
       </div>
       <div className="card stat">
         <span className="label">Memory</span>

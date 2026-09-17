@@ -2,6 +2,7 @@ package agent
 
 import (
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -82,8 +83,15 @@ func collectMetrics(monitored []string) *protocol.Metrics {
 // physicalPartitions filters out pseudo filesystems so the disk list is the
 // set of volumes an operator cares about.
 func physicalPartitions() []disk.PartitionStat {
+	// A partial result is still a result. On Windows one unreadable volume - an
+	// empty card reader, a BitLocker volume that is locked, a disconnected
+	// mapped drive - makes disk.Partitions return a warning alongside every
+	// volume it did read. Discarding the slice on any error therefore reported
+	// the device as having NO disks at all, in both metrics and inventory, and
+	// a disk alert opened before that could never resolve because no disk was
+	// ever mentioned again. Only an empty slice is a real failure.
 	parts, err := disk.Partitions(false)
-	if err != nil {
+	if err != nil && len(parts) == 0 {
 		return nil
 	}
 	var out []disk.PartitionStat
@@ -95,10 +103,10 @@ func physicalPartitions() []disk.PartitionStat {
 		case strings.HasPrefix(p.Mountpoint, "/snap/") || strings.HasPrefix(p.Mountpoint, "/boot/efi") || strings.HasPrefix(p.Mountpoint, "/var/lib/docker"):
 			continue
 		}
-		for _, o := range p.Opts {
-			if o == "cdrom" {
-				continue
-			}
+		// This used to `continue` the inner loop, which only moved to the next
+		// mount option, so a cdrom was never actually skipped.
+		if slices.Contains(p.Opts, "cdrom") {
+			continue
 		}
 		out = append(out, p)
 	}

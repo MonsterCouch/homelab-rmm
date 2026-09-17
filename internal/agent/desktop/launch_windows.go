@@ -51,7 +51,14 @@ func launch(exe, serverURL, token, fingerprint string, quality int) (string, err
 	if err != nil {
 		slog.Debug("desktop: cannot tell whether this is a service; assuming interactive", "err", err)
 	}
-	if !isService {
+	// IsWindowsService answers "is my parent services.exe in session 0", which
+	// is not the same question. An agent started by the Task Scheduler, by a
+	// service wrapper such as NSSM or WinSW, or by PsExec -s is SYSTEM in
+	// session 0 with a parent of svchost.exe, so it reported false and took
+	// the in-process path - inside a session that has no desktop, where the
+	// capture can only fail. What decides this is the session we are actually
+	// in, so ask that; IsWindowsService stays as a hint for the normal case.
+	if !isService && !inSessionZero() {
 		serveInProcess(serverURL, token, fingerprint, quality)
 		return "running in-process", nil
 	}
@@ -414,4 +421,17 @@ func enablePrivileges(names ...string) {
 				"name", name)
 		}
 	}
+}
+
+// inSessionZero reports whether this process lives in session 0, which has no
+// desktop to capture whatever started the process. Session 0 is the only
+// reliable signal: how the agent was launched varies, where it ended up does
+// not.
+func inSessionZero() bool {
+	var sess uint32
+	if err := windows.ProcessIdToSessionId(windows.GetCurrentProcessId(), &sess); err != nil {
+		slog.Debug("desktop: cannot read our own session id", "err", err)
+		return false
+	}
+	return sess == 0
 }

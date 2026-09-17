@@ -391,12 +391,12 @@ func (a *Agent) handle(ctx context.Context, env protocol.Envelope) {
 	case protocol.ReqFsMkdir:
 		var in protocol.FsPath
 		if err = json.Unmarshal(env.D, &in); err == nil {
-			err = os.MkdirAll(in.Path, 0o755)
+			err = fsMkdir(in.Path)
 		}
 	case protocol.ReqFsRename:
 		var in protocol.FsRename
 		if err = json.Unmarshal(env.D, &in); err == nil {
-			err = os.Rename(in.From, in.To)
+			err = fsRename(in.From, in.To)
 		}
 	case protocol.ReqPower:
 		var in protocol.Power

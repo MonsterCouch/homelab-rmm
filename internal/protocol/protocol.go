@@ -351,6 +351,11 @@ type FsEntry struct {
 type FsListResult struct {
 	Path    string    `json:"path"`
 	Entries []FsEntry `json:"entries"`
+	// Truncated is set when the directory held more entries than the agent
+	// will put in one frame. Optional and omitted when false, so an older
+	// server simply ignores it; an older agent never sets it, which is the
+	// behaviour the server already assumes.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 type FsRead struct {

@@ -35,6 +35,7 @@ type Server struct {
 	mail        *mailer
 	runs        *runTracker
 	desktops    *desktopBroker
+	desktopCap  *desktopCount
 	fingerprint string
 	// pubkeyPin is base64(sha256(SPKI)) of the same certificate, which is what
 	// the Linux install script gives curl --pinnedpubkey.
@@ -134,6 +135,7 @@ func New(cfg Config) (*Server, error) {
 	s.baselines = newBaselineEngine(s)
 	s.runs = newRunTracker(s)
 	s.desktops = newDesktopBroker()
+	s.desktopCap = newDesktopCount()
 	s.sched = newScheduler(s)
 	db.markAllOffline()
 	// --public-url / RMM_PUBLIC_URL is the FIRST-RUN DEFAULT for the

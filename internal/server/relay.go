@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -442,6 +443,16 @@ func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "agent is offline")
 		return
 	}
+	// Every viewer starts its own SYSTEM helper on the device, each capturing
+	// and encoding the screen, and nothing bounded how many could run at once:
+	// opening the tab repeatedly stacked them up with no complaint from either
+	// side. Refuse past the cap rather than let a device be ground down by its
+	// own management agent.
+	if n := s.desktopCap.acquire(agentID); n < 0 {
+		writeErr(w, 429, fmt.Sprintf("this device already has %d remote desktop sessions open", maxDesktopsPerAgent))
+		return
+	}
+	defer s.desktopCap.release(agentID)
 	viewer, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -627,4 +638,42 @@ func bridge(vp *framePump, viewer *websocket.Conn, vw *wsWriter, helper *websock
 	helper.Close()
 	<-done
 	slog.Debug("desktop bridge closed")
+}
+
+// maxDesktopsPerAgent bounds concurrent remote desktop sessions against one
+// device. Each one runs a separate SYSTEM helper on the device that captures
+// and encodes the screen, so this is a load limit on the managed machine, not
+// on the server. Two is enough for the real case (an operator opening a second
+// view, or reconnecting before the first socket has been reaped) without
+// letting a stuck client stack helpers up indefinitely.
+const maxDesktopsPerAgent = 2
+
+// desktopCount tracks live desktop sessions per agent.
+type desktopCount struct {
+	mu sync.Mutex
+	n  map[string]int
+}
+
+func newDesktopCount() *desktopCount { return &desktopCount{n: map[string]int{}} }
+
+// acquire takes a slot and returns the new count, or -1 when the agent is
+// already at the cap.
+func (d *desktopCount) acquire(agentID string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.n[agentID] >= maxDesktopsPerAgent {
+		return -1
+	}
+	d.n[agentID]++
+	return d.n[agentID]
+}
+
+func (d *desktopCount) release(agentID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.n[agentID] <= 1 {
+		delete(d.n, agentID) // keep the map from growing one key per agent seen
+		return
+	}
+	d.n[agentID]--
 }
