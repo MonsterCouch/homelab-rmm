@@ -120,14 +120,14 @@ func (d *DB) agentByKey(key string) (string, bool) {
 	return id, true
 }
 
-// unlimitedUses is the only non-positive uses_left that still enrols. Any
+// unlimitedUses is the only non-positive uses_left that still enrolls. Any
 // other value <= 0 is exhausted, so a row an older server drove negative (or a
 // hand-edited one) reads as spent rather than as "unlimited forever".
 const unlimitedUses = -1
 
 func usesExhausted(usesLeft int) bool { return usesLeft != unlimitedUses && usesLeft <= 0 }
 
-// checkEnrollToken reports whether a token could still enrol a device.
+// checkEnrollToken reports whether a token could still enroll a device.
 func (d *DB) checkEnrollToken(token string) error {
 	var usesLeft int
 	var expires int64
@@ -143,13 +143,13 @@ func (d *DB) checkEnrollToken(token string) error {
 	return nil
 }
 
-// enrolResult is what an enrolment did, beyond the identity it issued.
-type enrolResult struct {
+// enrollResult is what an enrollment did, beyond the identity it issued.
+type enrollResult struct {
 	ID  string
 	Key string
 	// Rekeyed: an existing OFFLINE record with this hostname+os was adopted
 	// and given the new key (a reinstall - or a device claiming another's
-	// hostname, which is why it is audited apart from a fresh enrolment).
+	// hostname, which is why it is audited apart from a fresh enrollment).
 	Rekeyed bool
 	// DuplicateHostname: a record with this hostname+os already existed but
 	// was online, so a second one was created. Same takeover attempt, louder
@@ -157,16 +157,16 @@ type enrolResult struct {
 	DuplicateHostname bool
 }
 
-// enrollAgent consumes an enrolment token and creates the agent record. The
+// enrollAgent consumes an enrollment token and creates the agent record. The
 // token is consumed with a conditional UPDATE inside the same transaction
-// that creates the device, so concurrent enrolments cannot stretch a
+// that creates the device, so concurrent enrollments cannot stretch a
 // single-use token, and uses_left never drops below zero (-1 = unlimited).
 // isOnline reports whether a device has a live socket right now. The
 // agents.online column is a convenience that a restart or a replaced socket
 // can leave stale, and a stale 0 widens the window in which another machine
 // claiming the same hostname takes over the record.
-func (d *DB) enrollAgent(token string, hello protocol.Hello, ip string, isOnline func(string) bool) (enrolResult, error) {
-	var res enrolResult
+func (d *DB) enrollAgent(token string, hello protocol.Hello, ip string, isOnline func(string) bool) (enrollResult, error) {
+	var res enrollResult
 	res.Key = randomToken(32)
 	err := d.withTx(context.Background(), func(tx *sql.Tx) error {
 		var (
@@ -193,7 +193,7 @@ func (d *DB) enrollAgent(token string, hello protocol.Hello, ip string, isOnline
 				return errors.New("token exhausted")
 			}
 		}
-		// A re-enrolment from the same hostname+os replaces the old record's
+		// A re-enrollment from the same hostname+os replaces the old record's
 		// key instead of creating a duplicate device (reinstalls are common).
 		// Liveness comes from the hub, not the column.
 		var candidates []string
@@ -219,7 +219,7 @@ func (d *DB) enrollAgent(token string, hello protocol.Hello, ip string, isOnline
 				hashKey(res.Key), hello.Version, hello.Platform, hello.Arch, ip, res.ID)
 			return err
 		}
-		// hostname is not unique, so an enrolment that collides with a device
+		// hostname is not unique, so an enrollment that collides with a device
 		// that is currently ONLINE gets its own record. Report it: the record
 		// it failed to adopt is the one it was aiming at.
 		res.DuplicateHostname = len(candidates) > 0
@@ -229,7 +229,7 @@ func (d *DB) enrollAgent(token string, hello protocol.Hello, ip string, isOnline
 		return err
 	})
 	if err != nil {
-		return enrolResult{}, err
+		return enrollResult{}, err
 	}
 	return res, nil
 }
@@ -513,7 +513,7 @@ func (d *DB) ListGroups() ([]Group, error) {
 	return out, rows.Err()
 }
 
-// ---- enrolment tokens ----
+// ---- enrollment tokens ----
 
 type EnrollToken struct {
 	ID        int64  `json:"id"`

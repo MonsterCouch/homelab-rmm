@@ -149,7 +149,7 @@ func TestListPatchesOrdersLinuxSecurityFirst(t *testing.T) {
 
 func TestPatchScanStoresCategoriesDownloadedAndDescription(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "winbox", "windows")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
 	go func() {
@@ -227,7 +227,7 @@ func TestPatchScanStoresCategoriesDownloadedAndDescription(t *testing.T) {
 
 func TestPatchInstallLeavesWingetRowsOutOfTheBatch(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "winbox2", "windows")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
 	insertPatch(t, s, ag.id, "916031e1-9d13-48e9-a262-c8a0db93fbac", "wua", "Critical", "available")

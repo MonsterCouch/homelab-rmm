@@ -35,7 +35,7 @@ Go structs in the same package (`Agent`, `Script`, `Run`, `Task`, `Automation`, 
 - Roles: `admin` (everything), `tech` (everything except users/settings), `viewer` (read-only:
   every POST/PUT/PATCH/DELETE returns 403, and so do the GETs that are not really reads —
   `/ws/shell/{id}`, `/ws/desktop/{id}`, `/api/agents/{id}/fs/download`, the sensitive event-log
-  channels (see [Event log](#event-log)) and `GET /api/enroll`, whose body carries the enrolment
+  channels (see [Event log](#event-log)) and `GET /api/enroll`, whose body carries the enrollment
   token values).
 - The client address used by the rate limiter and the audit log is the peer address.
   `X-Forwarded-For` is honoured only when the peer is inside a network given to
@@ -101,9 +101,9 @@ See `routes()` in `internal/server/api.go`. Highlights:
   the session ends when the viewer has not answered for 90 s. The device's helper is then closed
   with `1001` and the reason `the viewer stopped answering`, so a phone that slept mid-session
   does not leave the operator's screen being captured for nobody.
-- Groups `/api/groups`, enrolment `/api/enroll` (POST returns `{token, windows, linux}` install
+- Groups `/api/groups`, enrollment `/api/enroll` (POST returns `{token, windows, linux}` install
   commands; GET returns `{tokens, public_url, fingerprint}`). `GET /install/{token}?os=windows|linux&arch=`
-  renders the install script and is unauthenticated, but only for a token that could still enrol
+  renders the install script and is unauthenticated, but only for a token that could still enroll
   (404 otherwise) and an `arch` of `amd64|arm64|arm|386` (400 otherwise).
 - Scripts `/api/scripts`, `POST /api/scripts/run {script_id|language+body, args, targets|agent_ids}`
   → `{runs: {agentId: runId|"error: ..."|"skipped: ..."}}`, runs `/api/runs?agent=&limit=`,

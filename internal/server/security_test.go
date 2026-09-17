@@ -228,10 +228,10 @@ func TestViewerCannotMutateBaselines(t *testing.T) {
 	}
 }
 
-// ---- sec-03: 30 concurrent enrolments with a one-use token produced 22
+// ---- sec-03: 30 concurrent enrollments with a one-use token produced 22
 // devices and left uses_left at -10, which reads as "unlimited" forever. ----
 
-func TestEnrolTokenIsConsumedAtomically(t *testing.T) {
+func TestEnrollTokenIsConsumedAtomically(t *testing.T) {
 	s, ts, b := newTestServerWith(t, Config{})
 	var tok struct{ Token string }
 	b.mustJSON("POST", "/api/enroll", map[string]any{"name": "one", "uses": 1}, &tok)
@@ -277,7 +277,7 @@ func TestEnrolTokenIsConsumedAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	if left != 0 {
-		t.Errorf("uses_left = %d after one enrolment, want 0 (negative reads as unlimited)", left)
+		t.Errorf("uses_left = %d after one enrollment, want 0 (negative reads as unlimited)", left)
 	}
 	var devices int
 	s.db.QueryRow(`SELECT COUNT(*) FROM agents`).Scan(&devices)
@@ -705,11 +705,11 @@ func TestAuthEndpointsRejectCrossSiteRequests(t *testing.T) {
 	}
 }
 
-// ---- sec-08: a re-enrolment that adopts an offline device's record is a
+// ---- sec-08: a re-enrollment that adopts an offline device's record is a
 // takeover if the hostname was guessed, so it is audited apart from a fresh
-// enrolment and shown on the device's own timeline. ----
+// enrollment and shown on the device's own timeline. ----
 
-func TestReEnrolmentRekeysAndIsAuditedSeparately(t *testing.T) {
+func TestReEnrollmentRekeysAndIsAuditedSeparately(t *testing.T) {
 	s, ts, b := newTestServerWith(t, Config{})
 	var tok struct{ Token string }
 	b.mustJSON("POST", "/api/enroll", map[string]any{"name": "lab", "uses": 5}, &tok)
@@ -717,7 +717,7 @@ func TestReEnrolmentRekeysAndIsAuditedSeparately(t *testing.T) {
 
 	first := dialAgentAs(t, ts, hdr, "h1", "linux")
 	if first.id == "" || first.key == "" {
-		t.Fatal("enrolment returned no identity")
+		t.Fatal("enrollment returned no identity")
 	}
 	waitFor(t, "first agent online", func() bool { return s.hub.IsOnline(first.id) })
 	first.ws.Close()
@@ -731,28 +731,28 @@ func TestReEnrolmentRekeysAndIsAuditedSeparately(t *testing.T) {
 
 	second := dialAgentAs(t, ts, hdr, "h1", "linux")
 	if second.id != first.id {
-		t.Fatalf("re-enrolment created a second record: %s then %s", first.id, second.id)
+		t.Fatalf("re-enrollment created a second record: %s then %s", first.id, second.id)
 	}
 	if second.key == first.key {
-		t.Error("re-enrolment must issue a new device key")
+		t.Error("re-enrollment must issue a new device key")
 	}
 	// The old key stops working the moment the record is re-keyed.
 	if _, ok := s.db.agentByKey(first.key); ok {
 		t.Error("the superseded device key still resolves to an agent")
 	}
 
-	var rekeys, enrols int
+	var rekeys, enrolls int
 	s.db.QueryRow(`SELECT COUNT(*) FROM audit WHERE action = 'agent.rekeyed' AND target = ?`, first.id).Scan(&rekeys)
-	s.db.QueryRow(`SELECT COUNT(*) FROM audit WHERE action = 'agent.enrolled' AND target = ?`, first.id).Scan(&enrols)
+	s.db.QueryRow(`SELECT COUNT(*) FROM audit WHERE action = 'agent.enrolled' AND target = ?`, first.id).Scan(&enrolls)
 	if rekeys != 1 {
 		t.Errorf("expected exactly one agent.rekeyed audit entry, got %d", rekeys)
 	}
-	if enrols != 1 {
-		t.Errorf("expected the original agent.enrolled entry to stand alone, got %d", enrols)
+	if enrolls != 1 {
+		t.Errorf("expected the original agent.enrolled entry to stand alone, got %d", enrolls)
 	}
 	var kind, msg string
-	if err := s.db.QueryRow(`SELECT kind, message FROM agent_events WHERE agent_id = ? AND kind = 'enrol'`, first.id).Scan(&kind, &msg); err != nil {
-		t.Fatalf("no enrol row on the device timeline: %v", err)
+	if err := s.db.QueryRow(`SELECT kind, message FROM agent_events WHERE agent_id = ? AND kind = 'enroll'`, first.id).Scan(&kind, &msg); err != nil {
+		t.Fatalf("no enroll row on the device timeline: %v", err)
 	}
 	if !strings.Contains(msg, "re-keyed") {
 		t.Errorf("device timeline message does not describe the re-key: %q", msg)
@@ -791,12 +791,12 @@ func TestSecurityHeaders(t *testing.T) {
 // stored whatever `uses` the caller sent, so {"uses": -7} minted a token that
 // never ran out by count. ----
 
-func TestDamagedEnrolTokenIsSpentNotUnlimited(t *testing.T) {
+func TestDamagedEnrollTokenIsSpentNotUnlimited(t *testing.T) {
 	s, ts, b := newTestServerWith(t, Config{})
 	var tok struct{ Token string }
 	b.mustJSON("POST", "/api/enroll", map[string]any{"name": "lab", "uses": 1}, &tok)
 
-	// exactly the state the pre-fix enrolment race left behind
+	// exactly the state the pre-fix enrollment race left behind
 	if _, err := s.db.Exec(`UPDATE enroll_tokens SET uses_left = -10 WHERE token = ?`, tok.Token); err != nil {
 		t.Fatal(err)
 	}
@@ -876,7 +876,7 @@ func TestMigrationClampsNegativeUsesLeft(t *testing.T) {
 // agent.enrolled. Two "workstation-7" rows is the more confusing outcome, and
 // the operator was told to watch for agent.rekeyed. ----
 
-func TestEnrolmentUnderALiveHostnameIsAuditedSeparately(t *testing.T) {
+func TestEnrollmentUnderALiveHostnameIsAuditedSeparately(t *testing.T) {
 	s, ts, b := newTestServerWith(t, Config{})
 	var tok struct{ Token string }
 	b.mustJSON("POST", "/api/enroll", map[string]any{"name": "lab", "uses": 5}, &tok)
@@ -889,22 +889,22 @@ func TestEnrolmentUnderALiveHostnameIsAuditedSeparately(t *testing.T) {
 	if second.id == first.id {
 		t.Fatal("an ONLINE record must not be re-keyed out from under the device using it")
 	}
-	var dupes, rekeys, enrols int
+	var dupes, rekeys, enrolls int
 	s.db.QueryRow(`SELECT COUNT(*) FROM audit WHERE action = 'agent.duplicate_hostname' AND target = ?`, second.id).Scan(&dupes)
 	s.db.QueryRow(`SELECT COUNT(*) FROM audit WHERE action = 'agent.rekeyed'`).Scan(&rekeys)
-	s.db.QueryRow(`SELECT COUNT(*) FROM audit WHERE action = 'agent.enrolled'`).Scan(&enrols)
+	s.db.QueryRow(`SELECT COUNT(*) FROM audit WHERE action = 'agent.enrolled'`).Scan(&enrolls)
 	if dupes != 1 {
 		t.Errorf("expected one agent.duplicate_hostname entry for the second device, got %d", dupes)
 	}
 	if rekeys != 0 {
 		t.Errorf("nothing was re-keyed, but %d agent.rekeyed entries were written", rekeys)
 	}
-	if enrols != 1 {
-		t.Errorf("the duplicate should not be filed as an ordinary enrolment: %d agent.enrolled entries", enrols)
+	if enrolls != 1 {
+		t.Errorf("the duplicate should not be filed as an ordinary enrollment: %d agent.enrolled entries", enrolls)
 	}
 	var msg string
-	if err := s.db.QueryRow(`SELECT message FROM agent_events WHERE agent_id = ? AND kind = 'enrol'`, second.id).Scan(&msg); err != nil {
-		t.Fatalf("no enrol row on the duplicate's timeline: %v", err)
+	if err := s.db.QueryRow(`SELECT message FROM agent_events WHERE agent_id = ? AND kind = 'enroll'`, second.id).Scan(&msg); err != nil {
+		t.Fatalf("no enroll row on the duplicate's timeline: %v", err)
 	}
 	if !strings.Contains(msg, "already using") {
 		t.Errorf("device timeline message does not describe the collision: %q", msg)
@@ -916,7 +916,7 @@ func TestEnrolmentUnderALiveHostnameIsAuditedSeparately(t *testing.T) {
 // carries the token VALUES, which are all anyone needs to add a device of
 // their own to the fleet. ----
 
-func TestViewerCannotReadEnrolmentTokens(t *testing.T) {
+func TestViewerCannotReadEnrollmentTokens(t *testing.T) {
 	_, ts, admin := newTestServerWith(t, Config{})
 	var tok struct{ Token string }
 	admin.mustJSON("POST", "/api/enroll", map[string]any{"name": "lab", "uses": 5}, &tok)
@@ -929,7 +929,7 @@ func TestViewerCannotReadEnrolmentTokens(t *testing.T) {
 		t.Errorf("viewer GET /api/enroll should be 403, got %d", st)
 	}
 	if strings.Contains(string(body), tok.Token) {
-		t.Errorf("the enrolment token leaked to a read-only account: %s", body)
+		t.Errorf("the enrollment token leaked to a read-only account: %s", body)
 	}
 	// A writer still gets it.
 	var list struct{ Tokens []struct{ Token string } }
@@ -941,7 +941,7 @@ func TestViewerCannotReadEnrolmentTokens(t *testing.T) {
 
 // ---- inst-02: the install scripts turned certificate validation off and
 // fetched the agent from an unauthenticated endpoint with nothing to check it
-// against, so anything on-path during enrolment could hand the machine a
+// against, so anything on-path during enrollment could hand the machine a
 // binary of its choosing and get root/SYSTEM. ----
 
 func TestInstallScriptVerifiesTheAgentBinary(t *testing.T) {

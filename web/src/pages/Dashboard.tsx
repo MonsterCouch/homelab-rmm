@@ -158,7 +158,7 @@ export function Dashboard() {
                 {total === 0 && (
                   <div className="banner info" style={{ marginBottom: 0 }}>
                     <span>
-                      No devices yet. <Link to="/devices?enroll=1">Enrol your first device</Link>.
+                      No devices yet. <Link to="/devices?enroll=1">Enroll your first device</Link>.
                     </span>
                   </div>
                 )}
@@ -450,7 +450,7 @@ function GettingStarted({ devices }: { devices: number }) {
   const url = system.data?.public_url ?? '';
   const loopback = /\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/i.test(url);
   const steps: Step[] = [
-    { id: 'device', label: 'Enrol a device', done: devices > 0, to: '/devices?enroll=1', hint: 'The install one-liner is in the enrol drawer.' },
+    { id: 'device', label: 'Enroll a device', done: devices > 0, to: '/devices?enroll=1', hint: 'The install one-liner is in the enroll drawer.' },
     {
       id: 'url',
       label: 'Set the public URL agents dial',

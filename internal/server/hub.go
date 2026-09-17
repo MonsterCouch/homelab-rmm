@@ -131,10 +131,10 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		}
 		agentID = id
 	case enroll != "":
-		// enrolment is completed after hello so the record has a hostname,
+		// enrollment is completed after hello so the record has a hostname,
 		// but the token is checked now so a bad one never gets a socket
 		if err := h.s.db.checkEnrollToken(enroll); err != nil {
-			writeErr(w, http.StatusUnauthorized, "enrolment refused: "+err.Error())
+			writeErr(w, http.StatusUnauthorized, "enrollment refused: "+err.Error())
 			return
 		}
 	default:
@@ -167,29 +167,29 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	if agentID == "" {
 		en, err := h.s.db.enrollAgent(enroll, hello, ip, h.IsOnline)
 		if err != nil {
-			conn.WriteJSON(protocol.Envelope{T: "error", Err: "enrolment refused: " + err.Error()})
+			conn.WriteJSON(protocol.Envelope{T: "error", Err: "enrollment refused: " + err.Error()})
 			conn.Close()
-			slog.Warn("enrolment refused", "ip", ip, "host", hello.Hostname, "err", err)
+			slog.Warn("enrollment refused", "ip", ip, "host", hello.Hostname, "err", err)
 			return
 		}
 		agentID, newKey = en.ID, en.Key
 		switch {
 		case en.Rekeyed:
-			// distinct from a fresh enrolment so an operator can spot a device
+			// distinct from a fresh enrollment so an operator can spot a device
 			// that took over another's record by claiming its hostname
 			h.s.db.Audit("system", ip, "agent.rekeyed", agentID, hello.Hostname)
-			h.s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,?)`, agentID, now(), "enrol",
-				"Device record re-keyed by a new enrolment from "+ip+" (reinstall, or another device claiming this hostname)", "{}")
-			slog.Warn("agent record re-keyed by enrolment", "id", agentID, "host", hello.Hostname, "ip", ip)
+			h.s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,?)`, agentID, now(), "enroll",
+				"Device record re-keyed by a new enrollment from "+ip+" (reinstall, or another device claiming this hostname)", "{}")
+			slog.Warn("agent record re-keyed by enrollment", "id", agentID, "host", hello.Hostname, "ip", ip)
 		case en.DuplicateHostname:
 			// The same takeover attempt against a device that happened to be
 			// ONLINE: no record was adopted, a second one with the same name
 			// was created instead. Two "workstation-7" rows in the console is
 			// the confusing outcome, so it gets its own audit action.
 			h.s.db.Audit("system", ip, "agent.duplicate_hostname", agentID, hello.Hostname)
-			h.s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,?)`, agentID, now(), "enrol",
+			h.s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,?)`, agentID, now(), "enroll",
 				"Enrolled from "+ip+" under a hostname another device is already using (reinstall with a stale record, or a device claiming this hostname)", "{}")
-			slog.Warn("enrolment duplicated an existing hostname", "id", agentID, "host", hello.Hostname, "ip", ip)
+			slog.Warn("enrollment duplicated an existing hostname", "id", agentID, "host", hello.Hostname, "ip", ip)
 		default:
 			h.s.db.Audit("system", ip, "agent.enrolled", agentID, hello.Hostname)
 		}
@@ -203,7 +203,7 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	}
 	ac.lastPong.Store(time.Now().UnixNano())
 
-	// welcome: identity (for a new enrolment) + config
+	// welcome: identity (for a new enrollment) + config
 	welcome := map[string]any{"agent_id": agentID, "config": h.s.agentConfig(agentID)}
 	if newKey != "" {
 		welcome["agent_key"] = newKey
@@ -236,7 +236,7 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	if justEnrolled {
 		// Fired here, not from a defer: a deferred call runs when this socket
 		// finally drops (hours or days later, after the agent_offline
-		// automation), so an onboarding automation never ran at enrolment.
+		// automation), so an onboarding automation never ran at enrollment.
 		h.s.sched.automation("enrolled", agentID, map[string]any{"hostname": hello.Hostname})
 	}
 

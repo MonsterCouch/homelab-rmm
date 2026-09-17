@@ -55,21 +55,21 @@ verifies the peer certificate against the pin and nothing else (`InsecureSkipVer
 `VerifyPeerCertificate` callback). An empty fingerprint means "use the system trust store", which
 is what you want with a CA-issued certificate or a TLS-terminating proxy.
 
-**Enrolment → per-agent key.** The first connection carries `X-Enroll-Token`. The server checks
+**Enrollment → per-agent key.** The first connection carries `X-Enroll-Token`. The server checks
 the token before upgrading the socket (`checkEnrollToken`), waits for the `hello` frame, then
 `enrollAgent` creates the device (or re-keys an offline device with the same hostname + OS) and
 consumes one of the token's uses **in a single transaction**: the decrement is a conditional
-`UPDATE ... WHERE uses_left > 0` that must affect exactly one row, so simultaneous enrolments
+`UPDATE ... WHERE uses_left > 0` that must affect exactly one row, so simultaneous enrollments
 cannot stretch a one-use token past one device or drive the count negative (`-1` means unlimited
 and is left alone; every other value `<= 0` reads as exhausted, migration 2 repairs rows an older
 server damaged, and `POST /api/enroll` clamps `uses` on the way in). `enrollAgent` reports back
 what it did: a re-key is audited as `agent.rekeyed` rather than `agent.enrolled`, and an
-enrolment that collides with a hostname a device is currently *using* — which gets its own record,
+enrollment that collides with a hostname a device is currently *using* — which gets its own record,
 since only offline records are adopted — as `agent.duplicate_hostname`. Both add a row to the
 device's event timeline. The server then
 answers with a `welcome` frame containing `agent_id` and a 32-byte random `agent_key`. The agent persists both and from then on sends
 `Authorization: Bearer <key>`; the server stores only `sha256(key)`. A revoked key (device
-deleted) makes the agent drop its identity and re-enrol if it still has a token.
+deleted) makes the agent drop its identity and re-enroll if it still has a token.
 
 **Liveness.** The hub pings every 30 s and drops a socket silent for 90 s; the agent reconnects
 with exponential backoff from 2 s to 60 s plus jitter. A new socket for the same agent id replaces
@@ -173,7 +173,7 @@ filter never matches one.
 that releases its queued runs); `agent_offline` fires when that device's **current** socket goes
 away, at the end of `Hub.handleAgentWS`.
 A socket that has already been replaced by a reconnect does not fire it — only the connection
-the hub still holds for that id declares the device offline — and `enrolled` fires at enrolment
+the hub still holds for that id declares the device offline — and `enrolled` fires at enrollment
 rather than when the enrolling socket eventually drops. What none of them have is a grace
 period: a Wi-Fi drop that reconnects produces `agent_offline` and then `agent_online`, a
 half-open socket is only noticed when the 30 s keepalive has missed pongs for 90 s, and a server
@@ -288,7 +288,7 @@ Serves `web/dist` from the embedded filesystem (or `--dev-web DIR`), immutable c
 ### Agent binaries and install scripts (`install.go`)
 `GET /api/agent-download/{file}` serves `rmm-agent-<os>-<arch>[.exe]` from `<data>/agents/`, then
 `<dir of rmm-server>/agents/`, then `<dir of rmm-server>/`, unauthenticated (the binary is not a
-secret; enrolment still needs a token — and the install script checks what it downloaded).
+secret; enrollment still needs a token — and the install script checks what it downloaded).
 `GET /install/{token}?os=windows|linux&arch=` renders the bootstrap script with the public URL,
 token, certificate fingerprint, public-key pin and `agentBinarySHA256` baked in (one hash per
 architecture for Linux, where `uname -m` decides). The script verifies that hash before it runs
@@ -335,7 +335,7 @@ slice in `db.go`, applied in order and tracked in `PRAGMA user_version`.
 | `patches` | per-device update inventory, `(agent_id, patch_id)` | `status` (`available`, `approved`, `installing`, `installed`, `failed`, `ignored`), `severity` (listed worst-first by an explicit rank, not by the TEXT column's own order; Windows reports the MSRC ratings, apt/dnf/zypper report `security`, which ranks with `Important` so a distro's security updates are never the rows a `LIMIT` drops), `categories` (always a JSON array), `source`, `downloaded`, `description` |
 | `patch_policies` | scan/install schedules | `scan_schedule`, `install_schedule`, `mode`, `reboot` |
 | `audit` | who did what | `user`, `ip`, `action`, `target`, `details` |
-| `agent_events` | the device event timeline: `patch` progress lines pushed by the agent, `enrol` and `drift` rows written by the server. Monitored-service state is **not** here — it rides in each metrics sample and reaches operators through the alert engine | `kind`, `message`, `fields` |
+| `agent_events` | the device event timeline: `patch` progress lines pushed by the agent, `enroll` and `drift` rows written by the server. Monitored-service state is **not** here — it rides in each metrics sample and reaches operators through the alert engine | `kind`, `message`, `fields` |
 | `baselines` | desired-state definitions | `targets` (JSON), `enforce`, `interval_sec`, `enabled`, `version` |
 | `baseline_checks` | the checks of a baseline | **`id INTEGER PRIMARY KEY AUTOINCREMENT`** (identity is permanent), `position` (presentation only), `kind`, `params` (JSON), `remediate`, `severity`, `os_filter`, `timeout_sec` |
 | `baseline_results` | current state per (device, check) | `state`, `expected`, `observed`, `detail`, `fixed`, `version`, `stale`, `checked_at` (device clock), `received_at` / `since` (server clock) |

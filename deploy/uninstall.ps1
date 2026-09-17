@@ -127,6 +127,6 @@ if ($Server) {
             Write-Host "kept $DataDir (it holds files that are not the agent's; a server installed on this machine keeps its database and certificate there)"
         }
     } else {
-        Write-Host "kept $DataDir\agent.json (this device's identity AND its enrolment token, so a reinstall keeps the device's history - and a token still valid there would re-enrol it; -Purge removes it)"
+        Write-Host "kept $DataDir\agent.json (this device's identity AND its enrollment token, so a reinstall keeps the device's history - and a token still valid there would re-enroll it; -Purge removes it)"
     }
 }

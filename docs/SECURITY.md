@@ -14,7 +14,7 @@ the console reachable on the LAN or over a VPN. Adversaries considered:
    and the server (a compromised IoT device, a guest on the Wi-Fi).
 2. **A compromised or malicious device** that holds an agent key and tries to reach other
    devices or the server's data.
-3. **A stolen enrolment token** or a stolen `agent.json`.
+3. **A stolen enrollment token** or a stolen `agent.json`.
 4. **Web attacks** against a signed-in operator: CSRF, cross-site WebSocket hijacking, session
    theft.
 5. **Password guessing** against the console.
@@ -44,13 +44,13 @@ after it are in clear text. `rmm-agent install` warns about an `http://` URL and
 server is a legitimate use of it. Treat any fleet whose agents carry an `http://` URL as
 unprotected against adversary 1 above.
 
-**Device identity.** Enrolment requires a token created by an operator. Tokens are 24 random
+**Device identity.** Enrollment requires a token created by an operator. Tokens are 24 random
 bytes, expire (24 h default) and have a use count (1 default); an exhausted or expired token is
 refused, hidden from the list and purged a day after its expiry. The use is **consumed in the
 same SQLite transaction that creates the device record**, with a conditional
 `UPDATE ... WHERE uses_left > 0`, so devices racing on one token cannot stretch it: a one-use
-token enrols exactly one device however many arrive at once. `-1` is the operator's "unlimited"
-and is the **only** non-positive value that still enrols: a count the create endpoint would have
+token enrolls exactly one device however many arrive at once. `-1` is the operator's "unlimited"
+and is the **only** non-positive value that still enrolls: a count the create endpoint would have
 stored verbatim is clamped to `{-1} ∪ [1..]`, a row an older server drove below `-1` is repaired
 on upgrade (migration 2), and any other value `<= 0` reads as exhausted rather than as unlimited.
 The
@@ -67,7 +67,7 @@ trade. What it costs: a token created with several uses, or the console's "unlim
 on every device it enrolled (readable only by root, or by SYSTEM and Administrators on Windows,
 so anyone who is already root there can lift it) until it expires — one more reason to prefer
 single-use tokens and short expiries. And
-**deleting a device does not revoke the token on it**: the agent re-enrols within seconds as a
+**deleting a device does not revoke the token on it**: the agent re-enrolls within seconds as a
 brand-new record with no history, so removing a machine for good means stopping or uninstalling
 its agent first, or waiting out the token. The rejoin is auditable (`agent.enrolled`, or
 `agent.rekeyed` when it adopts an existing record).
@@ -86,7 +86,7 @@ Changing your own password **deletes your other sessions**, so reacting to a sto
 changing the password actually ends it.
 
 **First-run setup.** Until an account exists, `POST /api/auth/setup` would hand the first
-administrator account — which is root on every device you later enrol — to whoever asked first.
+administrator account — which is root on every device you later enroll — to whoever asked first.
 A server that starts with an empty user table therefore mints a random **one-time setup code**
 and prints it to the console and to `server.log` in the data directory. Every setup request must
 present it (compared in constant time, and rate-limited like a login), **including one from
@@ -134,7 +134,7 @@ users or settings, `admin` can do everything. An admin cannot demote or delete t
 account by accident. A viewer is also refused the endpoints that are reads only in HTTP terms:
 `GET /ws/shell/{id}`, `GET /ws/desktop/{id}` and `GET /api/agents/{id}/fs/download` all return
 403, because a terminal, a desktop session and pulling a file off a device are not "looking".
-`GET /api/enroll` is writer-only for the same reason: its body contains the enrolment token
+`GET /api/enroll` is writer-only for the same reason: its body contains the enrollment token
 **values**, and a token is all anyone needs to add a device of their own to the fleet (and, via
 the hostname adoption below, to take over an offline device's record). Browsing a directory
 listing stays available.
@@ -224,7 +224,7 @@ directories, and serves nothing else. `/install/<token>` renders a script that c
 public URL, the token you already had to know, the certificate fingerprint and public-key pin,
 and the **SHA-256 of the agent binary** this server would serve. Because that script is piped
 straight into `bash` or `iex` as root, everything interpolated into it is checked first: the
-token must match `^[A-Za-z0-9_-]{16,64}$` **and** still be a live enrolment token (anything else
+token must match `^[A-Za-z0-9_-]{16,64}$` **and** still be a live enrollment token (anything else
 is a 404, so the endpoint is not an injection oracle either), `?arch=` must be one of `amd64`,
 `arm64`, `arm`, `386`, and every value is escaped for the single-quoted literal it lands in
 (`''` for PowerShell, `'\''` for the shell). The response is `Cache-Control: no-store`.
@@ -246,7 +246,7 @@ trust:
 
 ## The install one-liners and certificate validation
 
-The enrolment commands the console prints contain
+The enrollment commands the console prints contain
 `[Net.ServicePointManager]::ServerCertificateValidationCallback={$true}` (Windows) or `curl -k`
 (Linux). They disable certificate validation for **one fetch**: the install script itself. That
 is unavoidable when the server uses a self-signed certificate the device has never seen — it is
@@ -364,9 +364,9 @@ neither the script nor the download.
   re-applied at every agent start and inherited by the files inside (the `0600` Go passes there
   is ignored, and the console's own file browser reports a meaningless `-rw-rw-rw-` for Windows
   paths — check it with `icacls`). What it grants is **more than that device's identity**: it
-  also holds `enroll_token`, deliberately kept so a device whose key was revoked can re-enrol
+  also holds `enroll_token`, deliberately kept so a device whose key was revoked can re-enroll
   unattended (see "The token stays on the device" above). Until that token expires or runs out
-  of uses, whoever reads one device's `agent.json` can enrol new devices into the fleet and, with
+  of uses, whoever reads one device's `agent.json` can enroll new devices into the fleet and, with
   a victim's hostname, take over an offline device's record. Single-use, short-lived tokens keep
   that window small; a long-lived multi-use token turns every device that used it into a copy of
   the fleet credential.
@@ -387,14 +387,14 @@ neither the script nor the download.
   anyway, and `BUILTIN\Users` stays out either way; the service and an elevated install get the
   SYSTEM + Administrators DACL unchanged. Anyone with administrative rights on the server host
   still has everything, as they always do.
-- **Enrolment re-uses an offline device record** with the same hostname and OS. A rogue machine
+- **Enrollment re-uses an offline device record** with the same hostname and OS. A rogue machine
   that knows a valid token and a victim's hostname could take over that record while the victim
   is offline (it would receive the victim's group/tags and queued runs, and the victim's own key
   stops working). The server cannot tell that apart from the reinstall it is there to support,
-  so it does not refuse it — it *reports* it: a re-enrolment that adopts an existing record is
+  so it does not refuse it — it *reports* it: a re-enrollment that adopts an existing record is
   audited as **`agent.rekeyed`** rather than `agent.enrolled`, logged at WARN with the source
   address, and written to that device's own event timeline. Only an **offline** record is
-  adopted; an enrolment that collides with a hostname a device is currently using gets its own
+  adopted; an enrollment that collides with a hostname a device is currently using gets its own
   record instead (hostnames are not unique), which leaves two rows with one name in the console —
   that is audited as **`agent.duplicate_hostname`**, also at WARN and also on the new device's
   timeline. Keep tokens single-use and short-lived, and treat either entry, if you did not cause
@@ -425,7 +425,7 @@ neither the script nor the download.
 4. **Trust the server certificate in your browser** once (`server.crt`), so a warning ever seen
    again means something. A name mismatch survives that import and is expected (above); a
    changed issuer is not.
-5. **Short, single-use enrolment tokens**; delete leftovers.
+5. **Short, single-use enrollment tokens**; delete leftovers.
 6. **Back up `server.key` with the database** and protect the backup like a password store; it
    is what every agent, and the phone, pins. Restoring it is what lets a rebuilt server keep the
    fleet; generating a new pair strands every pinned client at once (`docs/OPERATIONS.md` §6).

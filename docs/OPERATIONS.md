@@ -97,7 +97,7 @@ level=WARN msg="FIRST RUN: no users yet. ..." setup_code=3f9a1c07
   itself. There is no loopback exemption: a peer address of `127.0.0.1` can equally be a same-host
   reverse proxy relaying the whole LAN, any local process on the box, or a hostile page open in
   your own browser, and none of those should be able to claim the account that is root on every
-  device you later enrol. Reading the code proves you can see the server's console or log, which
+  device you later enroll. Reading the code proves you can see the server's console or log, which
   is the thing worth proving.
 - Wrong codes are rate-limited like logins and audited as `setup.refused`.
 - Concurrent setup requests do not race: the "no users yet?" check and the insert are one step,
@@ -130,14 +130,14 @@ directly and can run while the service is up (SQLite WAL with a 5 s busy timeout
 - **Server**: `server.log` in the data directory and stderr (journal / Event Log / `docker logs`).
   Startup prints `listening addr=… tls=… fingerprint=… data=… version=…`; the fingerprint line is
   what agents pin, and on a first run the one-time setup code is printed beside it. Agent
-  connects/disconnects, enrolments, alerts opened and tasks run are logged at info. Two `WARN`
-  lines are worth alerting on: `agent record re-keyed by enrolment` (a device took over an
+  connects/disconnects, enrollments, alerts opened and tasks run are logged at info. Two `WARN`
+  lines are worth alerting on: `agent record re-keyed by enrollment` (a device took over an
   existing, offline device record — see the audit note below) and `first-run setup refused`.
 - **Agent**: `agent.log` in the config directory, on Windows as on Linux. `connected server=…
   agent_id=…` means all is well; `session ended err=… retry_in=…` shows why it is reconnecting.
   Two `WARN` lines matter: `agent key rejected, re-enrolling with stored token` (the server no
   longer knows this device's key — pair it with the server's `agent record re-keyed by
-  enrolment`) and `server URL is plaintext` (the connection to the server is not encrypted; see
+  enrollment`) and `server URL is plaintext` (the connection to the server is not encrypted; see
   `--insecure` below). `RMM_DEBUG=1` in the service's environment adds debug lines.
   On Windows the agent runs under the Service Control Manager, which gives the process **no
   standard handles at all** — stderr goes nowhere, so `agent.log` is the only copy. When the
@@ -160,7 +160,7 @@ What to keep (all in the data directory):
 | File | Why |
 |---|---|
 | `rmm.db` | every device, user, script, run, alert, setting |
-| `server.crt`, `server.key` | the identity agents and the phone pin; without the key every agent must re-enrol (§6) |
+| `server.crt`, `server.key` | the identity agents and the phone pin; without the key every agent must re-enroll (§6) |
 | `agents/` | only if you placed agent binaries there |
 
 **Cold backup** (simplest, always consistent): stop the service, copy the directory, start it.
@@ -336,7 +336,7 @@ The failure shapes differ, which is why a rotation done by accident is expensive
   mismatch: got <hex>` to `agent.log` and retries with a backoff capped at a minute, indefinitely.
   Nothing reaches the server, so there is no server-side log line and no audit entry — the devices
   just go offline in the console, and an `offline` alert rule is the only thing that will actively
-  tell you. Fix per device: re-run the enrolment one-liner from the console (the identity survives
+  tell you. Fix per device: re-run the enrollment one-liner from the console (the identity survives
   because `server_url` is unchanged), or edit `fingerprint` in `agent.json` and restart the
   service. **You cannot push that as a script**: running a script needs the agent connected, and
   it is not. Budget for reaching each device some other way.
@@ -347,7 +347,7 @@ The failure shapes differ, which is why a rotation done by accident is expensive
   verifying, so this step is deliberately human.
 - **Browsers** warn again — new issuer, and possibly a new name mismatch. Re-import `server.crt`
   wherever it was imported.
-- **New enrolments are fine.** The console renders install commands from the live fingerprint, so
+- **New enrollments are fine.** The console renders install commands from the live fingerprint, so
   anything enrolled after the restart pins the new certificate.
 
 Rotate before enrolling a fleet, or at a time when you can reach the devices. Do **not** rotate to
@@ -422,7 +422,7 @@ time (suppresses new alerts and policy-driven patch installs).
    same IP) and nothing else is needed. Otherwise, before shutting the old one down, push a
    script to every device that edits `server_url` in `agent.json` and restarts the service
    (`Restart-Service HomelabRMMAgent` / `systemctl restart HomelabRMMAgent`), or re-run the
-   enrolment one-liner from the new server on each device (the identity survives when the
+   enrollment one-liner from the new server on each device (the identity survives when the
    `server_url` matches, so pick the DNS approach when you can).
 4. The certificate moves with the data directory, so the pin stays valid and the phone keeps
    working. If you generate a new one, re-pin everything — §6.
@@ -430,14 +430,14 @@ time (suppresses new alerts and policy-driven patch installs).
 ## 9. Housekeeping checklist
 
 - Watch `rmm.db` size in *Settings → System*; metrics dominate, retention controls it.
-- Keep enrolment tokens short-lived; expired ones disappear from the list automatically. They
+- Keep enrollment tokens short-lived; expired ones disappear from the list automatically. They
   are also the reason a deleted device can come back: the agent keeps `enroll_token` in
-  `agent.json` and re-enrols with it the moment its key is rejected, as a **new** record with no
+  `agent.json` and re-enrolls with it the moment its key is rejected, as a **new** record with no
   history. Stop or uninstall the agent (`rmm-agent stop` / `rmm-agent uninstall`, or
   `deploy/uninstall.ps1` / `deploy/uninstall.sh`) *before* deleting the device, or make sure the
   token it holds is expired or exhausted.
 - Review *Audit* and *Users* occasionally; remove accounts you no longer use. In *Audit*, an
-  **`agent.rekeyed`** entry means an enrolment adopted an existing offline device record instead
+  **`agent.rekeyed`** entry means an enrollment adopted an existing offline device record instead
   of creating a new one. That is what a reinstall looks like — and also what a machine claiming
   another's hostname looks like, so any you did not cause deserves a look. An
   **`agent.duplicate_hostname`** entry is the same attempt against a device that was *online*:
@@ -445,7 +445,7 @@ time (suppresses new alerts and policy-driven patch installs).
   at the right one. A plain new device is `agent.enrolled`.
 - Give people who only need dashboards the `viewer` role: on top of being refused every write, a
   viewer cannot open a terminal (`/ws/shell`), start a remote desktop session (`/ws/desktop`),
-  download a file from a device, or read the enrolment token list (`GET /api/enroll`) — a token
+  download a file from a device, or read the enrollment token list (`GET /api/enroll`) — a token
   is all anyone needs to add a device of their own.
 - After upgrading the server, replace the `agents/` folder too so newly enrolled devices get the
   matching agent.

@@ -17,7 +17,7 @@ import (
 )
 
 // fakeAgent speaks the agent protocol from a test so the whole server path
-// (enrolment, hub routing, streaming, alerting) is exercised without an OS.
+// (enrollment, hub routing, streaming, alerting) is exercised without an OS.
 type fakeAgent struct {
 	t     *testing.T
 	ws    *websocket.Conn
@@ -266,7 +266,7 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("POST without X-Requested-With should be 403, got %d", resp.StatusCode)
 	}
 
-	// --- enrolment ---
+	// --- enrollment ---
 	var tok struct{ Token, Windows, Linux string }
 	b.mustJSON("POST", "/api/enroll", map[string]any{"name": "lab", "uses": 1}, &tok)
 	if !strings.Contains(tok.Windows, tok.Token) || !strings.Contains(tok.Linux, "curl") {
@@ -278,7 +278,7 @@ func TestEndToEnd(t *testing.T) {
 	}
 	agent := dialAgent(t, wsURL(ts), http.Header{"X-Enroll-Token": []string{tok.Token}})
 	if agent.id == "" || agent.key == "" {
-		t.Fatal("enrolment did not return id+key")
+		t.Fatal("enrollment did not return id+key")
 	}
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(agent.id) })
 

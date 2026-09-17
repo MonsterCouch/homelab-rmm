@@ -40,7 +40,7 @@ UI has not been built).
 service:
 
 ```bash
-# create a token in the console (Devices → Enrol), then:
+# create a token in the console (Devices → Enroll), then:
 RMM_AGENT_DIR=./tmp/agent go run ./cmd/rmm-agent install --server http://localhost:8080 --token <token> --no-service
 RMM_AGENT_DIR=./tmp/agent go run ./cmd/rmm-agent run
 ```
@@ -93,7 +93,7 @@ embedded `index.html`, so a console-less archive cannot reach a release. Binarie
 `VERSION` is given, via `-ldflags "-s -w -X …/internal/server.Version=… -X …/internal/agent.Version=…"`
 and `-trimpath`. The archive layout (server at the root, `agents/rmm-agent-<os>-<arch>[.exe]`
 beside it) is what `internal/server/install.go` looks up, so a server run from an extracted
-archive can enrol devices without any copying.
+archive can enroll devices without any copying.
 
 Without make: `tools/build.sh <targets>` (bash) or `tools/build.ps1 -Target <targets>`
 (PowerShell 5.1 compatible; builds the zips with `System.IO.Compression` so entry names use

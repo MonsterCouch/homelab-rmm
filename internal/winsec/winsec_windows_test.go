@@ -28,7 +28,7 @@ func unprotect(t *testing.T, path string) {
 // owner, and an owner keeps READ_CONTROL and WRITE_DAC whatever the DACL says:
 // a standard user who pre-creates the directory before the agent or the server
 // is installed can simply grant BUILTIN\Users read access back afterwards, and
-// then read the device key, the enrolment token, rmm.db and server.key. So the
+// then read the device key, the enrollment token, rmm.db and server.key. So the
 // owner is part of the fix, and a failure to set it is never silent (acl-01).
 func TestSecureDirTakesOwnershipOrSaysWhyNot(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "HomelabRMM")

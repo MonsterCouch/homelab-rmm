@@ -35,7 +35,7 @@ ARG VERSION=dev
 ARG TARGETOS
 ARG TARGETARCH
 ENV MODULE=github.com/MonsterCouch/homelab-rmm
-# every agent binary (all five platforms) so one image can enrol any device
+# every agent binary (all five platforms) so one image can enroll any device
 RUN VERSION="$VERSION" bash tools/build.sh agents
 RUN mkdir -p /out /data \
  && CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -trimpath \

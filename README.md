@@ -47,7 +47,7 @@ self-signed setup is safe.
   shutdown, lock, log off, and **Wake-on-LAN** relayed through another agent on the same subnet.
 - **Organisation** — groups, tags, custom fields, notes, display names.
 - **Users** — admin / tech / viewer roles (a viewer looks at everything and changes nothing: no
-  writes, and no terminal, remote desktop, file download or enrolment token either), TOTP
+  writes, and no terminal, remote desktop, file download or enrollment token either), TOTP
   two-factor authentication, session management, password reset from the CLI.
 - **Audit log** of every action with user and source address.
 
@@ -75,7 +75,7 @@ _Coming soon: dashboard, device overview, remote desktop, script run with live o
    [releases](https://github.com/MonsterCouch/homelab-rmm/releases) page (see the note above for
    which version that is, and how to build a newer one).
 2. Extract it to `C:\Program Files\HomelabRMM`. You get `rmm-server.exe` and an `agents\` folder
-   with the agent binaries for every platform; the server serves those to devices you enrol.
+   with the agent binaries for every platform; the server serves those to devices you enroll.
 3. From an **elevated** PowerShell:
 
    ```powershell
@@ -112,12 +112,12 @@ _Coming soon: dashboard, device overview, remote desktop, script run with live o
    ```
 
    The form **always** asks for it, including from a browser on the server itself: that account
-   is root on every device you go on to enrol, and a connection from `127.0.0.1` could equally be
+   is root on every device you go on to enroll, and a connection from `127.0.0.1` could equally be
    a reverse proxy relaying the LAN, another program on the box, or a web page you happen to have
    open. Reading the code is the thing that proves it is you. Lost it? Restart the server before
    anyone creates a user and it prints a new one; once the admin exists the code is neither
    minted nor asked for again.
-6. **Devices → Enrol**: create an enrolment token (name, optional group, number of uses, expiry),
+6. **Devices → Enroll**: create an enrollment token (name, optional group, number of uses, expiry),
    then on each machine you want to manage:
    - Windows, elevated PowerShell — save the script, read it, run it:
 
@@ -176,13 +176,13 @@ docker compose up -d --build
 ```
 
 The image (`Dockerfile`, distroless, runs as a non-root user) has the server at `/rmm-server`
-and every agent binary in `/agents/`, so enrolment works out of the box. Data is the `/data`
+and every agent binary in `/agents/`, so enrollment works out of the box. Data is the `/data`
 volume. Details and a bind-mount variant are in `docker-compose.yml` and
 [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Enrolling devices
 
-An enrolment token (Devices → Enrol) is the only secret a new device needs. Tokens expire
+An enrollment token (Devices → Enroll) is the only secret a new device needs. Tokens expire
 (24 h by default), have a use count (1 by default, unlimited possible) and can pre-assign a
 group. The console prints two commands per token:
 
@@ -200,7 +200,7 @@ group. The console prints two commands per token:
   `/opt/homelab-rmm/rmm-agent`, config at `/etc/homelab-rmm/agent.json`, systemd unit
   **HomelabRMMAgent**. The architecture (amd64, arm64, armv7) is detected from `uname -m`.
 
-The script is served only for a **live enrolment token** — anything else is a 404 — for an
+The script is served only for a **live enrollment token** — anything else is a 404 — for an
 architecture this project ships and for an operating system it ships (`windows` or `linux`;
 anything else is a 400, so a typo cannot hand a Windows box a bash script), so the URL cannot be
 used to push arbitrary text into the root shell it is piped to.
@@ -233,10 +233,10 @@ worth knowing before you choose the token's *Uses* and expiry.
   **every** device it enrolled, readable by root/SYSTEM there, until it expires (24 h by
   default). Prefer a single-use token per machine; keep the expiry short.
 - **Deleting a device in the console does not keep it away.** The agent notices its key was
-  rejected and re-enrols with the stored token within seconds — as a *new* record, with a new
+  rejected and re-enrolls with the stored token within seconds — as a *new* record, with a new
   id and no history. To remove a device for good, uninstall or stop the agent first (see
   *Agent install, uninstall, update*), then delete it; or wait for the token to expire, or
-  exhaust its uses, before deleting. The re-enrolment is visible in the audit log as
+  exhaust its uses, before deleting. The re-enrollment is visible in the audit log as
   `agent.enrolled` / `agent.rekeyed`.
 
 **Manual install** (no download step): copy `agents/rmm-agent-<os>-<arch>[.exe]` from the
@@ -254,7 +254,7 @@ left in `Downloads`, on the Desktop or in a build tree hands SYSTEM to anyone wh
 it. `install` inspects the directory and the binary itself and warns, naming the accounts that
 can write them, but it does not refuse.
 
-The fingerprint is shown on the Enrol page and printed in `server.log` at startup. Omit
+The fingerprint is shown on the Enroll page and printed in `server.log` at startup. Omit
 `--fingerprint` only when the server certificate is signed by a CA the device already trusts.
 `--no-service` writes the config without registering a service (development).
 
@@ -352,14 +352,14 @@ state machine, the API and the console.
   place (it holds the device identity). Delete the binary and the config yourself, or use
   `deploy/uninstall.ps1` / `deploy/uninstall.sh` (`-Purge` / `--purge` removes the config too).
   Then delete the device in the console so it does not linger as offline.
-- **Update**: re-run the enrolment one-liner with a fresh token. It stops the service, swaps the
+- **Update**: re-run the enrollment one-liner with a fresh token. It stops the service, swaps the
   binary and re-installs; because `agent.json` already exists for the same server, the device
   keeps its identity and history. Alternatively stop the service, replace the binary and start
   it. A push-from-console self-update is on the roadmap (the protocol already has
   `agent.update`).
-- **Re-enrol** (after a server certificate change or a deleted device): run the one-liner
+- **Re-enroll** (after a server certificate change or a deleted device): run the one-liner
   again. An agent whose key was revoked on the server and that still has its original token
-  re-enrols by itself.
+  re-enrolls by itself.
 
 ## Upgrading the server
 
@@ -394,14 +394,14 @@ stopping the service, putting the files back and starting it. More in
   `/etc/homelab-rmm/agent.log` (rotated at 10 MB). Server: `server.log` in the data directory,
   also on stderr / `journalctl -u HomelabRMMServer` / `docker logs`. Set the environment variable
   `RMM_DEBUG=1` on either side for debug output.
-- **The device never appears.** Check `agent.log`. `enrolment refused: token expired/exhausted`:
+- **The device never appears.** Check `agent.log`. `enrollment refused: token expired/exhausted`:
   create a new token. `connection refused` / timeouts: the device cannot reach the public URL on
   port 8443 (firewall on the server?). `rmm-agent status` shows whether the service is running.
 - **`server certificate fingerprint mismatch` in agent.log.** The server's certificate changed
-  (new install, regenerated or replaced certificate). Re-run the enrolment one-liner on the
+  (new install, regenerated or replaced certificate). Re-run the enrollment one-liner on the
   device, or edit `fingerprint` in `agent.json` and restart the agent. Set
   `fingerprint` to `""` to use the system trust store instead (only with a CA-signed certificate).
-- **`unknown agent key`.** The device was deleted in the console. It re-enrols on its own if its
+- **`unknown agent key`.** The device was deleted in the console. It re-enrolls on its own if its
   `agent.json` still has a token that is valid; otherwise run the one-liner again.
 - **Browser says the certificate is not valid for this name.** The name you typed is not in the
   certificate. Use one that is (hostname, IP), or set `--public-url` and delete
@@ -409,7 +409,7 @@ stopping the service, putting the files back and starting it. More in
   before that need re-enrolling: new certificate, new fingerprint). Or bring your own certificate
   with `--cert/--key`.
 - **Locked out.** `rmm-server user passwd --username <you>` sets a new password, clears the
-  user's sessions **and disables that user's TOTP** (re-enrol the authenticator under *Account*
+  user's sessions **and disables that user's TOTP** (re-enroll the authenticator under *Account*
   afterwards). An admin can also reset another user's 2FA under *Users*, or create a new admin
   with `rmm-server user add`.
 - **Remote desktop shows "Wayland sessions are not supported".** The Linux desktop is running
@@ -419,7 +419,7 @@ stopping the service, putting the files back and starting it. More in
   (Linux) on PATH. PowerShell scripts prefer `pwsh` and fall back to Windows PowerShell 5.1.
 - **A Linux device shows no patches.** No supported package manager was found (apt-get, dnf,
   yum, pacman, zypper); the scan result carries the reason.
-- **Antivirus blocks the Windows enrolment.** Expect it; nothing here is signed. Three separate
+- **Antivirus blocks the Windows enrollment.** Expect it; nothing here is signed. Three separate
   things can be stopped:
   - *The one-liner itself* (`ScriptContainedMaliciousContent`, Bitdefender and friends): the
     `DownloadString` + `iex` shape is what trips AMSI, not the script. Use the four-line form in
@@ -440,7 +440,7 @@ stopping the service, putting the files back and starting it. More in
 ## Security model (summary)
 
 - Agents only make **outbound** connections and **pin** the server certificate by SHA-256
-  fingerprint; enrolment tokens are single-use and expire; each device gets its own key, stored
+  fingerprint; enrollment tokens are single-use and expire; each device gets its own key, stored
   hashed on the server.
 - Operators sign in with bcrypt-hashed passwords, optional TOTP, `HttpOnly` + `SameSite=Strict`
   session cookies (14 days), an `X-Requested-With` header on every state-changing request

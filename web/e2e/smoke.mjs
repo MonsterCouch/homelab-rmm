@@ -842,12 +842,12 @@ async function main() {
   await page.waitForFunction(() => document.documentElement.dataset.theme === 'dark');
   step('theme toggle switches dark/light and persists the choice');
 
-  // ---- devices + enrol ----
+  // ---- devices + enroll ----
   await page.click('nav a[href="/devices"]');
   await page.waitForSelector('h1:has-text("Devices")');
   await page.waitForSelector('text=No devices enrolled yet');
   step('devices page renders with empty state');
-  await page.click('button:has-text("Enrol device")');
+  await page.click('button:has-text("Enroll device")');
   await page.waitForSelector('.drawer');
   // ux-02: a drawer must never paint translucent over the page. Nothing in its
   // ancestor chain may animate opacity (fading the host fades the panel with
@@ -880,7 +880,7 @@ async function main() {
   const linText = await (await page.waitForSelector('[data-testid="enroll-linux"]')).textContent();
   if (!linText || !linText.includes('curl') || !linText.includes('sudo bash')) problems.push(`linux one-liner missing or malformed: ${linText}`);
   await page.waitForSelector('.drawer .list-item:has-text("smoke-token")');
-  step('enrolment token created; Windows and Linux one-liners and active token list shown');
+  step('enrollment token created; Windows and Linux one-liners and active token list shown');
   const token = (await (await page.waitForSelector('[data-testid="enroll-token"]')).textContent())?.trim() ?? '';
   if (haveAgent && token) {
     startAgent(token);
@@ -1362,7 +1362,7 @@ async function main() {
   const viewerDenied = await page.evaluate(async () => {
     const out = {};
     out.download = (await fetch('/api/agents/probe/fs/download?path=/etc/shadow', { headers: { 'X-Requested-With': 'fetch' } })).status;
-    // An enrolment token is a bearer credential for adding a device to the
+    // An enrollment token is a bearer credential for adding a device to the
     // fleet, so the listing that carries the token values is writer-only too.
     const enroll = await fetch('/api/enroll', { headers: { 'X-Requested-With': 'fetch' } });
     out.enroll = enroll.status;
@@ -1380,11 +1380,11 @@ async function main() {
   });
   expectViewerDenials = false;
   if (viewerDenied.download !== 403) problems.push(`viewer could request a file download (status ${viewerDenied.download}, want 403)`);
-  if (viewerDenied.enroll !== 403) problems.push(`viewer could list enrolment tokens (status ${viewerDenied.enroll}, want 403)`);
-  if (/"token"\s*:/.test(viewerDenied.enrollBody)) problems.push('enrolment token values were returned to a read-only account');
+  if (viewerDenied.enroll !== 403) problems.push(`viewer could list enrollment tokens (status ${viewerDenied.enroll}, want 403)`);
+  if (/"token"\s*:/.test(viewerDenied.enrollBody)) problems.push('enrollment token values were returned to a read-only account');
   if (viewerDenied.shell !== 'refused') problems.push('viewer opened a terminal WebSocket');
   if (viewerDenied.desktop !== 'refused') problems.push('viewer opened a remote desktop WebSocket');
-  step('viewer is refused the terminal, the remote desktop, file downloads and enrolment tokens by the server');
+  step('viewer is refused the terminal, the remote desktop, file downloads and enrollment tokens by the server');
 
   // ---- deep link + SPA fallback ----
   await page.goto(BASE + '/tasks');

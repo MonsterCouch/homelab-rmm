@@ -82,7 +82,7 @@ func (s *Server) handleAgentDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// downloads are not authenticated: the binary is not secret and the
-	// install script runs before the device has a key. Enrolment still needs
+	// install script runs before the device has a key. Enrollment still needs
 	// a valid token, and the script verifies the SHA-256 it was rendered with
 	// before running what it got.
 	for _, dir := range []string{s.cfg.path("agents")} {
@@ -113,7 +113,7 @@ var (
 
 // handleInstallScript renders the platform install script for a token. The
 // script is piped into an elevated shell on the device, so every value that
-// lands in it is whitelisted: the token must be a real, unexpired enrolment
+// lands in it is whitelisted: the token must be a real, unexpired enrollment
 // token (404 otherwise, which also stops the endpoint acting as a script
 // injection oracle) and the architecture must be one we ship.
 func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {

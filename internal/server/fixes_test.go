@@ -51,9 +51,9 @@ func captureLogs(t *testing.T) *syncBuffer {
 	return buf
 }
 
-// enrolToken mints a token straight in the database, for tests that have no
+// enrollToken mints a token straight in the database, for tests that have no
 // signed-in browser.
-func enrolToken(t *testing.T, s *Server) string {
+func enrollToken(t *testing.T, s *Server) string {
 	t.Helper()
 	tok := randomToken(24)
 	if _, err := s.db.Exec(`INSERT INTO enroll_tokens(token, name, uses_left, expires_at, created_by, created_at) VALUES(?,?,?,?,?,?)`,
@@ -87,7 +87,7 @@ func browserHeader(t *testing.T, ts *httptest.Server, b *browser) http.Header {
 // device as offline, because the device is still connected.
 func TestSocketReplacementWithLiveStream(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 
 	first := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "flapper", "linux")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(first.id) })
@@ -148,7 +148,7 @@ func TestSocketReplacementWithLiveStream(t *testing.T) {
 // and GET /api/runs/{id}.
 func TestTailLiveRunIsRaceFree(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "tailbox", "linux")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
 
@@ -220,7 +220,7 @@ func TestTailLiveRunIsRaceFree(t *testing.T) {
 // the "same subnet" loop skipped every candidate and /wol always answered 409.
 func TestWakeOnLanPicksSender(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 
 	target := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "sleeper", "linux")
 	sender := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "awake", "linux")
@@ -269,10 +269,10 @@ func TestWakeOnLanPicksSender(t *testing.T) {
 
 // ---- SRV-05: the "enrolled" automation ----
 
-// TestEnrolledAutomationFiresAtEnrolment pins SRV-05: the trigger was fired
+// TestEnrolledAutomationFiresAtEnrollment pins SRV-05: the trigger was fired
 // from a defer, so it ran when the socket eventually dropped - after the
 // agent_offline automation, hours or days later.
-func TestEnrolledAutomationFiresAtEnrolment(t *testing.T) {
+func TestEnrolledAutomationFiresAtEnrollment(t *testing.T) {
 	s, ts, b := newTestServer(t)
 	var sc Script
 	b.mustJSON("POST", "/api/scripts", Script{Name: "onboard", Language: "bash", Body: "echo welcome"}, &sc)
@@ -281,7 +281,7 @@ func TestEnrolledAutomationFiresAtEnrolment(t *testing.T) {
 		"action_params": json.RawMessage(fmt.Sprintf(`{"script_id":%d}`, sc.ID)),
 	}, nil)
 
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "newbox", "linux")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
 
@@ -304,7 +304,7 @@ func TestEnrolledAutomationFiresAtEnrolment(t *testing.T) {
 // returns - so every desktop session leaked a goroutine and a connection.
 func TestDesktopHandlerReturns(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 
 	helperConnected := make(chan *websocket.Conn, 1)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "deskbox", "windows")
@@ -377,7 +377,7 @@ func TestDesktopHelperAfterViewerGaveUpIsClosed(t *testing.T) {
 
 func TestReleaseQueuedClaimsTheRow(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "queuebox", "linux")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
 
@@ -421,7 +421,7 @@ func TestReleaseQueuedClaimsTheRow(t *testing.T) {
 
 func TestPatchInstallRefusesWhenBusy(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "patchbox", "linux")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
 	s.db.Exec(`INSERT INTO patches(agent_id, patch_id, title, status, first_seen, last_seen) VALUES(?,?,?,'approved',?,?)`,
@@ -447,7 +447,7 @@ func TestPatchInstallRefusesWhenBusy(t *testing.T) {
 
 func TestPatchScanErrorIsKept(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "aptbox", "linux")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
 	// a patch the scan will not list again: a failed refresh must not decide
@@ -493,7 +493,7 @@ func TestPatchScanErrorIsKept(t *testing.T) {
 
 func TestPowerIsAuditedAndMapsAgentErrors(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "powerbox", "linux")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
 	go func() {
@@ -562,7 +562,7 @@ func TestPublicURLSettingWinsOverTheFlag(t *testing.T) {
 
 func TestDashboardCountsFromTheHub(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "dashbox", "linux")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
 	// the stale column is what a restart (or any CLI command) leaves behind
@@ -617,7 +617,7 @@ func TestMetricsRangeClampsPointsAndTakesTheLastDisks(t *testing.T) {
 
 func TestScriptRunCarriesDeviceContext(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "envbox", "linux")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
 	b.mustJSON("PATCH", "/api/agents/"+ag.id, map[string]any{
@@ -717,15 +717,15 @@ func TestSettingsAuditSaysWhatChanged(t *testing.T) {
 	}
 }
 
-// ---- OP-07 regression pin: viewers and enrolment tokens ----
+// ---- OP-07 regression pin: viewers and enrollment tokens ----
 
-func TestViewerCannotReadEnrolTokens(t *testing.T) {
+func TestViewerCannotReadEnrollTokens(t *testing.T) {
 	_, ts, b := newTestServer(t)
 	b.mustJSON("POST", "/api/users", map[string]string{"username": "vic", "password": "password123", "role": "viewer"}, nil)
 	ro := newBrowser(t, ts)
 	ro.mustJSON("POST", "/api/auth/login", map[string]string{"username": "vic", "password": "password123"}, nil)
 	if st, body := ro.do("GET", "/api/enroll", nil); st != 403 {
-		t.Fatalf("a viewer must not read live enrolment tokens: %d %s", st, body)
+		t.Fatalf("a viewer must not read live enrollment tokens: %d %s", st, body)
 	}
 }
 
@@ -733,7 +733,7 @@ func TestViewerCannotReadEnrolTokens(t *testing.T) {
 
 func TestScriptFailedAlertsDedupePerDevice(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	b.mustJSON("POST", "/api/alert-rules", AlertRule{Name: "script failed", Kind: "script_failed", Targets: Targets{All: true}, Severity: "warning", Enabled: true}, nil)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "failbox", "linux")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
@@ -752,7 +752,7 @@ func TestScriptFailedAlertsDedupePerDevice(t *testing.T) {
 
 func TestAutomationTriggeredRunDoesNotOpenAnAlert(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	b.mustJSON("POST", "/api/alert-rules", AlertRule{Name: "script failed", Kind: "script_failed", Targets: Targets{All: true}, Severity: "warning", Enabled: true}, nil)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "loopbox", "linux")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
@@ -866,7 +866,7 @@ func TestGracefulShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx) }()
@@ -1053,7 +1053,7 @@ func TestCancelRun(t *testing.T) {
 	}
 
 	// ---- live: the agent accepts the run and never answers it
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "slowbox", "linux")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
 	var live struct {
@@ -1166,7 +1166,7 @@ func TestSustainedWindowMustBeCrossed(t *testing.T) {
 
 func TestRefusedServiceActionsAndKillsAreAudited(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "auditbox", "windows")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
 	// The device refuses both, which is what an SCM "Access is denied." and
@@ -1221,7 +1221,7 @@ func TestRefusedServiceActionsAndKillsAreAudited(t *testing.T) {
 
 func TestAgentUpdateBoundsWhatAnOperatorCanType(t *testing.T) {
 	s, ts, b := newTestServer(t)
-	tok := enrolToken(t, s)
+	tok := enrollToken(t, s)
 	ag := dialAgentAs(t, ts, http.Header{"X-Enroll-Token": []string{tok}}, "boundsbox", "linux")
 	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(ag.id) })
 	path := "/api/agents/" + ag.id

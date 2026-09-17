@@ -17,7 +17,7 @@ var psQuotedRe = regexp.MustCompile(`'([^']+)'`)
 // The cost of that design is this invariant: every file this package writes into
 // ConfigDir has to be on the list, or it survives -Purge, keeps the directory
 // from being removed, and is inherited by the next install. That is how a purged
-// machine kept its baselines.json (stale desired state for the next enrolment)
+// machine kept its baselines.json (stale desired state for the next enrollment)
 // and its helper.log.
 func TestUninstallScriptPurgesEveryFileTheAgentWritesIntoItsDirectory(t *testing.T) {
 	dir := t.TempDir()
@@ -26,7 +26,7 @@ func TestUninstallScriptPurgesEveryFileTheAgentWritesIntoItsDirectory(t *testing
 	// Derived from the paths themselves, so a new file under ConfigDir fails
 	// here until deploy/uninstall.ps1 learns about it.
 	want := []string{
-		filepath.Base(ConfigPath()),                 // agent.json: identity and enrolment token
+		filepath.Base(ConfigPath()),                 // agent.json: identity and enrollment token
 		filepath.Base(ConfigPath()) + ".tmp",        // SaveConfig writes then renames
 		filepath.Base(LogPath()),                    // agent.log: the service's own log
 		filepath.Base(LogPath()) + ".1",             // its one rotation (cmd/rmm-agent)

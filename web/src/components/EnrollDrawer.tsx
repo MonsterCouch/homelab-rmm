@@ -27,7 +27,7 @@ export function EnrollDrawer({ onClose, groups }: { onClose: () => void; groups:
     try {
       const res = await api.createEnroll({ name: name.trim(), group_id: groupId ? +groupId : null, uses: unlimited ? -1 : Math.max(1, uses), ttl_hours: Math.max(1, ttl) });
       setCreated(res);
-      toast.success('Enrolment token created');
+      toast.success('Enrollment token created');
       void list.reload();
     } catch (err) {
       toast.error('Could not create token', errMsg(err));
@@ -37,7 +37,7 @@ export function EnrollDrawer({ onClose, groups }: { onClose: () => void; groups:
   };
 
   const remove = async (id: number, label: string) => {
-    if (!(await confirm({ title: 'Delete token', message: `Delete the enrolment token "${label}"? Installs already in progress keep working.`, danger: true, confirmLabel: 'Delete' }))) return;
+    if (!(await confirm({ title: 'Delete token', message: `Delete the enrollment token "${label}"? Installs already in progress keep working.`, danger: true, confirmLabel: 'Delete' }))) return;
     try {
       await api.deleteEnroll(id);
       if (created?.id === id) setCreated(null);
@@ -48,10 +48,10 @@ export function EnrollDrawer({ onClose, groups }: { onClose: () => void; groups:
   };
 
   return (
-    <Drawer title="Enrol a device" onClose={onClose} wide>
+    <Drawer title="Enroll a device" onClose={onClose} wide>
       <div className="stack" style={{ gap: 16 }}>
         <div className="card">
-          <div className="card-head">New enrolment token</div>
+          <div className="card-head">New enrollment token</div>
           <div className="card-body">
             <div className="form-row">
               <Field label="Name" hint="A label for the audit log, e.g. the device or site.">
@@ -69,7 +69,7 @@ export function EnrollDrawer({ onClose, groups }: { onClose: () => void; groups:
               </Field>
             </div>
             <div className="form-row">
-              <Field label="Uses" hint="How many devices may enrol with this token.">
+              <Field label="Uses" hint="How many devices may enroll with this token.">
                 <div className="row" style={{ flexWrap: 'nowrap' }}>
                   <input type="number" min={1} max={1000} value={uses} disabled={unlimited} onChange={(e) => setUses(+e.target.value || 1)} style={{ width: 100 }} />
                   <label className="row" style={{ gap: 6, whiteSpace: 'nowrap' }}>

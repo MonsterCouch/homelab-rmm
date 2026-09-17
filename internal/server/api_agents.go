@@ -549,7 +549,7 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
-// ---- enrolment ----
+// ---- enrollment ----
 
 func (s *Server) handleListEnroll(w http.ResponseWriter, r *http.Request) {
 	t, err := s.db.ListEnrollTokens()

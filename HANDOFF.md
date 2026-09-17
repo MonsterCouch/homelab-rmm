@@ -97,7 +97,7 @@ the new version and fix the compare links at the bottom).
   remediate → resolve).
 - Remote desktop was tested end to end on Xvfb with real pixels, mouse, keyboard and wheel.
 - Independent adversarial reviews attacked the server live (install-script injection, role
-  gates, enrolment-token races, forwarded headers, setup takeover, CSRF) and the fixes are
+  gates, enrollment-token races, forwarded headers, setup takeover, CSRF) and the fixes are
   pinned by `internal/server/security_test.go` and `baselines_verify_test.go`.
 - **2026-09-15/16: the first real-Windows run.** An agent was installed as the service
   `HomelabRMMAgent` on a Windows 11 Home 25H2 workstation and thirteen subsystems were
@@ -173,7 +173,7 @@ the new version and fix the compare links at the bottom).
   ignore unknown fields, the server ignores reports with an unknown version.
 - Every non-GET API call needs `X-Requested-With: fetch`; browser WebSockets are
   origin-checked; viewers get 403 on every mutation, including shell, desktop, downloads and
-  enrolment tokens.
+  enrollment tokens.
 - Roles: a `tech` can run scripts as root/SYSTEM by design; command-kind
   baseline checks and sensitive file paths are admin-only, even for preview.
 - Remediation safety lives in `internal/agent/baseline_group.go`

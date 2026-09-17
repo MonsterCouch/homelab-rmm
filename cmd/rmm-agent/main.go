@@ -346,7 +346,7 @@ func main() {
 	case "install":
 		fs := flag.NewFlagSet("install", flag.ExitOnError)
 		server := fs.String("server", "", "server URL, e.g. https://rmm.lan:8443")
-		token := fs.String("token", "", "enrolment token from the console")
+		token := fs.String("token", "", "enrollment token from the console")
 		fp := fs.String("fingerprint", "", "server certificate SHA-256 fingerprint (omit when the certificate is publicly trusted)")
 		noService := fs.Bool("no-service", false, "write the config only; do not register a service")
 		dir := configDirFlag(fs)

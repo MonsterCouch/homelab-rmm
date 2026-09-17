@@ -110,14 +110,14 @@ func (a *Agent) session(ctx context.Context) error {
 	} else if a.cfg.EnrollToken != "" {
 		hdr.Set("X-Enroll-Token", a.cfg.EnrollToken)
 	} else {
-		return errors.New("no agent key and no enrolment token; run `rmm-agent install`")
+		return errors.New("no agent key and no enrollment token; run `rmm-agent install`")
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	ws, resp, err := Dial(dialCtx, a.cfg.WSURL("/ws/agent"), a.cfg.Fingerprint, hdr)
 	cancel()
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusUnauthorized && a.cfg.Key != "" && a.cfg.EnrollToken != "" {
-			// key revoked (device deleted on the server) but we still hold a token: re-enrol
+			// key revoked (device deleted on the server) but we still hold a token: re-enroll
 			slog.Warn("agent key rejected, re-enrolling with stored token")
 			a.cfg.Key, a.cfg.AgentID = "", ""
 			a.cfg.Save()
@@ -152,7 +152,7 @@ func (a *Agent) session(ctx context.Context) error {
 	if welcome.AgentKey != "" {
 		a.cfg.AgentID, a.cfg.Key = welcome.AgentID, welcome.AgentKey
 		if err := a.cfg.Save(); err != nil {
-			slog.Error("cannot save enrolment; the device will re-enrol next start", "err", err)
+			slog.Error("cannot save enrollment; the device will re-enroll next start", "err", err)
 		} else {
 			slog.Info("enrolled", "agent_id", welcome.AgentID)
 		}

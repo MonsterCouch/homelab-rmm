@@ -281,9 +281,9 @@ CREATE TABLE agent_events (
 );
 CREATE INDEX idx_agent_events ON agent_events(agent_id, ts DESC);
 `,
-	// 2: repair enrolment tokens an older server drove below -1.
+	// 2: repair enrollment tokens an older server drove below -1.
 	//
-	// Before the enrolment race was closed, concurrent agents each decremented
+	// Before the enrollment race was closed, concurrent agents each decremented
 	// uses_left without a guard, so a one-use token could end up at -10. Any
 	// negative value read as "unlimited", which turned a spent single-use
 	// token into a permanent one. -1 is the operator's own "unlimited"; every

@@ -95,11 +95,11 @@ the protocol; old agents keep working.
   no longer leaves a SYSTEM shell open.
 
 ### Documentation
-- Windows enrolment documents the antivirus reality (AMSI blocks the `iex` one-liner; Bitdefender
+- Windows enrollment documents the antivirus reality (AMSI blocks the `iex` one-liner; Bitdefender
   on the validation machine) and makes the two-step form the primary path, run with
   `powershell -NoProfile -ExecutionPolicy Bypass -File`. Manual installs go in an
   administrators-only directory. `agent.json`'s Windows protection is described as a DACL, not
-  `0600`; the enrolment token it keeps is called out; OPERATIONS.md describes the real Windows
+  `0600`; the enrollment token it keeps is called out; OPERATIONS.md describes the real Windows
   diagnostic channels; API.md gains an **Event log** section, run statuses, exit-code
   representation, `scan_error`, power aliases; ARCHITECTURE.md describes the script runner, patch
   severity ordering and `agent.update` accurately; README no longer advertises public IP.
@@ -220,22 +220,22 @@ Initial release.
 
 ### Security
 - **Install script endpoint hardened.** `GET /install/{token}` now renders a script only for a
-  token that matches `^[A-Za-z0-9_-]{16,64}$` *and* could still enrol a device; anything else is
+  token that matches `^[A-Za-z0-9_-]{16,64}$` *and* could still enroll a device; anything else is
   a 404. `?arch=` must be one of `amd64`, `arm64`, `arm`, `386` or the request is a 400, and the
   public URL, token and fingerprint are escaped for the single-quoted literal they are
   interpolated into. Previously the token path segment went into the script verbatim, so a
   crafted URL could add commands to a script that is piped into `bash` or `iex` as root.
   Responses are `Cache-Control: no-store`.
 - **Viewers can no longer open a terminal, a remote desktop session, download a file or read an
-  enrolment token.** `GET /ws/shell/{id}`, `GET /ws/desktop/{id}`,
+  enrollment token.** `GET /ws/shell/{id}`, `GET /ws/desktop/{id}`,
   `GET /api/agents/{id}/fs/download` and `GET /api/enroll` are behind the same write check as
-  everything else and return 403 for the `viewer` role. The enrolment listing carries the token
+  everything else and return 403 for the `viewer` role. The enrollment listing carries the token
   *values*, which are all anyone needs to add a device of their own to the fleet. Directory
   listings and the rest of the read-only console are unchanged.
-- **Enrolment tokens are consumed atomically.** The use count is decremented with a conditional
-  `UPDATE` inside the transaction that creates the device record. Concurrent enrolments on a
+- **Enrollment tokens are consumed atomically.** The use count is decremented with a conditional
+  `UPDATE` inside the transaction that creates the device record. Concurrent enrollments on a
   one-use token previously produced one device per racing agent and left `uses_left` negative,
-  which reads as "unlimited" forever. `-1` is now the only non-positive value that still enrols:
+  which reads as "unlimited" forever. `-1` is now the only non-positive value that still enrolls:
   `POST /api/enroll` clamps `uses` to `{-1} ∪ [1..]` instead of storing what it is sent, rows an
   older server drove below `-1` are repaired on upgrade (migration 2), and anything else `<= 0`
   reads as exhausted.
@@ -269,10 +269,10 @@ Initial release.
 - **Content-Security-Policy** on every response: `default-src 'self'`, `script-src 'self'` (no
   inline or `eval`ed script), `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`,
   `form-action 'self'`.
-- **A re-enrolment that takes over an existing offline device record is audited as
+- **A re-enrollment that takes over an existing offline device record is audited as
   `agent.rekeyed`**, logged at WARN with the source address and written to that device's event
   timeline, so a reinstall and a machine claiming another's hostname are no longer both filed as
-  `agent.enrolled`. An enrolment that collides with a hostname a device is currently *using* is
+  `agent.enrolled`. An enrollment that collides with a hostname a device is currently *using* is
   audited as **`agent.duplicate_hostname`** — nothing is re-keyed, but the fleet now has two rows
   with one name, which is the confusing half of the same attempt.
 - **The install scripts verify the agent binary and pin the download.** `/install/<token>` now
@@ -312,7 +312,7 @@ Initial release.
   `--dev-web`. CI additionally greps every packaged server binary for the embedded `index.html`,
   so the artefact itself is checked and not just the source tree.
 - `deploy/uninstall.sh` / `uninstall.ps1` say that the `agent.json` they keep holds the
-  enrolment token as well as the device identity.
+  enrollment token as well as the device identity.
 
 ### Documentation
 - **README no longer promises a download that does not exist.** There is no `v*` tag yet, so the
@@ -320,7 +320,7 @@ Initial release.
   CI `dist` artefact) and the License section states plainly that no `LICENSE` file has been
   chosen — which is what the archives' placeholder already said. `docs/DEVELOPMENT.md` lists both
   as blockers for the first release.
-- **The enrolment token's real lifecycle is documented.** README said the agent "never uses the
+- **The enrollment token's real lifecycle is documented.** README said the agent "never uses the
   token again"; in fact `agent.json` keeps `enroll_token` and replays it whenever the server
   rejects the key, which is what makes a deleted device reappear within seconds as a new record
   with no history, and what leaves a multi-use token at rest on every device it enrolled until it
@@ -352,7 +352,7 @@ Initial release.
   WAL, versioned migrations) and a self-signed certificate generated on first run.
 - Windows service / systemd unit management (`install`, `uninstall`, `start`, `stop`,
   `restart`, `status`) and a `user` CLI (`add`, `passwd`, `list`).
-- Agent hub: outbound WebSocket per device, enrolment tokens (uses, expiry, group), per-device
+- Agent hub: outbound WebSocket per device, enrollment tokens (uses, expiry, group), per-device
   keys stored hashed, keepalive, config push, live event fan-out to browsers.
 - Users with admin / tech / viewer roles, bcrypt passwords, TOTP two-factor, session cookies,
   CSRF header check, same-origin WebSocket check, login rate limiting, audit log.
@@ -364,14 +364,14 @@ Initial release.
 - Scripting: library with categories, parameters, timeouts and OS filters; PowerShell, cmd,
   bash, sh, python; streamed output; queued runs for offline devices; targets by device, group,
   tag or OS; cron-scheduled tasks; automations (run script, email, webhook) on device, alert,
-  enrolment, reboot and patch events.
+  enrollment, reboot and patch events.
 - Patch management: scan/approve/ignore/install with live log, policies with scan and install
   schedules, approved / all / security modes, reboot never / if required / always.
 - Relays: browser terminal over a pseudo-terminal, remote desktop bridge with single-use helper
   tokens.
 - Device tools: processes, services, event log / journal, file browser with upload and
   download, power actions, Wake-on-LAN via a peer agent on the same subnet.
-- Enrolment: install scripts for Windows (PowerShell) and Linux (bash) served per token; agent
+- Enrollment: install scripts for Windows (PowerShell) and Linux (bash) served per token; agent
   binaries served from `<data>/agents/` or beside the executable.
 - Seed data on first start: 17 starter scripts (Windows PowerShell and Linux bash) across
   Maintenance, Diagnostics, Updates, Security and Users; seven default alert rules; `Servers`
@@ -380,7 +380,7 @@ Initial release.
 
 ### Agent (Windows, Linux)
 - Service install with certificate pinning by SHA-256 fingerprint, reconnect with backoff,
-  identity kept across reinstalls, automatic re-enrolment after key revocation.
+  identity kept across reinstalls, automatic re-enrollment after key revocation.
 - Inventory (hardware, OS, disks, network, software, GPUs, users, pending reboot, antivirus)
   and periodic metrics.
 - Scripts with positional parameters, streamed output, timeout and cancel (process-tree kill).

@@ -9,7 +9,7 @@
 # agents (/ws/agent), terminals (/ws/shell/...), remote desktop
 # (/ws/desktop/...) and the Server-Sent Events stream (/api/events).
 #
-# The agent enrolment command that the console prints pins the certificate
+# The agent enrollment command that the console prints pins the certificate
 # fingerprint it sees on the server. With --insecure the server has no
 # certificate, so the fingerprint is empty and agents fall back to the system
 # trust store: the certificate Caddy serves must be one the devices trust

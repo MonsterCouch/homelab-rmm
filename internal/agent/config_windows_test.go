@@ -39,14 +39,14 @@ func unprotect(t *testing.T, path string) {
 }
 
 // Nobody but SYSTEM and Administrators may read agent.json: it holds the
-// device key and the enrolment token, and %ProgramData%'s inherited ACL grants
+// device key and the enrollment token, and %ProgramData%'s inherited ACL grants
 // BUILTIN\Users read-and-execute (acl-01). The Unix mode on Save() does
 // nothing here, so the DACL is the whole of the fix - and it has to reach the
 // file, not only the directory.
 func TestConfigSaveLocksDownTheAgentDirectory(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "HomelabRMM")
 	t.Setenv("RMM_AGENT_DIR", dir)
-	cfg := &Config{ServerURL: "https://rmm.lan:8443", AgentID: "a1", Key: "device-key", EnrollToken: "enrol"}
+	cfg := &Config{ServerURL: "https://rmm.lan:8443", AgentID: "a1", Key: "device-key", EnrollToken: "enroll"}
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}

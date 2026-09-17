@@ -219,7 +219,7 @@ export const api = {
   patchInstall: (id: string, body: { ids?: string[]; all?: boolean; reboot_if_required: boolean }) =>
     post<Ok>(`/api/agents/${enc(id)}/patches/install`, body),
 
-  // ---- groups / enrolment ----
+  // ---- groups / enrollment ----
   groups: () => list(get<Group[] | null>('/api/groups')),
   createGroup: (name: string, description = '') => post<Group>('/api/groups', { name, description }),
   updateGroup: (id: number, name: string, description = '') => put<Ok>(`/api/groups/${id}`, { name, description }),

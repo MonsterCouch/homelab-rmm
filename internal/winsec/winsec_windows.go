@@ -29,7 +29,7 @@ type grant struct {
 // SecureDir locks down a directory the service owns. Unix modes are a no-op on
 // Windows, so a child of %ProgramData% is created with %ProgramData%'s own
 // inherited ACL, which grants BUILTIN\Users read-and-execute: every local
-// account could read the agent's agent.json (device key and enrolment token)
+// account could read the agent's agent.json (device key and enrollment token)
 // or the server's rmm.db and server.key. This replaces the directory's DACL
 // with a PROTECTED one - inheritance from the parent is dropped rather than
 // merged - granting full control to SYSTEM and the local Administrators group

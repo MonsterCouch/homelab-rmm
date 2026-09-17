@@ -1,7 +1,7 @@
 # deploy/
 
 Examples and helpers for running Homelab RMM. None of these are required: `rmm-server install`
-and the enrolment one-liners set everything up on their own. See `docs/OPERATIONS.md` for the
+and the enrollment one-liners set everything up on their own. See `docs/OPERATIONS.md` for the
 full picture.
 
 | File | Use it when |

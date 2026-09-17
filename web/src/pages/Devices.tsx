@@ -343,7 +343,7 @@ export function Devices() {
         </Dropdown>
         {canWrite && (
           <Button variant="primary" onClick={() => setEnroll(true)}>
-            <IconPlus /> Enrol device
+            <IconPlus /> Enroll device
           </Button>
         )}
       </div>
@@ -434,7 +434,7 @@ export function Devices() {
         emptyBody={
           !agents.data?.length && canWrite ? (
             <>
-              Click <b>Enrol device</b> to create an install token.
+              Click <b>Enroll device</b> to create an install token.
             </>
           ) : undefined
         }

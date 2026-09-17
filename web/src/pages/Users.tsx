@@ -175,7 +175,7 @@ function EditUser({ user, isSelf, onClose, onSaved }: { user: User; isSelf: bool
     }
   };
   const resetTotp = async () => {
-    if (!(await confirm({ title: 'Reset two-factor', message: `Remove the authenticator from "${user.username}"? They can enrol a new one from their Account page.`, danger: true, confirmLabel: 'Reset 2FA' }))) return;
+    if (!(await confirm({ title: 'Reset two-factor', message: `Remove the authenticator from "${user.username}"? They can enroll a new one from their Account page.`, danger: true, confirmLabel: 'Reset 2FA' }))) return;
     try {
       await api.updateUser(user.id, { reset_totp: true });
       toast.success('Two-factor reset');

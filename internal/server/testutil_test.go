@@ -104,7 +104,7 @@ func request(t *testing.T, method, url, remoteAddr, body string) *http.Request {
 
 // rawAgent is a bare agent socket: it completes the hello handshake with a
 // chosen identity and hands back what the welcome said, without the reply loop
-// fakeAgent runs. Enrolment tests need control over the hostname.
+// fakeAgent runs. Enrollment tests need control over the hostname.
 type rawAgent struct {
 	ws  *websocket.Conn
 	id  string

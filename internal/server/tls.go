@@ -22,7 +22,7 @@ import (
 // loadOrCreateCert returns the server certificate. If the operator supplied
 // one it is used as is; otherwise a self-signed ECDSA certificate is written
 // to the data directory on first run and reused thereafter. Agents pin its
-// SHA-256 fingerprint at enrolment, so a self-signed certificate is as safe
+// SHA-256 fingerprint at enrollment, so a self-signed certificate is as safe
 // as a public one for the agent channel; browsers will warn once until the
 // operator imports it or supplies their own.
 func loadOrCreateCert(cfg Config, hosts []string) (tls.Certificate, string, error) {

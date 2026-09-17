@@ -12,11 +12,11 @@ import (
 
 // Config is persisted at ConfigPath() with mode 0600 - on Windows the mode is
 // ignored entirely and the protected DACL EnsureConfigDir puts on the
-// directory is what keeps other accounts out. The key is issued at enrolment
+// directory is what keeps other accounts out. The key is issued at enrollment
 // and never shown again; losing it means re-enrolling.
 //
-// EnrollToken stays in the file after enrolment on purpose: it is how a device
-// whose key the server revoked re-enrols without anyone visiting it (the 401
+// EnrollToken stays in the file after enrollment on purpose: it is how a device
+// whose key the server revoked re-enrolls without anyone visiting it (the 401
 // path in Agent.session). That makes agent.json a fleet credential and not
 // only a device one, for as long as the token has uses and has not expired -
 // "The token stays on the device" in docs/SECURITY.md says what that costs.
