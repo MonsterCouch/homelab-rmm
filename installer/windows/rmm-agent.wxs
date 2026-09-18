@@ -19,7 +19,8 @@
   registering the service and confirming it started, instead of a second
   description of the same thing that can drift.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package
       Name="Homelab RMM Agent"
       Manufacturer="Homelab RMM"
@@ -37,6 +38,20 @@
         DowngradeErrorMessage="A newer version of the Homelab RMM Agent is already installed." />
 
     <MediaTemplate EmbedCab="yes" />
+
+    <!-- The icon Programs and Features shows, and the About/Help links that
+         make the entry look like software rather than a stray package. -->
+    <Icon Id="AppIcon" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/MonsterCouch/homelab-rmm" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/MonsterCouch/homelab-rmm" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <!-- Shortcuts are OFF by default here, unlike the server package. The
+         agent is a background service on a managed endpoint, and putting a
+         console link on every desk both annoys the person sitting there and
+         advertises the management URL. Pass SHORTCUT=1 to add them anyway. -->
+    <Property Id="SHORTCUT" Secure="yes" />
 
     <!-- Enrollment details. SERVER and TOKEN are required for a first install;
          an upgrade over an existing agent does not need them, because the
@@ -63,8 +78,29 @@
       </Directory>
     </StandardDirectory>
 
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AgentMenuFolder" Name="Homelab RMM" />
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
+
+    <!-- A .url rather than a shortcut to an executable: the thing an operator
+         wants to open is the console, which is a web page on the server, not
+         the agent binary (which is a service and does nothing when run by
+         hand). SERVER is already required for a first install. -->
+    <Component Id="AgentMenuShortcut" Guid="3E1C9A62-4F5D-4B8E-9C71-2D6A8F0B4E13" Directory="AgentMenuFolder" Condition="SHORTCUT">
+      <util:InternetShortcut Id="AgentMenuUrl" Name="Homelab RMM Console" Target="[SERVER]" IconFile="[INSTALLFOLDER]rmm-agent.exe" />
+      <RemoveFolder Id="RemoveAgentMenuFolder" Directory="AgentMenuFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\HomelabRMM\Agent" Name="menu" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+    <Component Id="AgentDesktopShortcut" Guid="7A4B2E19-8C3D-4F6A-B15E-9D0C7A2F8B46" Directory="DesktopFolder" Condition="SHORTCUT">
+      <util:InternetShortcut Id="AgentDesktopUrl" Name="Homelab RMM Console" Target="[SERVER]" IconFile="[INSTALLFOLDER]rmm-agent.exe" />
+      <RegistryValue Root="HKCU" Key="Software\HomelabRMM\Agent" Name="desktop" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
     <Feature Id="Main" Title="Homelab RMM Agent" Level="1">
       <ComponentRef Id="AgentExe" />
+      <ComponentRef Id="AgentMenuShortcut" />
+      <ComponentRef Id="AgentDesktopShortcut" />
     </Feature>
 
     <!-- The command lines are built into properties named after the deferred

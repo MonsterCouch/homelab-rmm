@@ -17,7 +17,8 @@
   would collide on a machine that runs the server and an agent, which is the
   normal case for a homelab.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package
       Name="Homelab RMM Server"
       Manufacturer="Homelab RMM"
@@ -33,6 +34,12 @@
         DowngradeErrorMessage="A newer version of the Homelab RMM Server is already installed." />
 
     <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/MonsterCouch/homelab-rmm" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/MonsterCouch/homelab-rmm" />
+    <Property Id="ARPNOMODIFY" Value="1" />
 
     <!-- LISTEN binds every interface by default; restrict reachability with the
          firewall (a Tailscale-only rule is what the docs recommend) rather than
@@ -55,8 +62,32 @@
       </Directory>
     </StandardDirectory>
 
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ServerMenuFolder" Name="Homelab RMM" />
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
+
+    <!-- CONSOLEURL is PUBLICURL when it was given, and the loopback address
+         the server listens on otherwise, so the shortcut always points
+         somewhere real. A shortcut to the binary would be useless: it is a
+         service, and the thing to open is the console. -->
+    <Property Id="CONSOLEURL" Value="https://localhost:8443" />
+    <SetProperty Id="CONSOLEURL" Value="[PUBLICURL]" Before="CostFinalize" Sequence="both" Condition="PUBLICURL" />
+
+    <Component Id="ServerMenuShortcut" Guid="C51D8F73-6B2A-4E19-8D47-3F9E0A1C62B8" Directory="ServerMenuFolder">
+      <util:InternetShortcut Id="ServerMenuUrl" Name="Homelab RMM Console" Target="[CONSOLEURL]" IconFile="[INSTALLFOLDER]rmm-server.exe" />
+      <RemoveFolder Id="RemoveServerMenuFolder" Directory="ServerMenuFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\HomelabRMM\Server" Name="menu" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+    <Component Id="ServerDesktopShortcut" Guid="9B6E2C48-1D7F-4A53-B82C-5E0D3A7F91C6" Directory="DesktopFolder">
+      <util:InternetShortcut Id="ServerDesktopUrl" Name="Homelab RMM Console" Target="[CONSOLEURL]" IconFile="[INSTALLFOLDER]rmm-server.exe" />
+      <RegistryValue Root="HKCU" Key="Software\HomelabRMM\Server" Name="desktop" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
     <Feature Id="Main" Title="Homelab RMM Server" Level="1">
       <ComponentRef Id="ServerExe" />
+      <ComponentRef Id="ServerMenuShortcut" />
+      <ComponentRef Id="ServerDesktopShortcut" />
     </Feature>
 
     <!-- PUBLICURL and the certificate pair are optional, so they are appended

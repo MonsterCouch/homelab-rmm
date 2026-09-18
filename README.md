@@ -4,9 +4,13 @@ Homelab RMM is a self-hosted remote monitoring and management tool for a home la
 scripting, patching and automation of NinjaOne plus the remote desktop of ScreenConnect, in
 spirit, without the per-endpoint invoice. The server is **one Go binary** with the web console,
 API, SQLite database and agent endpoint inside; it runs as a Windows service or a systemd unit,
-or in Docker. Agents for Windows and Linux connect **outbound** over a single WebSocket, so
-devices behind NAT or on Wi-Fi need no inbound ports, and pin the server certificate so a
-self-signed setup is safe.
+or in Docker. Agents connect **outbound** over a single WebSocket, so devices behind NAT or on
+Wi-Fi need no inbound ports, and pin the server certificate so a self-signed setup is safe.
+
+**It is Windows-first.** That is where the script library, the MSI packages and most of the
+testing go, and where the product is exercised on real hardware rather than only cross-compiled.
+The Linux agent is fully supported and stays that way, with the same protocol, the same features
+and its own script library and baseline kinds. It is simply not where the depth is.
 
 ## Features
 
@@ -18,7 +22,14 @@ self-signed setup is safe.
 - **Alerting with email** — rules for CPU, memory, disk, offline, service state, reboot required,
   script and patch failures and event-log patterns; sustained thresholds, auto-resolve,
   acknowledge, maintenance mode per device, SMTP notifications (STARTTLS, implicit TLS or plain).
-- **Scripting** — PowerShell, cmd, bash, sh and python bodies, a script library with categories,
+- **Scripting** — PowerShell, cmd, bash, sh and python bodies, and a seeded library of **39
+  scripts, 33 of them for Windows**, across Diagnostics, Maintenance, Security, Users, Updates
+  and Software: a one-page health summary, event log errors grouped by source, a connectivity
+  test that names the hop that failed, battery wear, SMART health, listening ports with the
+  owning process and its publisher, a local account audit, update-cache and component-store
+  cleanup, profile management and winget. Anything destructive is report-only until a parameter
+  says otherwise, so the default run of every seeded script is safe to fire at a whole fleet.
+  Scripts take
   parameters (defaults, required), timeouts and OS filters; live streamed output; run on one
   device, a group, a tag or everything; queued for offline devices; cron **scheduling**;
   **automations** on events (device online/offline, alert opened/resolved, enrolled, reboot
@@ -184,7 +195,37 @@ volume. Details and a bind-mount variant are in `docker-compose.yml` and
 
 An enrollment token (Devices → Enroll) is the only secret a new device needs. Tokens expire
 (24 h by default), have a use count (1 by default, unlimited possible) and can pre-assign a
-group. The console prints two commands per token:
+group.
+
+### The MSI (recommended on Windows)
+
+```
+msiexec /i rmm-agent.msi /qn SERVER="https://rmm.example.ts.net:8443" TOKEN="<token>"
+```
+
+An MSI rather than a self-extracting `.exe` because this is the package that has to reach a
+fleet: `msiexec` takes the values as properties, and Group Policy, Intune and SCCM all deploy an
+MSI natively, so the agent can be pushed to machines that have never heard of the server. Add
+`FINGERPRINT="<64 hex>"` only when the server serves a self-signed certificate; omit it when the
+certificate is publicly trusted (one from `tailscale cert` is) and the agent uses system trust,
+which also means nothing has to be re-pinned when that certificate renews.
+
+It installs to `C:\Program Files\HomelabRMM`, registers a proper Programs and Features entry with
+an icon, and then runs the agent's own `install` subcommand, so one tested code path writes the
+configuration and registers the service. `%ProgramData%\HomelabRMM` is never touched by the
+installer, so a device keeps its identity across an upgrade, and `msiexec /x` deregisters the
+service while leaving that directory alone.
+
+Console shortcuts are **off** by default in the agent package: a link on every managed desk both
+annoys the person sitting there and advertises the management URL. Add `SHORTCUT=1` to install
+them anyway. The server package installs them by default, since that is where an operator sits.
+
+Build both packages with `tools\build.ps1 -Target all,msi`; see
+[docs/OPERATIONS.md](docs/OPERATIONS.md) for the server package and its properties.
+
+### The one-liners
+
+The console also prints two commands per token:
 
 - The **Windows** one-liner downloads the install script from `/install/<token>?os=windows`,
   which downloads `rmm-agent-windows-<arch>.exe` from `/api/agent-download/`, places it at
@@ -497,6 +538,20 @@ all. `make`, `tools/build.sh` and `tools/build.ps1` therefore refuse to build `r
 `web/dist/index.html` is missing and tell you to run `make web` first; `ALLOW_EMPTY_WEB=1`
 overrides that for a binary you intend to run with `--dev-web`. `tools/build.ps1` is the Windows
 twin of the Makefile. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
+
+### Windows installers
+
+The MSI packages need the [WiX Toolset](https://wixtoolset.org/):
+
+```
+winget install --id WiXToolset.WiXCLI
+wix eula accept wix7
+tools\build.ps1 -Target all,msi
+```
+
+WiX is not a dependency of anything else, so the `msi` target is deliberately not part of
+`-Target all`: a machine without it still builds and packages everything.
 
 ## License
 

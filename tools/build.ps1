@@ -311,6 +311,8 @@ function New-Msi {
     # binaries themselves via -ldflags.
     $msiVersion = Get-MsiVersion $Version
     $src = Join-Path $Root "installer\windows"
+    $icon = Join-Path $src "homelab-rmm.ico"
+    if (-not (Test-Path $icon)) { throw "$icon is missing; generate it with installer\windows\make-icon.ps1" }
     foreach ($part in @(
         @{ Name = "rmm-agent";  Wxs = "rmm-agent.wxs";  VarName = "AgentExe";  Exe = $agentExe },
         @{ Name = "rmm-server"; Wxs = "rmm-server.wxs"; VarName = "ServerExe"; Exe = $serverExe }
@@ -319,6 +321,7 @@ function New-Msi {
         & $wix build (Join-Path $src $part.Wxs) `
             "-d" "Version=$msiVersion" `
             "-d" ($part.VarName + "=" + $part.Exe) `
+            "-d" ("IconFile=" + $icon) `
             "-ext" "WixToolset.Util.wixext" "-arch" "x64" "-o" $out
         if ($LASTEXITCODE -ne 0) { throw "wix build failed for $($part.Wxs)" }
         Write-Host "  msi $out"
