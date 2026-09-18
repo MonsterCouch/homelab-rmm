@@ -1,7 +1,11 @@
 # Build, test and cross-compile on every push to main and every pull request;
-# publish a GitHub Release with the archives when a v* tag is pushed, or when
-# the workflow is run by hand with a release_tag (Actions -> Build -> Run
-# workflow): the tag is then created on the current commit by the release job.
+# publish a GitHub Release with the archives and the Windows installers when a
+# v* tag is pushed, or when the workflow is run by hand with a release_tag
+# (Actions -> Build -> Run workflow): the tag is then created on the current
+# commit by the release job.
+#
+# The MSI job runs on Windows and therefore only for releases - see its own
+# comment. Everything else runs on Linux on every push.
 name: Build
 
 on:
@@ -98,10 +102,84 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  msi:
+    name: Windows installers
+    # Only for releases. A Windows runner bills at twice the Linux rate, so
+    # building the MSIs on every push to main would roughly triple the cost of
+    # the workflow to produce artefacts nobody downloads between releases.
+    # WiX is also not a dependency of anything else, which is why the `msi`
+    # target sits outside `-Target all` and outside the ordinary build job.
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe needs the tags for the version stamp
+
+      - name: Stamp the requested release version
+        # Same reason as in the build job: a manual release names its tag
+        # before it exists, and the version is stamped from git describe.
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        shell: bash
+        run: |
+          case "${{ inputs.release_tag }}" in
+            v[0-9]*) ;;
+            *) echo "::error::release_tag must look like v1.2.3"; exit 1 ;;
+          esac
+          git tag "${{ inputs.release_tag }}"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: WiX Toolset
+        # The version is pinned: an MSI authored against v7 is not guaranteed
+        # to build on whatever major version ships next, and a release is the
+        # worst moment to discover that. The EULA has to be accepted
+        # non-interactively or `wix build` refuses to run at all.
+        run: |
+          dotnet tool install --global wix --version 7.0.0
+          wix --version
+          wix eula accept wix7
+          wix extension add -g WixToolset.Util.wixext/7.0.0
+
+      - name: Build the installers
+        # -Platforms windows/amd64 is the whole point of running here: the MSIs
+        # consume only that pair, so the other eight binaries are built in the
+        # cheap Linux job instead.
+        run: ./tools/build.ps1 -Target web,server,agents,msi -Platforms windows/amd64
+        shell: pwsh
+
+      - name: Console is really embedded
+        # The same check the Linux job makes, for the binary that actually goes
+        # inside the MSI: a server packaged without the UI step embeds one empty
+        # file, compiles without a warning and serves a directory listing.
+        shell: bash
+        run: |
+          grep -qa '<div id="root">' dist/rmm-server-windows-amd64.exe || {
+            echo "::error::the packaged server has no embedded web console"
+            exit 1
+          }
+          ls -l dist/*.msi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msi
+          path: dist/*.msi
+          if-no-files-found: error
+          retention-days: 14
+
   release:
     name: GitHub Release
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
-    needs: build
+    needs: [build, msi]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -110,6 +188,20 @@ jobs:
         with:
           name: dist
           path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: msi
+          path: dist
+
+      - name: Checksum the installers too
+        # SHA256SUMS was written by the Linux job, which never saw the MSIs.
+        # Appending them keeps one file that covers everything the release
+        # offers, so a download can be verified whichever form it took.
+        run: |
+          cd dist
+          sha256sum *.msi >> SHA256SUMS
+          cat SHA256SUMS
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -121,4 +213,5 @@ jobs:
           files: |
             dist/homelab-rmm-*.zip
             dist/homelab-rmm-*.tar.gz
+            dist/*.msi
             dist/SHA256SUMS

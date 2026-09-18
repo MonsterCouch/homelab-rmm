@@ -29,13 +29,20 @@
     tools\build.ps1                       # everything
     tools\build.ps1 -Target server,agents # binaries only, reusing the existing web\dist
     tools\build.ps1 -Target package -Version v1.2.3
+    tools\build.ps1 -Target web,server,agents,msi -Platforms windows/amd64 # installers only
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('web', 'server', 'agents', 'all', 'test', 'package', 'msi', 'checksums', 'clean')]
     [string[]]$Target = @('all'),
     [string]$Version = '',
-    [string]$Dist = 'dist'
+    [string]$Dist = 'dist',
+    # Restrict the cross-compile to these os/arch pairs, e.g. -Platforms windows/amd64.
+    # The MSI target only ever consumes windows/amd64, and a Windows CI runner bills
+    # at twice the Linux rate, so building nine binaries there to package two is
+    # money spent on nothing. Empty means every platform, which is what a release
+    # archive build wants.
+    [string[]]$Platforms = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,6 +54,15 @@ Set-Location $root
 $module = 'github.com/MonsterCouch/homelab-rmm'
 $serverPlatforms = @('windows/amd64', 'windows/arm64', 'linux/amd64', 'linux/arm64')
 $agentPlatforms = @('windows/amd64', 'windows/arm64', 'linux/amd64', 'linux/arm64', 'linux/arm')
+if ($Platforms.Count -gt 0) {
+    # Intersect rather than replace, so a typo or an unsupported pair cannot
+    # quietly invent a build target that the rest of the script cannot name.
+    $serverPlatforms = @($serverPlatforms | Where-Object { $Platforms -contains $_ })
+    $agentPlatforms = @($agentPlatforms | Where-Object { $Platforms -contains $_ })
+    if ($serverPlatforms.Count -eq 0 -and $agentPlatforms.Count -eq 0) {
+        throw "-Platforms matched nothing. Supported: windows/amd64, windows/arm64, linux/amd64, linux/arm64, linux/arm"
+    }
+}
 
 function Get-BuildVersion {
     if ($script:Version) { return $script:Version }

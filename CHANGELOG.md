@@ -5,12 +5,67 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-18
+
 **First run on real Windows.** Everything Windows-specific had only ever been cross-compiled and
 reviewed. On 2026-09-15 the agent was installed as a service on a Windows 11 workstation, every
 subsystem was exercised against it, and 95 findings were confirmed and fixed. Nothing here changes
 the protocol; old agents keep working.
 
+### Added
+- **Windows installers.** `rmm-server-<version>-x64.msi` and `rmm-agent-<version>-x64.msi`, built
+  by `tools\build.ps1 -Target msi` with WiX v7: a real Add/Remove Programs entry with an icon,
+  upgrades that replace the binary without touching the data directory, an uninstall that
+  deregisters the service rather than leaving it pointing at a file that is gone, and Start-menu
+  and desktop shortcuts to the console. Every setting is an MSI property, so
+  `msiexec /i rmm-agent.msi /qn SERVER=... TOKEN=...` is a whole unattended deployment. Both are
+  now attached to each release by a Windows CI job; it runs only for releases, because a Windows
+  runner bills at twice the Linux rate.
+- **22 Windows scripts** in the seeded library, across Diagnostics, Maintenance, Security, Users
+  and Software — all of them executed against a live Windows 11 agent rather than only reviewed.
+  Component-store cleanup reclaimed 10.34 GB on the validation machine.
+- **`--tailscale-cert`.** The server gets a real Let's Encrypt certificate for its tailnet name
+  from `tailscale cert`, re-asks daily, and swaps a renewed one in **without a restart** because
+  the listener reads the certificate through a `GetCertificate` hook. Renewal is why this belongs
+  in the server and not the installer: the certificates last 90 days, so minting one at install
+  time only moves the outage a quarter into the future. Any failure is a warning, never fatal — a
+  server that cannot reach Tailscale still starts on its self-signed certificate.
+- **Pinning stops being a time bomb.** When the served certificate verifies against the host trust
+  store for the public URL's host, the server hands out **no** fingerprint: enrollment commands
+  omit `--fingerprint` and agents use system trust, which survives every renewal. A self-signed
+  certificate is still pinned, because nothing else vouches for it. `GET /api/enroll` reports both
+  `fingerprint` (what to pin, empty when there is nothing to) and `cert_fingerprint` (what is
+  actually served).
+- **`rmm-server setup-code`** prints the one-time first-run code the console asks for. The code is
+  minted in memory and never stored, so its only durable copy is the `setup_code=` attribute of
+  the FIRST RUN warning in `server.log` — the one place an operator cannot find it when the
+  service starts the server and stderr goes nowhere. The command reads it back, says so instead
+  of printing a spent code once an account exists, and tells you to restart when the log holds
+  none. The setup form's hint now names it first.
+- **`tools\build.ps1 -Platforms`** restricts the cross-compile, e.g. `-Platforms windows/amd64`.
+  The MSI target consumes only that pair, so the release job no longer builds nine binaries on
+  the expensive runner to package two.
+
+### Licensing
+- **`LICENSE`** settles it: proprietary, licensed rather than sold, with access for evaluation
+  granting internal evaluation only. Until now the repository carried no licence file at all, so
+  no rights were granted to anyone and the release archives shipped a placeholder saying as much.
+- **`THIRD-PARTY-NOTICES.md`** carries the attributions the compiled-in components require. The
+  binaries link 22 Go modules and the console bundle embeds 40 npm packages; every one is
+  permissive (MIT, BSD, ISC, Apache 2.0, zlib), so none is copyleft and none forces this source
+  open, but all of them require their copyright notice to travel with a copy of the software. Both
+  MSIs install it beside the executable and both packagers stage it into every archive and now
+  fail rather than build one without it. It is generated from the components' own licence files,
+  including the `NOTICE` that Apache 2.0 section 4(d) requires be reproduced.
+
 ### Fixed
+- **A fresh clone did not compile.** `go build ./...` failed with `pattern all:dist: no matching
+  files found`, because `web/embed.go` embeds `web/dist` and the directory did not exist. The
+  README claimed a tracked `.gitkeep` held it open, but the ignore rule excluded `/web/dist/`
+  itself and git never descends into an excluded directory — so the `!/web/dist/.gitkeep`
+  negation below it had never had any effect. The rule now excludes the contents instead, and the
+  `.gitkeep` exists. The build scripts still refuse to build `rmm-server` without
+  `web/dist/index.html`, so this cannot silently ship a console-less server.
 - **The Windows service wrote no log.** The slog handler was `io.MultiWriter(os.Stderr, file)`;
   a process the Service Control Manager starts has no standard handles, so the first write failed
   and slog swallowed the error: `agent.log` (and `server.log`, including the first-run **setup
@@ -404,6 +459,7 @@ Initial release.
   checksums), GitHub Actions build and release workflow, Dockerfile (distroless, agents baked
   in) and docker-compose, deploy examples (systemd unit, Caddy, nginx, uninstall scripts).
 
-[Unreleased]: https://github.com/MonsterCouch/homelab-rmm/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/MonsterCouch/homelab-rmm/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/MonsterCouch/homelab-rmm/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MonsterCouch/homelab-rmm/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MonsterCouch/homelab-rmm/releases/tag/v0.1.0

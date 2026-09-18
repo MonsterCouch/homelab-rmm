@@ -92,6 +92,25 @@ in the data directory:
 level=WARN msg="FIRST RUN: no users yet. ..." setup_code=3f9a1c07
 ```
 
+**The short way to get it back is `rmm-server setup-code`.** It reads the most recent code out
+of `server.log`, which is the only durable copy — the code is minted in memory and never stored,
+so the database does not have it:
+
+```
+C:\Program Files\HomelabRMM Server> .\rmm-server.exe setup-code
+
+==== FIRST-RUN SETUP CODE: 3f9a1c07 ====
+
+Enter it in the Setup code field at https://rmm.example.ts.net:8443
+```
+
+Run it **elevated**: the data directory is locked down to SYSTEM and Administrators, so an
+unprivileged prompt cannot read the log. Pass `--data` if the server does not use the default
+directory. If an account already exists the command says so instead of printing a spent code,
+because from that point the form stops asking and the recovery you want is
+`rmm-server user passwd`. If the log holds no code at all, restart the server while the user
+table is still empty and a fresh one is minted.
+
 - The setup form **always** shows a **Setup code** field and the request is refused with 403
   until it matches — from the LAN, from behind a reverse proxy, and from a browser on the server
   itself. There is no loopback exemption: a peer address of `127.0.0.1` can equally be a same-host

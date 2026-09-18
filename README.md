@@ -66,19 +66,24 @@ and its own script library and baseline kinds. It is simply not where the depth 
 
 _Coming soon: dashboard, device overview, remote desktop, script run with live output._
 
-> **Releases.** [v0.1.0](https://github.com/MonsterCouch/homelab-rmm/releases/tag/v0.1.0) is
-> published, so the download links in the two quick starts below resolve: each
-> `homelab-rmm-<os>-<arch>.zip`, the linux `.tar.gz` files and `SHA256SUMS` are attached to it,
-> and `releases/latest/download/...` always points at the newest tagged version. That is the
-> *released* version, not `main` — [CHANGELOG.md](CHANGELOG.md) says what is in each one, and
-> baselines (desired state, drift detection, self-healing) arrive in 0.2.0. To run something
+> **Releases.** The download links in the two quick starts below resolve against the newest tag:
+> each `homelab-rmm-<os>-<arch>.zip`, the linux `.tar.gz` files, **both Windows `.msi`
+> installers** and `SHA256SUMS` are attached to every release, and
+> `releases/latest/download/...` always points at the newest one. That is the *released*
+> version, not `main` — [CHANGELOG.md](CHANGELOG.md) says what is in each one. To run something
 > newer than the latest tag, produce the archives yourself — see
 > [Building from source](#building-from-source):
 > `make all && make package` writes exactly the `dist/homelab-rmm-<os>-<arch>.zip` /
-> `.tar.gz` the quick starts unpack (server, `agents/`, docs, `deploy/`, `SHA256SUMS`) — or take
-> the `dist` artefact from the newest green run of the
+> `.tar.gz` the quick starts unpack (server, `agents/`, docs, `deploy/`, `LICENSE`,
+> `THIRD-PARTY-NOTICES.md`, `SHA256SUMS`) — or take the `dist` artefact from the newest green
+> run of the
 > [Build workflow](https://github.com/MonsterCouch/homelab-rmm/actions/workflows/build.yml).
 > Everything after the download step is exactly as written.
+>
+> The MSIs are built by a separate Windows job that runs **only for a release**, because a
+> Windows runner costs twice what a Linux one does. So a release has them and an ordinary push's
+> `dist` artefact does not; to get them from a commit that is not tagged, build them yourself
+> with `tools\build.ps1 -Target web,server,agents,msi -Platforms windows/amd64`.
 
 ## Quick start (Windows server)
 
