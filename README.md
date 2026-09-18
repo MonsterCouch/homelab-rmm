@@ -555,8 +555,20 @@ WiX is not a dependency of anything else, so the `msi` target is deliberately no
 
 ## License
 
-**Not settled yet.** The repository carries no `LICENSE` file, so no licence is granted — treat
-the code as all rights reserved until one is added. The release archives ship a placeholder that
-says the same (`tools/build.sh` writes it when `LICENSE` is absent); once the file exists it is
-copied into every archive instead. It was still missing when 0.1.0 was tagged, so that release
-carries the placeholder too; adding a real one is the outstanding licensing chore.
+**Proprietary.** See [LICENSE](LICENSE). Homelab RMM is not open source: it is licensed, not
+sold, and no right to use, copy, modify or redistribute it arises from having access to the
+repository. Access granted for evaluation permits internal evaluation only, revocably, and
+never production use or use on behalf of a third party. For a commercial licence, ask.
+
+Releases before 0.3.0 predate the file and shipped a placeholder saying no licence was granted,
+which had the same effect.
+
+### Third-party components
+
+The binaries compile in third-party open-source code, and the console bundle embeds more of it.
+All of it is permissive — MIT, BSD, ISC, Apache 2.0 and zlib — so none of it is copyleft and
+none of it forces this project's own source open. Every one of those licences does require its
+copyright notice to travel with any copy of the software, so
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) is installed beside the executable by both
+MSIs and copied into every release archive. It is generated from the components' own licence
+files; regenerate it when a dependency changes.

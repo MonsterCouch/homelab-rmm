@@ -34,6 +34,7 @@ Usage:
   rmm-server user add --username U [--role admin|tech|viewer]   (prompts for password)
   rmm-server user passwd --username U
   rmm-server user list
+  rmm-server setup-code             print the one-time first-run setup code the console asks for
   rmm-server version
 
 Flags for run/install:
@@ -55,8 +56,9 @@ Environment: RMM_DATA_DIR, RMM_LISTEN, RMM_PUBLIC_URL, RMM_CERT_FILE, RMM_KEY_FI
 
 First run: with no users yet the server prints a one-time SETUP CODE to the console and to
 server.log in the data directory. The setup form asks for it unless you open the console from
-a browser on the server itself. Lost it? Restart the server before creating a user: a new code
-is minted on every start that finds no users.
+a browser on the server itself. "rmm-server setup-code" reads it back out of the log, which is
+the only place it lands when the service runs it and stderr goes nowhere. Lost it? Restart the
+server before creating a user: a new code is minted on every start that finds no users.
 `, server.Version, server.DefaultDataDir())
 }
 
@@ -357,6 +359,8 @@ func run(args []string) int {
 		}
 	case "user":
 		return runUser(args)
+	case "setup-code":
+		return runSetupCode(args)
 	default:
 		usage()
 		return 2

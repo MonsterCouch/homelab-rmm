@@ -1,0 +1,103 @@
+Homelab RMM
+Proprietary Software Licence
+
+Copyright (c) 2026 MonsterCouch. All rights reserved.
+
+1. OWNERSHIP
+
+   This software, including its source code, build scripts, documentation,
+   installers and all other material in this repository (the "Software"), is
+   the confidential and proprietary property of the copyright holder. It is
+   licensed, not sold. Nothing in this file transfers ownership of anything.
+
+2. NO LICENCE IS GRANTED BY DEFAULT
+
+   No right to use, copy, modify, merge, publish, distribute, sublicense or
+   sell the Software is granted by the mere fact of your having access to it.
+   Rights exist only where the copyright holder has granted them to you in a
+   separate written agreement signed by the copyright holder.
+
+   If you obtained the Software without such an agreement -- for example
+   because a repository, archive or binary was shared, leaked, mirrored or
+   made public, whether deliberately or by mistake -- you have no licence to
+   it, and clauses 3 and 4 do not grant you one.
+
+3. EVALUATION
+
+   Where the copyright holder has given you access for the purpose of
+   evaluating the Software, and has not stated otherwise in writing, you may
+   install and run it on systems you own or administer, for internal
+   evaluation only, for as long as that access continues. This permission is
+   personal to you, non-exclusive, non-transferable, revocable at any time and
+   without notice, and does not extend to production use, to use on behalf of
+   a third party, or to any use for which a fee is charged to anyone.
+
+4. RESTRICTIONS
+
+   Except as clause 2 or 3 expressly permits, you must not:
+
+   (a) copy, publish, distribute, sell, rent, lease, sublicense or otherwise
+       make the Software available to any third party;
+   (b) modify the Software or create derivative works from it;
+   (c) remove, obscure or alter any copyright, licence or attribution notice;
+   (d) use the Software to provide a commercial or hosted service to others,
+       including any managed service, monitoring service or remote support
+       service;
+   (e) use the Software, its design, or its documentation to develop a
+       competing product; or
+   (f) disclose the Software, or any benchmark or evaluation result concerning
+       it, to any third party.
+
+   Where mandatory law grants you a right that clause 4(b) purports to
+   restrict -- notably a right to decompile for interoperability -- that law
+   prevails to the extent it applies, and nothing here is intended to waive
+   it.
+
+5. FEEDBACK
+
+   If you send the copyright holder suggestions, bug reports or other
+   feedback, the copyright holder may use them without restriction and owes
+   you nothing for them. You are not required to send any.
+
+6. THIRD-PARTY COMPONENTS
+
+   The Software incorporates third-party open-source components, which remain
+   under their own licences. Those licences are not affected by this one, and
+   this licence does not purport to restrict your rights in those components
+   as they exist independently of the Software. See THIRD-PARTY-NOTICES.md.
+
+7. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NONINFRINGEMENT.
+
+   The Software administers computers remotely: it can execute commands with
+   full system privileges, install and remove software, alter configuration
+   and restart machines. You are solely responsible for deciding where to
+   deploy it, for the actions you take with it, and for the consequences of
+   those actions.
+
+8. LIMITATION OF LIABILITY
+
+   TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT SHALL THE COPYRIGHT
+   HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+   ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE,
+   INCLUDING ANY LOSS OF DATA, LOSS OF PROFITS OR BUSINESS INTERRUPTION.
+
+   Nothing in this licence excludes or limits liability that cannot lawfully
+   be excluded or limited.
+
+9. TERMINATION
+
+   Any permission granted under clause 3 ends immediately, without notice, if
+   you breach this licence or if the copyright holder revokes your access. On
+   termination you must stop using the Software and destroy every copy of it
+   in your possession or control.
+
+10. ENQUIRIES
+
+   For a commercial licence, or for permission to do anything this licence
+   does not permit, contact the copyright holder through the repository's
+   homepage: https://github.com/MonsterCouch/homelab-rmm

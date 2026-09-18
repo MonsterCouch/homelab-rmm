@@ -5,7 +5,13 @@
 /dist/
 /build/
 /web/node_modules/
-/web/dist/
+# The built UI is not tracked, but the directory itself must be, because
+# web/embed.go embeds it with //go:embed all:dist and a `go build ./...` on a
+# fresh clone fails outright when it does not exist. Excluding the contents
+# (/web/dist/*) rather than the directory (/web/dist/) is what makes the
+# .gitkeep negation below effective: git never descends into an excluded
+# directory, so a negation for a file inside one is silently ignored.
+/web/dist/*
 !/web/dist/.gitkeep
 *.db
 *.db-wal

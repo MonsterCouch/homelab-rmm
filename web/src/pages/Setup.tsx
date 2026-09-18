@@ -105,7 +105,7 @@ export function Setup() {
           <Field
             label="Setup code"
             htmlFor="su-code"
-            hint="The one-time code the server printed at startup — on the console, and as a WARN line in server.log in the data directory. Lost it? Restart the server before anyone creates a user and it prints a new one."
+            hint="The one-time code the server printed at startup. Cannot see it? Run “rmm-server setup-code” on the server in an elevated prompt — it reads the code back out of server.log, which is the only place it lands when the service starts the server and there is no console to print to. Lost it entirely? Restart the server before anyone creates a user and it mints a new one."
           >
             {/* The code is lower-case hex printed by the server: autocapitalise
                 or autocorrect it and first-run setup fails on the phone. */}

@@ -75,6 +75,14 @@
         <Component Id="AgentExe" Guid="7C2E0A14-7B7E-4C8B-9E5B-3A1D0C5E9F21" Bitness="always64">
           <File Id="rmm_agent.exe" Name="rmm-agent.exe" Source="$(var.AgentExe)" KeyPath="yes" />
         </Component>
+        <!-- The permissive licences of the components compiled into
+             rmm-agent.exe require their notices to travel with any copy of
+             the software, and this package is a copy of the software, so the
+             attributions are installed rather than left in the repository. -->
+        <Component Id="AgentDocs" Guid="1F8B0D63-5A47-4C92-BE31-2D7E6A0C94F5" Bitness="always64">
+          <File Id="agent_license.txt" Name="LICENSE.txt" Source="$(var.LicenseFile)" KeyPath="yes" />
+          <File Id="agent_notices.md" Name="THIRD-PARTY-NOTICES.md" Source="$(var.NoticesFile)" />
+        </Component>
       </Directory>
     </StandardDirectory>
 
@@ -99,6 +107,7 @@
 
     <Feature Id="Main" Title="Homelab RMM Agent" Level="1">
       <ComponentRef Id="AgentExe" />
+      <ComponentRef Id="AgentDocs" />
       <ComponentRef Id="AgentMenuShortcut" />
       <ComponentRef Id="AgentDesktopShortcut" />
     </Feature>

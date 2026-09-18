@@ -253,6 +253,14 @@ function New-Packages {
         if (Test-Path 'CHANGELOG.md') { Copy-Item -LiteralPath 'CHANGELOG.md' -Destination $stage }
         if (Test-Path 'docs') { Copy-Item -LiteralPath 'docs' -Destination (Join-Path $stage 'docs') -Recurse }
         if (Test-Path 'deploy') { Copy-Item -LiteralPath 'deploy' -Destination (Join-Path $stage 'deploy') -Recurse }
+        # The attributions the compiled-in components require have to be in
+        # the archive, not just in the repository: this archive is a copy of
+        # the software and carries their code inside the binaries.
+        if (Test-Path 'THIRD-PARTY-NOTICES.md') {
+            Copy-Item -LiteralPath 'THIRD-PARTY-NOTICES.md' -Destination (Join-Path $stage 'THIRD-PARTY-NOTICES.md')
+        } else {
+            throw "THIRD-PARTY-NOTICES.md is missing; the archive must carry the third-party attributions"
+        }
         if (Test-Path 'LICENSE') {
             Copy-Item -LiteralPath 'LICENSE' -Destination (Join-Path $stage 'LICENSE')
         } else {
@@ -313,6 +321,16 @@ function New-Msi {
     $src = Join-Path $Root "installer\windows"
     $icon = Join-Path $src "homelab-rmm.ico"
     if (-not (Test-Path $icon)) { throw "$icon is missing; generate it with installer\windows\make-icon.ps1" }
+
+    # The licence and the third-party attributions are installed beside the
+    # executable, not merely kept in the repository: the permissive licences
+    # of the compiled-in components require their notices to travel with any
+    # copy of the software, and an MSI is a copy of the software.
+    $license = Join-Path $Root "LICENSE"
+    $notices = Join-Path $Root "THIRD-PARTY-NOTICES.md"
+    foreach ($doc in @($license, $notices)) {
+        if (-not (Test-Path $doc)) { throw "$doc is missing; the installers must carry it" }
+    }
     foreach ($part in @(
         @{ Name = "rmm-agent";  Wxs = "rmm-agent.wxs";  VarName = "AgentExe";  Exe = $agentExe },
         @{ Name = "rmm-server"; Wxs = "rmm-server.wxs"; VarName = "ServerExe"; Exe = $serverExe }
@@ -322,6 +340,8 @@ function New-Msi {
             "-d" "Version=$msiVersion" `
             "-d" ($part.VarName + "=" + $part.Exe) `
             "-d" ("IconFile=" + $icon) `
+            "-d" ("LicenseFile=" + $license) `
+            "-d" ("NoticesFile=" + $notices) `
             "-ext" "WixToolset.Util.wixext" "-arch" "x64" "-o" $out
         if ($LASTEXITCODE -ne 0) { throw "wix build failed for $($part.Wxs)" }
         Write-Host "  msi $out"

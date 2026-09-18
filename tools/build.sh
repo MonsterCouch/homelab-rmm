@@ -183,6 +183,14 @@ do_package() {
 		[ -f CHANGELOG.md ] && cp CHANGELOG.md "$stage/"
 		[ -d docs ] && cp -r docs "$stage/docs"
 		[ -d deploy ] && cp -r deploy "$stage/deploy"
+		# The attributions the compiled-in components require have to be in
+		# the archive, not just in the repository: this archive is a copy of
+		# the software and carries their code inside the binaries.
+		if [ -f THIRD-PARTY-NOTICES.md ]; then
+			cp THIRD-PARTY-NOTICES.md "$stage/THIRD-PARTY-NOTICES.md"
+		else
+			die "THIRD-PARTY-NOTICES.md is missing; the archive must carry the third-party attributions"
+		fi
 		if [ -f LICENSE ]; then
 			cp LICENSE "$stage/LICENSE"
 		else

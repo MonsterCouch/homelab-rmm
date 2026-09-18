@@ -66,6 +66,14 @@
         <Component Id="ServerExe" Guid="B4D9F1C7-2E6A-4F3B-8D5C-1A7E9B2C4D60" Bitness="always64">
           <File Id="rmm_server.exe" Name="rmm-server.exe" Source="$(var.ServerExe)" KeyPath="yes" />
         </Component>
+        <!-- The permissive licences of the components compiled into
+             rmm-server.exe require their notices to travel with any copy of
+             the software, and this package is a copy of the software, so the
+             attributions are installed rather than left in the repository. -->
+        <Component Id="ServerDocs" Guid="7A2C4E96-3D81-4B57-9E0F-6C1A8B3D5F24" Bitness="always64">
+          <File Id="server_license.txt" Name="LICENSE.txt" Source="$(var.LicenseFile)" KeyPath="yes" />
+          <File Id="server_notices.md" Name="THIRD-PARTY-NOTICES.md" Source="$(var.NoticesFile)" />
+        </Component>
       </Directory>
     </StandardDirectory>
 
@@ -93,6 +101,7 @@
 
     <Feature Id="Main" Title="Homelab RMM Server" Level="1">
       <ComponentRef Id="ServerExe" />
+      <ComponentRef Id="ServerDocs" />
       <ComponentRef Id="ServerMenuShortcut" />
       <ComponentRef Id="ServerDesktopShortcut" />
     </Feature>
