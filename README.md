@@ -75,15 +75,16 @@ _Coming soon: dashboard, device overview, remote desktop, script run with live o
 > [Building from source](#building-from-source):
 > `make all && make package` writes exactly the `dist/homelab-rmm-<os>-<arch>.zip` /
 > `.tar.gz` the quick starts unpack (server, `agents/`, docs, `deploy/`, `LICENSE`,
-> `THIRD-PARTY-NOTICES.md`, `SHA256SUMS`) — or take the `dist` artefact from the newest green
-> run of the
-> [Build workflow](https://github.com/MonsterCouch/homelab-rmm/actions/workflows/build.yml).
-> Everything after the download step is exactly as written.
+> `THIRD-PARTY-NOTICES.md`, `SHA256SUMS`). Everything after the download step is exactly as
+> written.
 >
-> The MSIs are built by a separate Windows job that runs **only for a release**, because a
-> Windows runner costs twice what a Linux one does. So a release has them and an ordinary push's
-> `dist` artefact does not; to get them from a commit that is not tagged, build them yourself
-> with `tools\build.ps1 -Target web,server,agents,msi -Platforms windows/amd64`.
+> CI keeps no downloadable build of an untagged commit. It tests and cross-compiles every push,
+> but uploading the 168 MB `dist/` each time filled this repository's 500 MB Actions artifact
+> quota in three pushes and then failed every run, so nothing is kept — a release is the only
+> published build. To run something newer, build it. The installers in particular are produced
+> by the release job (the only one that runs on Windows, since WiX needs it):
+> `tools\build.ps1 -Target web,server,agents,msi -Platforms windows/amd64` builds just those,
+> and `-Target all,package,msi,checksums` builds exactly what a release carries.
 
 ## Quick start (Windows server)
 

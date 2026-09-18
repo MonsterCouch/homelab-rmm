@@ -179,7 +179,14 @@ function New-ZipFromDirectory([string]$Stage, [string]$Zip) {
 }
 
 function Write-Checksums {
-    $files = Get-ChildItem -Path $Dist -File | Where-Object { $_.Name -match '^(homelab-rmm-.*\.(zip|tar\.gz)|rmm-(server|agent)-.*)$' } | Sort-Object Name
+    # .wixpdb is WiX's debug symbol file. It sits next to the MSI it came from
+    # and matched the pattern below, so it was being checksummed and would have
+    # been offered as a release download. Note also that this checksums what is
+    # in $Dist, not what this run produced: build a release from a clean dist
+    # (-Target clean) or a stale artefact from an earlier version rides along.
+    $files = Get-ChildItem -Path $Dist -File |
+        Where-Object { $_.Name -match '^(homelab-rmm-.*\.(zip|tar\.gz)|rmm-(server|agent)-.*)$' -and $_.Extension -ne '.wixpdb' } |
+        Sort-Object Name
     $lines = foreach ($f in $files) {
         $hash = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLower()
         "$hash  $($f.Name)"
@@ -358,7 +365,9 @@ function New-Msi {
             "-d" ("IconFile=" + $icon) `
             "-d" ("LicenseFile=" + $license) `
             "-d" ("NoticesFile=" + $notices) `
-            "-ext" "WixToolset.Util.wixext" "-arch" "x64" "-o" $out
+            "-ext" "WixToolset.Util.wixext" "-arch" "x64" `
+            "-pdbtype" "none" `
+            "-o" $out
         if ($LASTEXITCODE -ne 0) { throw "wix build failed for $($part.Wxs)" }
         Write-Host "  msi $out"
     }
