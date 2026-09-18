@@ -515,13 +515,44 @@ Neither package is code-signed, so SmartScreen and reputation-based antivirus
 will have an opinion on a fresh machine. That is expected; see the antivirus
 notes in the README.
 
-### Keeping a Tailscale certificate alive
+### Tailscale certificates
 
-`tailscale cert` issues a 90-day certificate and the server reads its
-certificate only at startup, so a working install starts failing three months
-later unless something renews it. `deploy\renew-tailscale-cert.ps1` re-mints,
-re-locks the key to SYSTEM and Administrators, and restarts the service **only
-when the file actually changed**. Register it as a weekly SYSTEM task:
+Pass `--tailscale-cert` (or `TAILSCALE=1` to the MSI) and the server gets a
+real Let's Encrypt certificate for its tailnet name, then keeps it renewed:
+
+```
+msiexec /i rmm-server.msi /qn TAILSCALE=1 PUBLICURL="https://box.tailnet-name.ts.net:8443"
+```
+
+It mints the certificate before the listener starts, re-asks once a day, and
+swaps a renewed one in **without a restart**, because the listener reads the
+certificate through a hook rather than a copy taken at startup. Requires
+HTTPS certificates to be enabled for the tailnet in the Tailscale admin
+console; without that, `tailscale cert` returns "your Tailscale account does
+not support getting TLS certs".
+
+Any failure is a warning, never fatal: a server that cannot reach Tailscale
+still starts on a self-signed certificate rather than refusing to run.
+
+The reason this belongs in the server and not in the installer is renewal.
+These certificates last 90 days, so minting one at install time only moves
+the outage a quarter into the future, and only the process that serves the
+certificate can pick up a new one on its own.
+
+**This is also what stops pinning becoming a time bomb.** A fingerprint pin
+is a promise about one specific certificate, and a publicly trusted one is
+designed to be replaced. So when the served certificate verifies against the
+host trust store for the public URL's host, the server hands out **no**
+fingerprint: the enrollment commands omit `--fingerprint` and agents use
+system trust, which keeps working across every renewal. A self-signed
+certificate is still pinned, because nothing else vouches for it. `GET
+/api/enroll` reports both, `fingerprint` being what to pin (empty when there
+is nothing to) and `cert_fingerprint` the certificate actually being served.
+
+`deploy\renew-tailscale-cert.ps1` remains for a server that cannot use the
+flag, for instance one behind a reverse proxy that terminates TLS itself. It
+re-mints, re-locks the key and restarts the service only when the file
+changed. Register it as a weekly SYSTEM task:
 
 ```
 $script = 'C:\ProgramData\HomelabRMM-Server\renew-tailscale-cert.ps1'
@@ -531,7 +562,3 @@ $t = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 3am
 $p = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
 Register-ScheduledTask -TaskName 'Homelab RMM cert renewal' -Action $a -Trigger $t -Principal $p
 ```
-
-It logs to `cert-renewal.log` beside the data directory. Run it by hand once
-after registering, to see it report the days remaining rather than waiting a
-week to find out it does not work.

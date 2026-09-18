@@ -56,6 +56,12 @@ type Server struct {
 	certHosts []string
 	certMu    sync.Mutex
 	certWarn  string
+	// certTrusted is whether the served certificate verifies on its own, so
+	// an enrolling agent needs no pin. Recomputed when the certificate
+	// changes, not per request.
+	certTrusted bool
+	// tsCertHost is the tailnet name --tailscale-cert issues for.
+	tsCertHost string
 	// patchJobs serialises patch work per device: overlapping scans and
 	// installs used to trample each other's status rows.
 	patchMu   sync.Mutex
@@ -153,6 +159,12 @@ func New(cfg Config) (*Server, error) {
 		}
 	}
 	if !cfg.Insecure {
+		// Before the certificate is loaded: this may set CertFile/KeyFile, and
+		// an operator-supplied pair always wins over it.
+		if cfg.TailscaleCert && cfg.CertFile == "" {
+			s.setupTailscaleCert()
+			cfg = s.cfg
+		}
 		hosts := localHostnames()
 		if h := hostOf(s.PublicURL()); h != "" {
 			hosts = append([]string{h}, hosts...)
@@ -165,6 +177,7 @@ func New(cfg Config) (*Server, error) {
 		s.fingerprint = fp
 		s.pubkeyPin = PublicKeyPin(cert.Certificate[0])
 		s.checkCertHost()
+		s.refreshCertTrust()
 	}
 	return s, nil
 }
@@ -277,11 +290,15 @@ func (s *Server) Run(ctx context.Context) error {
 				return err
 			}
 			s.cert, s.fingerprint = &cert, fp
+			s.pubkeyPin = PublicKeyPin(cert.Certificate[0])
 			s.checkCertHost()
+			s.refreshCertTrust()
 		}
 		s.httpSrv.TLSConfig = &tls.Config{
-			Certificates: []tls.Certificate{*s.cert},
-			MinVersion:   tls.VersionTLS12,
+			// A hook rather than a fixed slice, so --tailscale-cert can swap a
+			// renewed certificate in without dropping the listener.
+			GetCertificate: s.currentCert,
+			MinVersion:     tls.VersionTLS12,
 		}
 	}
 
@@ -311,6 +328,9 @@ func (s *Server) Run(ctx context.Context) error {
 
 	s.sched.start(ctx)
 	s.goJob(func() { s.alerts.run(ctx) })
+	if s.cfg.TailscaleCert && s.tsCertHost != "" {
+		s.goJob(func() { s.renewTailscaleCert(ctx) })
+	}
 
 	errCh := make(chan error, 1)
 	go func() {

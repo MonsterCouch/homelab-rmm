@@ -131,7 +131,10 @@ func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	url := s.PublicURL()
-	fp := s.fingerprint
+	// Nothing to pin when the chain verifies on its own: pinning a certificate
+	// that is designed to be rotated would stop every agent enrolled today
+	// from connecting the moment it renews.
+	fp := s.PinFingerprint()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	// os is whitelisted the way arch is. Serving the bash script for anything

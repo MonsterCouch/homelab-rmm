@@ -54,6 +54,13 @@
     <Property Id="CERTFILE" Secure="yes" />
     <Property Id="KEYFILE" Secure="yes" />
 
+    <!-- TAILSCALE=1 hands the certificate to the server instead of to this
+         installer. It mints one with `tailscale cert` at startup and renews it
+         on a timer, picking the new one up without a restart, which minting
+         here could not do: these certificates last 90 days, so an installer
+         that mints once only moves the outage a quarter into the future. -->
+    <Property Id="TAILSCALE" Secure="yes" />
+
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="HomelabRMM Server">
         <Component Id="ServerExe" Guid="B4D9F1C7-2E6A-4F3B-8D5C-1A7E9B2C4D60" Bitness="always64">
@@ -101,8 +108,10 @@
         Before="SetInstallServerService" Sequence="execute" Condition="PUBLICURL" />
     <SetProperty Id="CERTARG" Value=" --cert &quot;[CERTFILE]&quot; --key &quot;[KEYFILE]&quot;"
         Before="SetInstallServerService" Sequence="execute" Condition="CERTFILE AND KEYFILE" />
+    <SetProperty Id="TSARG" Value=" --tailscale-cert"
+        Before="SetInstallServerService" Sequence="execute" Condition="TAILSCALE AND NOT CERTFILE" />
     <SetProperty Id="InstallServerService"
-        Value="&quot;[INSTALLFOLDER]rmm-server.exe&quot; install --listen &quot;[LISTEN]&quot; --data &quot;[DATADIR]&quot;[PUBLICURLARG][CERTARG]"
+        Value="&quot;[INSTALLFOLDER]rmm-server.exe&quot; install --listen &quot;[LISTEN]&quot; --data &quot;[DATADIR]&quot;[PUBLICURLARG][CERTARG][TSARG]"
         Before="InstallServerService" Sequence="execute" />
     <CustomAction Id="InstallServerService" BinaryRef="Wix4UtilCA_X64" DllEntry="WixQuietExec64"
         Execute="deferred" Impersonate="no" Return="check" />

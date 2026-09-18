@@ -69,6 +69,8 @@ func newFlagSet(name string) (*flag.FlagSet, *server.Config, *string) {
 	fs.StringVar(&cfg.PublicURL, "public-url", "", "URL agents use to reach this server, e.g. https://rmm.lan:8443")
 	fs.StringVar(&cfg.CertFile, "cert", "", "your own TLS certificate (PEM) instead of the generated one")
 	fs.StringVar(&cfg.KeyFile, "key", "", "private key for --cert (PEM)")
+	fs.BoolVar(&cfg.TailscaleCert, "tailscale-cert", false,
+		"get the certificate from `tailscale cert` and keep it renewed (needs HTTPS certificates enabled for the tailnet)")
 	fs.BoolVar(&cfg.Insecure, "insecure", false, "serve plain HTTP (only behind a TLS-terminating reverse proxy)")
 	fs.StringVar(&cfg.DevWebDir, "dev-web", "", "serve the UI from this directory instead of the embedded build")
 	proxies := fs.String("trusted-proxies", "", "comma-separated IPs/CIDRs whose X-Forwarded-For header is trusted")
@@ -157,6 +159,9 @@ func installArgs(cfg server.Config) []string {
 	}
 	if cfg.CertFile != "" {
 		args = append(args, "--cert", cfg.CertFile, "--key", cfg.KeyFile)
+	}
+	if cfg.TailscaleCert {
+		args = append(args, "--tailscale-cert")
 	}
 	if cfg.Insecure {
 		args = append(args, "--insecure")

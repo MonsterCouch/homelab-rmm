@@ -563,7 +563,7 @@ func (s *Server) handleListEnroll(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"tokens": t, "public_url": s.PublicURL(), "fingerprint": s.fingerprint})
+	writeJSON(w, 200, map[string]any{"tokens": t, "public_url": s.PublicURL(), "fingerprint": s.PinFingerprint(), "cert_fingerprint": s.Fingerprint()})
 }
 
 func (s *Server) handleCreateEnroll(w http.ResponseWriter, r *http.Request) {

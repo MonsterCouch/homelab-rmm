@@ -609,7 +609,7 @@ func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 	var dbSize int64
 	s.db.QueryRow(`SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()`).Scan(&dbSize)
 	writeJSON(w, 200, map[string]any{
-		"version": Version, "public_url": s.PublicURL(), "fingerprint": s.fingerprint,
+		"version": Version, "public_url": s.PublicURL(), "fingerprint": s.Fingerprint(), "pin_fingerprint": s.PinFingerprint(),
 		"data_dir": s.cfg.DataDir, "db_bytes": dbSize, "uptime": int64(time.Since(s.startedAt).Seconds()),
 		"agents_connected": len(s.hub.OnlineIDs()),
 		// "" unless the certificate does not cover public_url, in which case

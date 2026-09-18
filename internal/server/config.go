@@ -12,15 +12,18 @@ import (
 // that works on a bare Windows box: data under ProgramData, HTTPS on :8443
 // with a self-signed certificate generated on first run.
 type Config struct {
-	DataDir   string // database, certificate, uploads
-	Listen    string // address:port for HTTPS
-	CertFile  string // optional operator-supplied certificate
-	KeyFile   string
-	PublicURL string // what agents and links use to reach the server, e.g. https://rmm.lan:8443
-	DevWebDir string // serve UI from this directory instead of the embedded build (development)
-	LogLevel  string
-	Insecure  bool // plain HTTP (behind a reverse proxy that terminates TLS)
-	SkipSeed  bool // do not create the starter scripts/rules on first run (tests)
+	DataDir  string // database, certificate, uploads
+	Listen   string // address:port for HTTPS
+	CertFile string // optional operator-supplied certificate
+	KeyFile  string
+	// TailscaleCert makes the server get its certificate from
+	// `tailscale cert` and keep it renewed. Ignored when CertFile is set.
+	TailscaleCert bool
+	PublicURL     string // what agents and links use to reach the server, e.g. https://rmm.lan:8443
+	DevWebDir     string // serve UI from this directory instead of the embedded build (development)
+	LogLevel      string
+	Insecure      bool // plain HTTP (behind a reverse proxy that terminates TLS)
+	SkipSeed      bool // do not create the starter scripts/rules on first run (tests)
 	// TrustedProxies lists CIDRs whose X-Forwarded-For header is believed
 	// (the reverse proxy in front of --insecure). Empty = never trust it.
 	TrustedProxies []string
