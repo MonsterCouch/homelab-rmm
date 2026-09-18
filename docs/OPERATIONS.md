@@ -514,3 +514,24 @@ New-NetFirewallRule -DisplayName 'Homelab RMM server (Tailscale only)' -Directio
 Neither package is code-signed, so SmartScreen and reputation-based antivirus
 will have an opinion on a fresh machine. That is expected; see the antivirus
 notes in the README.
+
+### Keeping a Tailscale certificate alive
+
+`tailscale cert` issues a 90-day certificate and the server reads its
+certificate only at startup, so a working install starts failing three months
+later unless something renews it. `deploy\renew-tailscale-cert.ps1` re-mints,
+re-locks the key to SYSTEM and Administrators, and restarts the service **only
+when the file actually changed**. Register it as a weekly SYSTEM task:
+
+```
+$script = 'C:\ProgramData\HomelabRMM-Server\renew-tailscale-cert.ps1'
+$a = New-ScheduledTaskAction -Execute powershell.exe `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$script`""
+$t = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 3am
+$p = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName 'Homelab RMM cert renewal' -Action $a -Trigger $t -Principal $p
+```
+
+It logs to `cert-renewal.log` beside the data directory. Run it by hand once
+after registering, to see it report the days remaining rather than waiting a
+week to find out it does not work.
