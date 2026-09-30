@@ -20,23 +20,21 @@ Go structs in the same package (`Agent`, `Script`, `Run`, `Task`, `Automation`, 
   same-origin check instead.
 - `GET /api/auth/state` → `{needs_setup, setup_code_required, user, version}`. When
   `needs_setup` is true the UI shows the first-run form and calls
-  `POST /api/auth/setup {username,password,email,code}` → `{ok:true}` plus the session cookie.
-  `setup_code_required` is true whenever setup still has to happen — there is no exemption for
-  any source address, loopback included. The server prints a one-time setup code at startup while
-  it has no users (console and `server.log`) and every setup request must send it as `code`. 403
-  on a wrong code, 403 once a user exists, 429 when rate-limited (the setup endpoint shares the
-  login limiter). Concurrent requests are serialised, so exactly one of them creates the
-  administrator.
+  `POST /api/auth/setup {username,password,email}` → `{ok:true}` plus the session cookie.
+  `setup_code_required` reports `false`; no one-time setup code is required on first run.
+  403 once a user exists, 429 when rate-limited (the setup endpoint shares the login limiter).
+  Concurrent setup requests are serialised (`Server.setupMu`), so exactly one of them creates the
+  administrator and subsequent requests are rejected with 403.
 - `POST /api/auth/login {username,password,code}` → `{ok,user}` or `{needs_totp:true}` (re-post
   with the 6-digit `code`). 401 on bad credentials, 429 when rate-limited.
 - `POST /api/auth/logout`.
 - `POST /api/me/password {current,new}` changes your own password and **deletes your other
   sessions**; the calling session survives.
-- Roles: `admin` (everything), `tech` (everything except users/settings), `viewer` (read-only:
-  every POST/PUT/PATCH/DELETE returns 403, and so do the GETs that are not really reads —
-  `/ws/shell/{id}`, `/ws/desktop/{id}`, `/api/agents/{id}/fs/download`, the sensitive event-log
-  channels (see [Event log](#event-log)) and `GET /api/enroll`, whose body carries the enrollment
-  token values).
+- Roles: `admin` (everything), `tech` (operations, scripts, runs, device management; can be scoped
+  by `org_scope`), `viewer` (read-only: every POST/PUT/PATCH/DELETE returns 403, and so do the GETs
+  that are not really reads — `/ws/shell/{id}`, `/ws/desktop/{id}`, `/api/agents/{id}/fs/download`,
+  the sensitive event-log channels (see [Event log](#event-log)) and `GET /api/enroll`), `poc`
+  (Point of Contact for client ticketing portal).
 - The client address used by the rate limiter and the audit log is the peer address.
   `X-Forwarded-For` is honoured only when the peer is inside a network given to
   `--trusted-proxies` / `RMM_TRUSTED_PROXIES`, and then the list is read from the **right**,
@@ -55,6 +53,8 @@ Go structs in the same package (`Agent`, `Script`, `Run`, `Task`, `Automation`, 
 changed[{check_id,from,to}], changed_truncated?}` — a notification, not data: refetch). Each has
 `{kind, agent_id, data}` JSON in the data field. An `EventSource` only receives named events it has
 a listener for, so a new kind has to be added to `KINDS` in `web/src/hooks/useEvents.tsx` as well.
+For users with an assigned `org_scope`, events are tenant-filtered at the hub layer (VULN-014) so
+technicians never receive telemetry or state changes for devices outside their scope.
 
 ## Endpoints
 
@@ -68,10 +68,12 @@ See `routes()` in `internal/server/api.go`. Highlights:
   [Event log](#event-log)), `GET .../fs?path=`,
   `GET .../fs/download?path=` (binary), `POST .../fs/upload?path=` (raw body),
   `POST .../fs/delete|mkdir {path}`, `POST .../fs/rename {from,to}`,
+  `POST .../isolate {isolate: true|false}` (device network quarantine: host firewall lockdown blocking non-RMM traffic while preserving control channel),
   `POST .../power {action: reboot|shutdown|lock|logoff, delay_sec, message}` — `poweroff` and
   `halt` are accepted as aliases of `shutdown`, `logout` as an alias of `logoff`; `delay_sec` is a
   grace period honoured for reboot, shutdown and logoff, while lock is always immediate,
   `POST .../wol`,
+  `POST .../update` (dispatches self-update instruction to agent),
   `POST .../run {script_id | language+body, args, timeout_sec}` → `{run_id}` (409 when the run
   cannot start, including a `script_id` whose `os_filter` does not match the device),
   `GET .../patches` → `{patches, last_scan, scan_error}` (`scan_error` is what the agent said went
@@ -101,10 +103,16 @@ See `routes()` in `internal/server/api.go`. Highlights:
   the session ends when the viewer has not answered for 90 s. The device's helper is then closed
   with `1001` and the reason `the viewer stopped answering`, so a phone that slept mid-session
   does not leave the operator's screen being captured for nobody.
+- Organizations & Sites: `GET /api/organizations`, `POST /api/organizations` (`{name}`, admin only),
+  `PUT /api/organizations/{id}` (`{name}`, admin only), `DELETE /api/organizations/{id}` (admin only),
+  `GET /api/organizations/{id}/sites`, `GET /api/sites` (all accessible sites),
+  `POST /api/organizations/{id}/sites` (`{name}`, admin only),
+  `PUT /api/sites/{id}` (`{name}`, admin only), `DELETE /api/sites/{id}` (admin only).
 - Groups `/api/groups`, enrollment `/api/enroll` (POST returns `{token, windows, linux}` install
-  commands; GET returns `{tokens, public_url, fingerprint}`). `GET /install/{token}?os=windows|linux&arch=`
-  renders the install script and is unauthenticated, but only for a token that could still enroll
-  (404 otherwise) and an `arch` of `amd64|arm64|arm|386` (400 otherwise).
+  commands; GET returns `{tokens, public_url, fingerprint}`).
+  `GET /install/{token}?os=windows|linux&arch=` renders the install script (unauthenticated, live token only).
+  `GET /install/{token}/msi` downloads the Windows MSI installer with embedded configuration tag overlay.
+  `GET /install/{token}/deb?arch=amd64|arm64` dynamically builds and streams a configured Debian `.deb` package.
 - Scripts `/api/scripts`, `POST /api/scripts/run {script_id|language+body, args, targets|agent_ids}`
   → `{runs: {agentId: runId|"error: ..."|"skipped: ..."}}`, runs `/api/runs?agent=&limit=`,
   `/api/runs/{id}` (includes stdout/stderr, live while running), `POST /api/runs/{id}/cancel`.
@@ -159,8 +167,34 @@ See `routes()` in `internal/server/api.go`. Highlights:
   `winget upgrade` lists for the agent's service account, the agent refuses to install them, and
   the server leaves them out of `all:true` approvals and of "install everything approved". Sending
   one explicitly comes back as a per-id failure, and the rest of the batch still installs.
-- Admin: `/api/settings` (GET/PUT `Settings`), `POST /api/settings/test-mail`, `/api/users`,
-  `GET /api/audit?limit=`, `GET /api/system`, `GET /api/dashboard`.
+- Software Catalog: `GET /api/software-catalog?os=`, `POST /api/software-catalog` (admin only: `{name, description, publisher, version, category, icon, install_cmd, uninstall_cmd, update_cmd, os}`),
+  `GET /api/software-catalog/{id}`, `PUT /api/software-catalog/{id}` (admin only), `DELETE /api/software-catalog/{id}` (admin only),
+  `POST /api/agents/{id}/software/install` (`{catalog_id?, custom_cmd?}` - `custom_cmd` requires admin),
+  `POST /api/agents/{id}/software/uninstall` (`{catalog_id?, custom_cmd?}` - `custom_cmd` requires admin).
+- IT Ticketing: `GET /api/tickets?org_id=&site_id=&status=&priority=&agent_id=&assigned_to=&limit=`,
+  `POST /api/tickets` (`{subject, description, requester_name, requester_email, requester_phone?, priority, status?, org_id?, site_id?, agent_id?}`),
+  `GET /api/tickets/{id}` (returns ticket with `comments` array), `PUT /api/tickets/{id}`, `DELETE /api/tickets/{id}` (admin only),
+  `POST /api/tickets/{id}/comments` (`{body, is_internal?}`), `GET /api/agents/{id}/tickets`.
+- Network Discovery & SNMP: `GET /api/discovered-devices?org_id=&site_id=&status=&device_type=`,
+  `GET /api/discovered-devices/{id}`, `PUT /api/discovered-devices/{id}` (`{status?, device_type?, hostname?, org_id?, site_id?}`),
+  `DELETE /api/discovered-devices/{id}`, `POST /api/discovered-devices/{id}/poll` (SNMP v2c poll directly or via agent),
+  `GET /api/network-scans`, `POST /api/network-scans` (`{subnet, agent_id?}` - private IPv4 /22 to /30; server-side scans without `agent_id` require admin).
+- Client Portal (token pass or session): `POST /api/agent/portal-pass` (agent mints 15-minute portal pass token),
+  `GET /portal/start?pass=` (redeems pass token and sets portal cookie),
+  `GET /api/portal/config` (device identity, org/site, domain user, is_poc),
+  `GET /api/portal/software` (self-service catalog items with installation status),
+  `POST /api/portal/software/action` (`{software_id, action: "install"|"uninstall"|"update", agent_id?}`),
+  `GET /api/portal/runs/{id}` (poll self-service run status for caller's agent),
+  `GET /api/portal/tickets`, `GET /api/portal/tickets/{id}`,
+  `POST /api/portal/tickets` (`{subject, description, requester_name, requester_email?, requester_phone?, priority?}`),
+  `POST /api/portal/tickets/{id}/comments` (`{body}`).
+- In-Place & Fleet Updates: `GET /api/server/version` (version, arch, staged update status),
+  `POST /api/server/update` (admin only: in-place server executable swap & service restart),
+  `POST /api/agents/update-all` (admin only: fleet-wide agent update trigger),
+  `POST /api/agents/{id}/update` (dispatch update to specific agent),
+  `GET /api/agent/update-check` (unauthenticated version probe).
+- Admin: `/api/settings` (GET/PUT `Settings`), `POST /api/settings/test-mail`,
+  `/api/users` (manage accounts, roles, and `org_scope`), `GET /api/audit?limit=`, `GET /api/system`, `GET /api/dashboard`.
 
 ## Event log
 

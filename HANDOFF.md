@@ -13,20 +13,25 @@ automation combined with ScreenConnect's remote desktop.
 
 - **Server** (`cmd/rmm-server`, `internal/server`): one Go binary, SQLite (pure Go, no cgo),
   self-signed HTTPS with certificate pinning for agents, embedded React console, WebSocket hub
-  for agents, sessions + TOTP, roles (admin / tech / viewer), audit log, SMTP alerts.
+  for agents, sessions + TOTP, roles (admin / tech / viewer), multi-tenancy (Organizations & Sites),
+  technician scoping (`org_scope`), software catalog, IT ticketing, network discovery & SNMP scanner,
+  audit log, SMTP alerts, and in-place self-updating (`/api/server/update`).
 - **Agent** (`cmd/rmm-agent`, `internal/agent`): one Go binary for Windows and Linux, runs as
   a service, outbound-only connection, inventory, metrics, scripts (PowerShell, cmd, bash, sh,
   python), services, processes, event log / journal, files, power, Wake-on-LAN, patching
-  (Windows Update Agent, apt/dnf/pacman/zypper), remote shell (ConPTY / pty), remote desktop
-  helper (`internal/agent/desktop`, spawned into the interactive session), and the baselines
-  engine (`internal/agent/baseline*.go`).
+  (Windows Update Agent, apt/dnf/pacman/zypper), device network quarantine (`isolate`),
+  remote shell (ConPTY / pty), remote desktop helper (`internal/agent/desktop`, spawned into the
+  interactive session with privacy banner and multi-monitor switching), portal pipe server
+  (`internal/portalpipe`), and the baselines engine (`internal/agent/baseline*.go`).
+- **Desktop Companion** (`cmd/rmm-desktop`): lightweight tray client for Windows end users and
+  technicians. Connects to `rmm-agent` via Named Pipe `\\.\pipe\homelab-rmm-portal` or directly
+  to an RMM server, providing portal pass generation and support launcher.
 - **Baselines** (`internal/baselines` shared validator, `internal/server/*baselines*`,
   `web/src/pages/Baseline*.tsx`): desired-state checks with drift alerts and self-healing.
   Contract and kind reference: `docs/BASELINES.md`.
-- **Console** (`web/`): Vite + React + TypeScript, embedded via `web/embed.go` from `web/dist`.
-  It now carries a phone pass: a DataTable card renderer under ~700 px, sheet-style modals,
-  coarse-pointer tap targets, a terminal key bar, a trackpad gesture model for the remote
-  desktop, and `web/src/lib/host.ts`, the bridge the Android shell talks to.
+- **Console & Portal** (`web/`): Vite + React + TypeScript, embedded via `web/embed.go` from `web/dist`.
+  Features administrative management, multi-tenant scoping, software catalog, ticketing, network discovery,
+  and a dedicated end-user client portal (`/portal`).
 - **Android** (`android/`, its own Gradle build): the pinned-trust foundation of a WebView
   shell around the console. `:trust` is a pure-JVM module (fingerprint, sealed server list,
   pairing URI, trust store) with 51 passing tests; the app module has the AndroidKeyStore
@@ -34,11 +39,11 @@ automation combined with ScreenConnect's remote desktop.
   builds an installable APK. The WebView stack and the real screens are NOT written yet -
   the Activities are placeholders whose comments name the task that replaces each one.
   Design and task list: `docs/ANDROID.md`.
-- Size: about 45k lines of Go, 17k of TypeScript, 2.8k of Kotlin. History is linear.
+- Size: about 50k lines of Go, 18k of TypeScript, 2.8k of Kotlin. History is linear.
 
 Read in this order: `README.md`, `docs/ARCHITECTURE.md`, `docs/API.md`,
 `docs/BASELINES.md`, `docs/DESKTOP-PROTOCOL.md`, `docs/SECURITY.md`,
-`docs/OPERATIONS.md`, `docs/DEVELOPMENT.md`.
+`docs/OPERATIONS.md`, `docs/DEVELOPMENT.md`, `docs/ROADMAP.md`.
 
 ## Toolchain
 
@@ -68,7 +73,7 @@ RMM_AGENT_DIR=./tmp/agent go run ./cmd/rmm-agent install --server http://127.0.0
 RMM_AGENT_DIR=./tmp/agent go run ./cmd/rmm-agent run
 ```
 
-First run prints a one-time **setup code** in the log; the setup form always asks for it.
+First run: navigating to the web console prompts to create the initial administrator account. The check and creation are atomic under an exclusive mutex (`setupMu`) and require no setup code. Subsequent setup requests return 403 Forbidden.
 
 End-to-end smoke with a real Linux agent (83 steps, the strongest check we have):
 
@@ -127,6 +132,17 @@ the new version and fix the compare links at the bottom).
   `v0.2.0-43-g1e3fc5d` where a Windows build used to stamp `dev`, wrote six archives and
   SHA256SUMS, and the stale-binary guard then refused to package once a source file was
   touched, naming the file and the target to rebuild.
+- **Enterprise Security Audit Suite (`internal/server/security_audit_test.go`):** 16 comprehensive
+  vulnerability test cases (`VULN-001` through `VULN-016`) verify tenant isolation (`org_scope`),
+  IDOR prevention, enrollment hijacking protection, dynamic fleet tag bypass defenses, SSE stream
+  tenant isolation, subnet scan bounds, and admin route gating.
+- **Device Network Quarantine:** Verified on Linux (`iptables` `RMM_ISOLATE` chain) and Windows
+  (`netsh advfirewall` prefix rules), isolating host network traffic while preserving RMM connectivity.
+- **Local IPC Security:** Verified Named Pipe DACL hardening (`internal/portalpipe`) on Windows
+  denying remote network logons and permitting interactive users.
+- **Deployment Packaging & In-Place Updates:** Verified Tagged MSI binary configuration trailers
+  (`[HOMELAB_RMM_CONFIG]`), dynamic Debian package generation (`internal/server/install_package_test.go`),
+  and server in-place binary swapping (`/api/server/update`).
 
 ## What has NOT been verified
 
@@ -150,7 +166,8 @@ the new version and fix the compare links at the bottom).
 
 ## Known open items
 
-1. **No LICENSE file.** Archives ship a placeholder. Pick one.
+1. ~~No LICENSE file.~~ **Closed 2026-09-18**: MonsterCouch proprietary licence (`LICENSE`)
+   committed to repo root and automatically packaged into all release archives.
 2. ~~Windows build tooling.~~ **Closed 2026-09-16**: `tools\build.ps1` was executed on real
    Windows, stamps the real version, and its stale-binary guard fires. See "How it was verified".
 3. Drift alerts cannot link back to the baseline and check that raised them: the alerts API
@@ -159,8 +176,9 @@ the new version and fix the compare links at the bottom).
 4. Baseline maintenance windows are not enforced on the device (no window field in
    `protocol.AgentConfig`); flap counters and log throttles are in memory and reset on
    server restart.
-5. Agent self-update: the agent implements `agent.update` (download, SHA-256 check, swap),
-   but nothing on the server triggers it yet.
+5. ~~Agent self-update & server in-place update~~ **Closed**: Server in-place updates
+   (`POST /api/server/update`) and fleet agent updates from staged packages in `agents/` are
+   implemented and operational.
 6. Console `--text-faint` contrast is below WCAG AA for de-emphasised text app-wide.
 6a. **The Android app is one stage of three.** `docs/ANDROID.md` holds the full task list;
    what remains is the WebView stack (the single pin call site, the host bridge, downloads,

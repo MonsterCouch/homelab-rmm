@@ -52,7 +52,14 @@ desktop helper runs in-process instead of being spawned. Omit `--fingerprint` fo
 server; for the TLS dev server pass the fingerprint printed at startup (or leave it empty and
 accept that the self-signed certificate is then rejected by the system store).
 
-`Ctrl-C` stops either binary cleanly (`internal/svc` runs the same function the service manager
+**Desktop companion (`rmm-desktop`)** on Windows:
+
+```bash
+go run ./cmd/rmm-desktop
+```
+It connects to the local agent over `\\.\pipe\homelab-rmm-portal` or can be pointed at an RMM server with `--server-url URL` (`--mode agent|server`).
+
+`Ctrl-C` stops any binary cleanly (`internal/svc` runs the same function the service manager
 would).
 
 ## Tests
@@ -60,9 +67,10 @@ would).
 ```bash
 go vet ./...
 go test ./...
-go test ./internal/server/ -run EndToEnd -v  # full server path with a fake agent (no OS access needed)
-go test ./internal/server/ -run Seed -v    # default library / rules / groups / policy
-cd web && npm run build                     # type-check + bundle
+go test ./internal/server/ -run EndToEnd -v           # full server path with a fake agent (no OS access needed)
+go test ./internal/server/ -run TestSecurityAudit_ -v  # multi-tenancy & security isolation audit suite (VULN-001 - VULN-016)
+go test ./internal/server/ -run Seed -v               # default library / rules / groups / policy
+cd web && npm run build                              # type-check + bundle
 ```
 
 `make test` (or `tools/build.sh test`, `tools/build.ps1 -Target test`) runs all three. Platform
@@ -78,6 +86,13 @@ make server      # rmm-server: windows/amd64, windows/arm64, linux/amd64, linux/
 make agents      # rmm-agent: the same four plus linux/arm (GOARM=7)
 make package     # dist/homelab-rmm-<os>-<arch>.zip (+ .tar.gz for linux), SHA256SUMS
 make VERSION=v1.2.3 package
+```
+
+On Windows, `tools\build.ps1` supports the same targets plus Windows-specific desktop and MSI artifacts:
+
+```powershell
+tools\build.ps1 -Target desktop   # rmm-desktop: windows/amd64 and windows/arm64
+tools\build.ps1 -Target msi       # builds WiX MSI installers for server and agent
 ```
 
 `make server` embeds whatever is in `web/dist` at that moment — run `make web` (or `make all`)
@@ -191,19 +206,16 @@ Example: a new `disk.smart` request that returns S.M.A.R.T. health for each disk
 
 ## Releasing
 
-`v0.1.0` is tagged and published, with the six archives and `SHA256SUMS` attached to it by CI, so
-the download URLs in `README.md` resolve. The repository still has no `LICENSE`, so
-`tools/build.sh` puts a placeholder in every archive — including the ones already released. That
-is the one release chore still outstanding.
+Release archives and `SHA256SUMS` are attached to GitHub releases by CI. The repository root contains
+the proprietary `LICENSE` file which the packaging scripts (`tools/build.sh`, `tools/build.ps1`, and `Makefile`)
+automatically bundle into every distribution archive.
 
-1. Add a `LICENSE` file (the packagers copy it into every archive as soon as it exists; until
-   then they write "No LICENSE file is present in this build").
-2. Update `CHANGELOG.md` — move `[Unreleased]` to the new version with a date, and add its
+1. Update `CHANGELOG.md` — move `[Unreleased]` to the new version with a date, and add its
    compare link at the bottom of the file.
-3. `git tag v1.2.3 && git push --tags`.
-4. CI builds, tests and attaches `homelab-rmm-<os>-<arch>.zip`, the linux `.tar.gz` files and
+2. `git tag v1.2.3 && git push --tags`.
+3. CI builds, tests, and attaches `homelab-rmm-<os>-<arch>.zip`, the linux `.tar.gz` files, and
    `SHA256SUMS` to the GitHub Release.
-5. Check that the README's release note still reads true for the new version — in particular the
+4. Check that the README's release note still reads true for the new version — in particular the
    line about which features `releases/latest` now carries.
 
 Packaging by hand: `make package` is safe on its own — it depends on `server agents`, so it

@@ -5,7 +5,40 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-09-18
+### Added
+- **Multi-Tenancy Hierarchy (Organizations & Sites):** Manage multi-client fleets under distinct
+  Organizations with physical Sites, technician assignment (`org_scope`), and tenant isolation.
+- **Client Self-Service Portal & Desktop Companion (`rmm-desktop`):**
+  - Token-authenticated end-user portal (`/portal`) for requesting help, tracking tickets, and running approved self-service scripts.
+  - Windows tray companion (`cmd/rmm-desktop`) with Named Pipe IPC (`\\.\pipe\homelab-rmm-portal`) and DACL hardening (`pipeSDDL`).
+- **Integrated IT Ticketing:** Multi-tenant ticketing workflow with status tracking (open, in-progress, resolved, closed),
+  public client comments, and internal technician-only notes (`is_internal: true`).
+- **Software Catalog:** Global repository of reusable software packages with automated silent install/uninstall
+  commands, platform targeting, and tracked deployments.
+- **Network Discovery & SNMP Polling:** Subnet discovery scanner and built-in SNMP (v2c) polling engine
+  for detecting routers, switches, NAS, and printers, mapping open ports, and managing unmanaged network assets.
+- **Device Network Quarantine (Isolation):** One-click device isolation via `POST /api/agents/{id}/isolate`.
+  Applies `iptables` rules on Linux or Windows Advanced Firewall policies on Windows, isolating the endpoint from
+  all network traffic while preserving bidirectional RMM communication.
+- **Remote Desktop Multi-Monitor & Privacy Banner:** Multi-monitor display switching (`monitor` message) and a
+  topmost, click-through, non-interactive overlay privacy banner on Windows to notify local users during remote sessions.
+- **Zero-Touch Deployment Packaging:**
+  - **Tagged MSI Overlay:** Dynamic 8 KB configuration trailer (`[HOMELAB_RMM_CONFIG]`) appended to `rmm-agent.msi` for
+    zero-argument double-click installation and seamless GPO/Intune deployment.
+  - **Dynamic Debian Generator:** On-the-fly Debian `.deb` package generation (`/install/{token}/deb`) containing pre-compiled
+    agent binaries, systemd unit definitions, and embedded enrollment configs.
+- **In-Place Server Self-Updating:** `POST /api/server/update` performs atomic binary replacement of `rmm-server`,
+  synchronizes updated agent packages in the `agents/` directory, and restarts the service gracefully.
+
+### Security & Hardening
+- **Security Audit Mitigations (VULN-001 - VULN-016):**
+  - Strict tenant IDOR verification across all agent, task, baseline, and ticket endpoints (`VULN-001`, `VULN-006`).
+  - Fleet tag bypass prevention: dynamic intersection of tag selectors with user's `org_scope` (`VULN-007`, `VULN-015`, `VULN-016`).
+  - Admin role enforcement on server updates, global software catalog entries, discovery scans, and audit logs (`VULN-003`, `VULN-008`, `VULN-011`, `VULN-013`).
+  - Real-time Server-Sent Events (SSE) stream tenant isolation to prevent event leakage (`VULN-014`).
+  - Rate limiting and bounds checking on subnet scans and UDP SNMP packet decoding (`VULN-004`, `VULN-005`).
+- **First-Run Setup Simplification:** Removed the setup code requirement. First-run administrator creation is guarded
+  atomically via exclusive mutex (`setupMu`) on `POST /api/auth/setup`, closing immediately upon creation.
 
 **First run on real Windows.** Everything Windows-specific had only ever been cross-compiled and
 reviewed. On 2026-09-15 the agent was installed as a service on a Windows 11 workstation, every
@@ -36,12 +69,9 @@ the protocol; old agents keep working.
   certificate is still pinned, because nothing else vouches for it. `GET /api/enroll` reports both
   `fingerprint` (what to pin, empty when there is nothing to) and `cert_fingerprint` (what is
   actually served).
-- **`rmm-server setup-code`** prints the one-time first-run code the console asks for. The code is
-  minted in memory and never stored, so its only durable copy is the `setup_code=` attribute of
-  the FIRST RUN warning in `server.log` — the one place an operator cannot find it when the
-  service starts the server and stderr goes nowhere. The command reads it back, says so instead
-  of printing a spent code once an account exists, and tells you to restart when the log holds
-  none. The setup form's hint now names it first.
+- **`rmm-server setup-code` command:** Retained for backward compatibility; prints an informational
+  notice stating that first-run setup codes are no longer required, directing operators to configure
+  the initial administrator account directly via the web console.
 - **`tools\build.ps1 -Platforms`** restricts the cross-compile, e.g. `-Platforms windows/amd64`.
   The MSI target consumes only that pair, so the release job no longer builds nine binaries on
   the expensive runner to package two.

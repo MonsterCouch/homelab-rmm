@@ -1,39 +1,50 @@
 # Architecture
 
-Homelab RMM is two Go binaries and a React single-page application. This document describes how
-they fit together; the wire types in `internal/protocol/protocol.go` and the route table in
-`internal/server/api.go` are the source of truth when the two disagree.
+Homelab RMM is three Go binaries (`rmm-server`, `rmm-agent`, `rmm-desktop`) and a React single-page
+application. This document describes how they fit together; the wire types in
+`internal/protocol/protocol.go` and the route table in `internal/server/api.go` are the source of truth
+when the two disagree.
 
 ## 1. Components
 
 ```
  browser ──HTTPS/WSS──▶ rmm-server ◀──WSS (outbound from device)── rmm-agent (service, SYSTEM/root)
-   SPA + SSE               │ ▲                                        │
-                           │ └────── WSS /ws/desktop-agent ────── rmm-agent desktop-helper
-                        SQLite                                      (interactive session)
+   SPA + SSE               │ ▲                                        │ ▲
+                           │ └────── WSS /ws/desktop-agent ──────     │ │ Named Pipe IPC
+                        SQLite          rmm-agent desktop-helper      │ │ \\.\pipe\homelab-rmm-portal
+                                          (interactive session)       ▼ │
+                                                                  rmm-desktop (tray companion / portal)
 ```
 
 | Component | Where | Role |
 |---|---|---|
-| `rmm-server` (`cmd/rmm-server`, `internal/server`) | one binary, Windows service / systemd / Docker | HTTPS listener (`:8443`), embedded web UI, JSON API, agent WebSocket endpoint, SQLite store, alert engine, scheduler, mailer, relays |
-| `rmm-agent` (`cmd/rmm-agent`, `internal/agent`) | every managed device, as SYSTEM or root | keeps one outbound WebSocket, pushes inventory and metrics, answers requests (scripts, shell, files, services, updates, power, desktop) |
-| desktop helper (`rmm-agent desktop-helper`, `internal/agent/desktop`) | spawned by the agent inside the interactive session | captures the screen and injects input; connects back to the server on its own socket |
+| `rmm-server` (`cmd/rmm-server`, `internal/server`) | one binary, Windows service / systemd / Docker | HTTPS listener (`:8443`), embedded web UI, JSON API, agent WebSocket endpoint, SQLite store, alert engine, scheduler, mailer, relays, multi-tenancy, ticketing, catalog, discovery |
+| `rmm-agent` (`cmd/rmm-agent`, `internal/agent`) | every managed device, as SYSTEM or root | keeps one outbound WebSocket, pushes inventory and metrics, answers requests (scripts, shell, files, services, updates, power, desktop, isolation, discovery), exposes portal Named Pipe on Windows |
+| `rmm-desktop` (`cmd/rmm-desktop`) | Windows workstations / laptops | lightweight desktop application with system tray companion; runs in `agent` mode (client self-service portal & IT ticketing companion via local Named Pipe IPC) or `server` mode (standalone operator console wrapper) |
+| desktop helper (`rmm-agent desktop-helper`, `internal/agent/desktop`) | spawned by the agent inside the interactive session | captures the screen and injects input; connects back to the server on its own socket; displays session privacy banner |
 | web UI (`web/`) | built to `web/dist`, embedded with `go:embed` (`web/embed.go`) | React 18 + TypeScript, xterm.js terminal, uPlot charts |
 | `internal/protocol` | shared | envelope and every message type |
+| `internal/portalpipe` | Windows agent & companion | secure Named Pipe IPC (`\\.\pipe\homelab-rmm-portal`) between agent service and `rmm-desktop` |
+| `internal/netscan` | server & agent | local subnet ARP/ICMP scanning and SNMP v2c querying |
+| `internal/winsec` | Windows agent & server | Windows ACL, SDDL, and security descriptor utilities |
 | `internal/svc` | shared | `kardianos/service` wrapper: install/uninstall/start/stop as a Windows service or systemd unit |
 
 ### Repository layout
 
 ```
-cmd/rmm-server, cmd/rmm-agent   entry points, flag parsing, service specs
+cmd/rmm-server, cmd/rmm-agent   server and agent entry points, flag parsing, service specs
+cmd/rmm-desktop                 Windows desktop client companion (WebView2 + system tray)
 internal/protocol               wire types (envelope, requests, replies)
 internal/baselines              desired-state param types, validation and limits, shared by both sides
-internal/server                 config, TLS, db + migrations, auth, hub, api_*.go, runs, alerts,
-                                scheduler, patches, baselines, mail, relay (shell + desktop), static,
-                                install, seed
+internal/portalpipe             Windows Named Pipe IPC for client portal communication
+internal/netscan                network discovery ARP sweeps, ICMP ping sweeps, SNMP querying
+internal/winsec                 Windows security descriptors, DACL helpers, and token inspection
+internal/server                 config, TLS, db + migrations, auth, hub, api_*.go, orgs, tickets,
+                                software_catalog, discovery, snmp, portal, portal_auth, runs,
+                                alerts, scheduler, patches, baselines, mail, relay, update, install
 internal/agent                  agent core (agent.go, conn.go, config.go), per-feature files with
-                                _windows.go / _linux.go implementations; platform_other.go is the contract
-internal/agent/desktop          capture, tiling, input injection, session launch, helper TLS
+                                _windows.go / _linux.go implementations; platform_other.go contract
+internal/agent/desktop          capture, tiling, input injection, display selection, privacy banner
 internal/svc                    service manager wrapper
 web/                            SPA source; web/dist is embedded
 tools/                          build.sh, build.ps1
@@ -269,36 +280,83 @@ bcrypt passwords, TOTP (`pquerna/otp`), 14-day session tokens in `sessions`, coo
 header required on every non-GET API call (only its presence is checked — a cross-site form
 cannot set any custom header; the console sends `fetch`), a 10-per-minute login limiter per client IP, roles `admin` / `tech`
 (no users or settings) / `viewer` (read-only — `requireWrite` also covers `/ws/shell/{id}`,
-`/ws/desktop/{id}`, the file download and `GET /api/enroll`, whose body carries token values).
+`/ws/desktop/{id}`, the file download and `GET /api/enroll`, whose body carries token values) / `poc` (Point of Contact for client ticketing).
 Changing your own password deletes your other sessions. The three `/api/auth/*` endpoints sit on
 the outer mux, outside `requireUser`, so `authGuard` gives them the same CSRF check plus an
 `Origin`/`Host` match and a JSON `Content-Type` requirement. `clientIP` uses the peer address and
 reads `X-Forwarded-For` only when the peer is inside one of `Server.trustedProxies`
 (`--trusted-proxies`); it then scans the hop list right-to-left past hops that are themselves
 trusted proxies, because the proxies in `deploy/` append to the header rather than replacing it,
-which makes the left-most hop attacker-chosen. While the user table is empty, `Server.setupCode`
-(a random hex value minted in `New`, printed at startup) is required by `POST /api/auth/setup`
-from every source address including loopback, and `Server.setupMu` makes the "no users yet?"
-check and the insert one step so a first-run window cannot create two administrators.
+which makes the left-most hop attacker-chosen. While the user table is empty, first-run setup is open
+at `POST /api/auth/setup` without requiring a setup code. `Server.setupMu` makes the "no users yet?"
+check and the insert one atomic step so a first-run window cannot create multiple administrators,
+and setup closes permanently once the first account is created.
+
+### Multi-Tenancy & Scoping (`orgs.go`)
+A 3-tier organizational hierarchy: Organizations and Sites. Agents, enrollment tokens, tickets, and
+network devices are assigned an `org_id` and `site_id` (defaulting to `org_default` and `site_default`).
+Operators with the `tech` role can be assigned an `org_scope` (`[]string{org_id, ...}`) that restricts
+their visibility and management strictly to their assigned tenants. Tenant boundaries are enforced
+across device queries, script execution, file transfers, ticketing, scheduled tasks (VULN-007),
+automations (VULN-008), baseline evaluations (VULN-009), agent updates (VULN-011), and Server-Sent
+Events (VULN-014).
+
+### Client Portal & Companion IPC (`portal.go`, `portal_auth.go`)
+End-user self-service portal accessible via browser or the native `rmm-desktop` Windows system tray
+companion. Communication between the Windows agent service and the desktop companion uses local
+Named Pipe IPC (`\\.\pipe\homelab-rmm-portal`, `internal/portalpipe`) with Windows DACLs securing access
+to the interactive user token. The portal enables non-administrative users to browse and install approved
+applications from the Software Catalog and create and track IT support tickets. Portal sessions are
+isolated such that client callers cannot view administrative runs (VULN-012) or other machines.
+
+### IT Ticketing System (`tickets.go`)
+Integrated helpdesk ticketing tracking service requests from end-users or internal technician dispatch.
+Tickets track lifecycle status (`open`, `in_progress`, `waiting`, `resolved`, `closed`), priority,
+requester information, assigned technician, and organization/site scoping. `ticket_comments` stores
+conversation history with an `is_internal` flag that separates public client-visible comments from
+confidential internal technician notes (VULN-006).
+
+### Software Catalog (`software_catalog.go`)
+Centralized library of software applications available for fleet deployment or end-user self-service.
+Catalog items define install, uninstall, and upgrade commands (winget or custom installers), publisher,
+version, OS targets, and icons. Creation, modification, and deletion of catalog entries are strictly
+restricted to administrators (VULN-003).
+
+### Network Discovery & SNMP Polling (`discovery.go`, `snmp.go`, `internal/netscan`)
+Discovers unmanaged network hardware via ARP sweeps and ICMP ping sweeps over defined CIDR subnets.
+Subnet sizes are bounded (private IPv4 /22 to /30, 1024 hosts maximum) to prevent network denial of service (VULN-004). SNMP polling (v2c)
+retrieves system name, description, uptime, and network interfaces using a memory-safe ASN.1 parser
+(VULN-005). Network scans can be initiated on the server (admin-only, VULN-013) or delegated to an
+enrolled agent within the target subnet.
+
+### In-Place Server & Fleet Updates (`update.go`)
+- **Server in-place upgrade**: `GET /api/server/version` checks running binary attributes and detects
+  staged server executables in `<data>/update/` or `dist/`. `POST /api/server/update` (admin-only)
+  performs an in-place atomic executable file swap and commands the service manager (`internal/svc`)
+  to restart the server daemon.
+- **Agent fleet updates**: `POST /api/agents/{id}/update` and `POST /api/agents/update-all` (admin-only,
+  VULN-011) push update notifications to agents, directing them to download the matching agent binary
+  from `/api/agent-download/`, verify SHA-256 integrity, swap binaries, and restart.
+
+### Device Network Isolation / Quarantine (`internal/agent/isolate_*.go`)
+`POST /api/agents/{id}/isolate` (with `{"isolate": true}` to isolate or `{"isolate": false}` to release)
+triggers host-level firewall lockdown (Windows Advanced Firewall / netsh advfirewall on Windows, iptables on Linux).
+All inbound and outbound IP traffic is blocked, with explicit exceptions carved out only for outbound TCP to the
+RMM server's IP/port and local UDP 53/67/68 for DNS and DHCP.
 
 ### Static UI (`static.go`)
 Serves `web/dist` from the embedded filesystem (or `--dev-web DIR`), immutable caching for
 `/assets/`, and falls back to `index.html` for client-side routes.
 
-### Agent binaries and install scripts (`install.go`)
-`GET /api/agent-download/{file}` serves `rmm-agent-<os>-<arch>[.exe]` from `<data>/agents/`, then
-`<dir of rmm-server>/agents/`, then `<dir of rmm-server>/`, unauthenticated (the binary is not a
-secret; enrollment still needs a token — and the install script checks what it downloaded).
-`GET /install/{token}?os=windows|linux&arch=` renders the bootstrap script with the public URL,
-token, certificate fingerprint, public-key pin and `agentBinarySHA256` baked in (one hash per
-architecture for Linux, where `uname -m` decides). The script verifies that hash before it runs
-the binary and pins the download connection to the server certificate, so the unauthenticated
-download endpoint is not an unverified one. The script itself is piped into a root shell, so its
-inputs are whitelisted before they reach it: the token must match `^[A-Za-z0-9_-]{16,64}$` and
-still pass `checkEnrollToken` (404 otherwise), `arch` must be one of `amd64|arm64|arm|386` (400
-otherwise), and every interpolated value goes through `psQuote` / `shQuote` for the single-quoted
-literal it lands in (`render` substitutes `@@NAME@@` placeholders in one pass, so a value cannot
-introduce another).
+### Agent binaries and install scripts (`install.go`, `install_deb.go`)
+- `GET /api/agent-download/{file}`: serves `rmm-agent-<os>-<arch>[.exe]` from `<data>/agents/`, then
+  `<dir of rmm-server>/agents/`, then `<dir of rmm-server>/`, unauthenticated.
+- `GET /install/{token}?os=windows|linux&arch=`: renders bootstrap script with pinned fingerprint and hash.
+- `GET /install/{token}/msi`: serves the Windows MSI installer with a custom appended configuration tag
+  overlay (`[HOMELAB_RMM_CONFIG]...[END_HOMELAB_RMM_CONFIG]`) containing the server URL, token, and
+  certificate fingerprint for zero-configuration GPO/Intune rollouts.
+- `GET /install/{token}/deb?arch=`: dynamically generates a native Debian `.deb` package on demand in pure
+  Go, bundling the Linux agent binary, systemd service unit, and pre-configured `/etc/homelab-rmm/agent.json`.
 
 ### Seed data (`seed.go`)
 On a fresh database `seedDefaults` inserts the starter script library (17 scripts across
@@ -322,10 +380,12 @@ slice in `db.go`, applied in order and tracked in `PRAGMA user_version`.
 | Table | Purpose | Notable columns |
 |---|---|---|
 | `settings` | key/value config: `public_url`, `smtp`, `agent_defaults`, `retention`, `seeded`, `seeded_baselines`, `last_patch_scan:<agent>`, `last_patch_scan_error:<agent>` | |
-| `users`, `sessions` | operators and their cookies | `role`, `totp_secret`, `totp_enabled`, `expires_at` |
+| `users`, `sessions` | operators and their cookies | `role` (`admin`, `tech`, `viewer`, `poc`), `org_scope` (JSON array of org IDs for technician scoping), `totp_secret`, `totp_enabled`, `expires_at` |
+| `organizations` | 3-tier MSP customer / organization boundaries | `id` (TEXT PK), `name` (unique NOCASE), `created_at` |
+| `sites` | physical locations or sub-tenants within an organization | `id` (TEXT PK), `org_id` (FK), `name`, `created_at`, `UNIQUE(org_id, name)` |
 | `groups` | device groups | unique `name` |
-| `enroll_tokens` | bootstrap tokens | `uses_left` (-1 unlimited), `expires_at`, `group_id` |
-| `agents` | one row per device | `key_hash`, `os`, `platform`, `arch`, `tags` (JSON), `custom_fields` (JSON), `inventory` (JSON snapshot), `last_metrics` (JSON), `monitored_services`, `maintenance_until`, `pending_reboot` |
+| `enroll_tokens` | bootstrap tokens | `uses_left` (-1 unlimited), `expires_at`, `group_id`, `org_id`, `site_id` |
+| `agents` | one row per device | `key_hash`, `os`, `platform`, `arch`, `tags` (JSON), `custom_fields` (JSON), `inventory` (JSON snapshot), `last_metrics` (JSON), `monitored_services`, `maintenance_until`, `pending_reboot`, `org_id`, `site_id`, `isolated`, `isolated_at`, `isolated_by` |
 | `metrics` | time series, `(agent_id, ts)` primary key, WITHOUT ROWID | `cpu`, `mem_used`, `disks` (JSON), `net_rx/tx`, `load1`, `procs` |
 | `scripts` | library | `language`, `body`, `params` (JSON `[{name, description, default, required}]`), `timeout_sec`, `os_filter` |
 | `script_runs` | executions | `status` (`queued`, `running`, `done`, `failed`, `timeout`, `cancelled`), `trigger` (`manual`, `task`, `automation`), `args`, `stdout`, `stderr` |
@@ -334,6 +394,11 @@ slice in `db.go`, applied in order and tracked in `PRAGMA user_version`.
 | `alert_rules`, `alerts` | rules and open/acked/resolved alerts | `kind`, `params` (JSON), `severity`, `dedupe_key`, `notified` |
 | `patches` | per-device update inventory, `(agent_id, patch_id)` | `status` (`available`, `approved`, `installing`, `installed`, `failed`, `ignored`), `severity` (listed worst-first by an explicit rank, not by the TEXT column's own order; Windows reports the MSRC ratings, apt/dnf/zypper report `security`, which ranks with `Important` so a distro's security updates are never the rows a `LIMIT` drops), `categories` (always a JSON array), `source`, `downloaded`, `description` |
 | `patch_policies` | scan/install schedules | `scan_schedule`, `install_schedule`, `mode`, `reboot` |
+| `software_catalog` | repository of self-service and deployable software | `id`, `name`, `description`, `publisher`, `version`, `category`, `icon`, `install_cmd`, `uninstall_cmd`, `update_cmd`, `os` |
+| `discovered_devices` | devices identified via subnet scans / SNMP | `ip`, `mac`, `hostname`, `vendor`, `os`, `device_type`, `open_ports`, `snmp_enabled`, `snmp_sys_name`, `snmp_sys_descr`, `snmp_sys_uptime`, `snmp_interfaces`, `org_id`, `site_id`, `status` |
+| `network_scans` | history of subnet discovery jobs | `subnet`, `agent_id`, `status`, `devices_found`, `started_at`, `completed_at`, `error` |
+| `tickets` | IT helpdesk tickets | `agent_id`, `org_id`, `site_id`, `subject`, `description`, `requester_name`, `requester_email`, `requester_phone`, `status`, `priority`, `assigned_to`, `source`, `is_internal` |
+| `ticket_comments` | conversation history on tickets | `ticket_id` (FK), `author`, `is_internal` (differentiates internal notes from client-visible replies), `body` |
 | `audit` | who did what | `user`, `ip`, `action`, `target`, `details` |
 | `agent_events` | the device event timeline: `patch` progress lines pushed by the agent, `enroll` and `drift` rows written by the server. Monitored-service state is **not** here — it rides in each metrics sample and reaches operators through the alert engine | `kind`, `message`, `fields` |
 | `baselines` | desired-state definitions | `targets` (JSON), `enforce`, `interval_sec`, `enabled`, `version` |
@@ -399,32 +464,35 @@ rows.
 - `shell*.go` — pseudo-terminal sessions; `services_*.go`, `proc_*.go`, `eventlog_*.go`,
   `updates_*.go`, `power_*.go`, `files.go`, `wol.go` — the per-feature handlers;
   `platform_other.go` documents the contract each platform file fulfils.
-  `eventlog_windows.go` reads channels through `wevtutil /uni:true` (UTF-16, so text outside the
-  system ANSI code page is not folded to "?") and falls back to a second `/f:XML` pass whenever
-  wevtutil warns that it could not render a record, because `/f:RenderedXml` drops such records
-  while still exiting 0. Page sizes, the fixed search window and the level vocabulary are the
-  cross-platform contract in [API.md](API.md#event-log).
+- `isolate_windows.go` / `isolate_linux.go` — network isolation (quarantine) engine: configures host
+  firewall rules blocking all IP traffic while retaining connectivity to the server and local DNS/DHCP.
+- `portal.go` — client portal helper and local Windows Named Pipe IPC listener (`\\.\pipe\homelab-rmm-portal`,
+  `internal/portalpipe`) providing unprivileged desktop companions authenticated bridge access to the server.
 - `update.go` — `agent.update` **requires** a 64-hex SHA-256 and a URL that is `https`, or plain
   `http` only against the configured server's own host, and refuses both before it fetches
-  anything: what this installs runs as SYSTEM/root, and the TLS client pins nothing when the
-  agent has no fingerprint. It then downloads over that client, verifies the hash, swaps the
-  binary next to the running one and exits so the service manager restarts it (no server-side
-  trigger exists yet).
-- `desktop/` — see `docs/DESKTOP-PROTOCOL.md`.
+  anything. It downloads over that client, verifies the hash, swaps the binary next to the running
+  one and exits so the service manager restarts it. Triggered remotely via console or `POST /api/agents/{id}/update`.
+- `desktop/` — display capture and input injection; multi-monitor enumeration (`desktop.go`),
+  and Windows in-session privacy banner overlay (`banner_windows.go`). See `docs/DESKTOP-PROTOCOL.md`.
 
 ## 7. Configuration resolution
 
-Server: flags → `RMM_*` environment (`RMM_DATA_DIR`, `RMM_LISTEN`, `RMM_PUBLIC_URL`,
+**Server**: flags → `RMM_*` environment (`RMM_DATA_DIR`, `RMM_LISTEN`, `RMM_PUBLIC_URL`,
 `RMM_CERT_FILE`, `RMM_KEY_FILE`, `RMM_INSECURE`, `RMM_DEV_WEB_DIR`, `RMM_DEBUG`) applied on top
 (`Config.FromEnv`). `rmm-server install` bakes the flags it was given into the service definition.
 Default data directory: `%ProgramData%\HomelabRMM` on Windows, `/var/lib/homelab-rmm` as root,
 `~/.homelab-rmm` otherwise.
 
-Agent: `agent.json` in `RMM_AGENT_DIR`, else `%ProgramData%\HomelabRMM` or `/etc/homelab-rmm`.
+**Agent**: `agent.json` in `RMM_AGENT_DIR`, else `%ProgramData%\HomelabRMM` or `/etc/homelab-rmm`.
 Fields: `server_url`, `agent_id`, `key`, `enroll_token`, `fingerprint`. `baselines.json` sits
 beside it and is written by the agent only — the desired-state specs, the last report per baseline
 and the fix hold-offs — so that a device that reboots while the server is unreachable still
 evaluates. A file that will not parse is logged and ignored, never fatal.
+
+**Desktop Companion (`rmm-desktop`)**:
+- Mode: parsed from `--mode agent|server`, env `RMM_MODE`, or inferred from binary name / `%ProgramData%` server markers (defaults to `agent` mode).
+- Server URL: parsed from `--server-url`, env `RMM_SERVER_URL` / `RMM_PUBLIC_URL`, Windows registry `HKLM\Software\HomelabRMM\ServerURL`, or `%ProgramData%\HomelabRMM\client_info.json`. Falls back to `https://localhost:8443`.
+- Webview2 profile: stored in `%LOCALAPPDATA%\HomelabRMM-Agent\WebView2` (or `HomelabRMM-Server`).
 
 ## 8. Versioning
 

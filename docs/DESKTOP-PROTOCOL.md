@@ -103,3 +103,25 @@ scales from its canvas size to `screen.w`/`screen.h`).
   `--token` is still accepted and takes precedence, as a developer override for running
   `rmm-agent desktop-helper` by hand; the helper drops the variable from its own environment as
   soon as it has read it, so nothing it starts inherits the token.
+
+## Privacy banner overlay & multi-monitor support
+
+- **Session privacy banner (Windows)**:
+  To prevent covert surveillance and inform the local user that remote management is active, the
+  desktop helper displays a topmost overlay banner (`HomelabRMM - Remote Support Active`) across
+  the active monitor. The banner is created using Win32 layered click-through window styles
+  (`WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE`). This ensures:
+  - Clicks and touches pass directly through to the underlying applications without interference.
+  - The banner never steals keyboard input focus or activates over fullscreen games/apps.
+  - When the remote session ends or disconnects, the window and its GDI resources are destroyed
+    immediately (`DestroyWindow`).
+
+- **Multi-monitor display switching**:
+  The helper queries display bounds across all attached monitors via GDI (`EnumDisplayMonitors` /
+  `GetSystemMetrics`) or X11/XRandR.
+  - The initial `screen` text frame enumerates all monitors (`monitors: [...]`) along with resolutions
+    and offsets.
+  - The web viewer provides a display selector dropdown. Sending `{"t":"monitor","index":<n>}` switches
+    active capture to the selected display index (e.g. index 0 for primary, 1 for secondary).
+  - The helper responds with an updated `screen` frame and an immediate full-frame refresh in the
+    new monitor's coordinate space.

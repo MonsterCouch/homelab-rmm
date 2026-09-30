@@ -1,6 +1,6 @@
-# Homelab RMM — Long-Term Architectural Roadmap & Future Plans
+# Architectural Roadmap & Future Capabilities
 
-This document tracks enterprise-grade capabilities identified during market comparisons (e.g. against NinjaOne, Datto RMM, ConnectWise) that are deferred for future consideration beyond our core roadmap.
+This document tracks enterprise-grade capabilities identified during market comparisons (e.g., against NinjaOne, Datto RMM, ConnectWise) that are planned for future development beyond the core Homelab RMM platform.
 
 ---
 
@@ -9,8 +9,8 @@ This document tracks enterprise-grade capabilities identified during market comp
 - **Architecture**:
   - Integration with storage backends (local NAS via SMB/NFS, S3-compatible cloud storage like MinIO, Wasabi, AWS S3, Backblaze B2).
   - Deduplication and client-side AES-256 encryption.
-  - Granular self-service file restoration from the web console.
-- **Alternative / Current Recommendation**: Pair with dedicated self-hosted backup utilities such as Proxmox Backup Server, Veeam Community Edition, Kopia, or Restic.
+  - Granular self-service file restoration from the web console and client portal.
+- **Current Recommendation**: Pair with dedicated self-hosted backup utilities such as Proxmox Backup Server, Veeam Community Edition, Kopia, or Restic.
 
 ---
 

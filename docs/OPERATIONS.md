@@ -101,10 +101,9 @@ directly and can run while the service is up (SQLite WAL with a 5 s busy timeout
 
 - **Server**: `server.log` in the data directory and stderr (journal / Event Log / `docker logs`).
   Startup prints `listening addr=… tls=… fingerprint=… data=… version=…`; the fingerprint line is
-  what agents pin, and on a first run the one-time setup code is printed beside it. Agent
-  connects/disconnects, enrollments, alerts opened and tasks run are logged at info. Two `WARN`
-  lines are worth alerting on: `agent record re-keyed by enrollment` (a device took over an
-  existing, offline device record — see the audit note below) and `first-run setup refused`.
+  what agents pin. Agent connects/disconnects, enrollments, alerts opened and tasks run are logged
+  at info. Two `WARN` lines are worth alerting on: `agent record re-keyed by enrollment` (a device
+  took over an existing, offline device record — see the audit note below) and `first-run setup refused`.
 - **Agent**: `agent.log` in the config directory, on Windows as on Linux. `connected server=…
   agent_id=…` means all is well; `session ended err=… retry_in=…` shows why it is reconnecting.
   Two `WARN` lines matter: `agent key rejected, re-enrolling with stored token` (the server no
@@ -451,6 +450,28 @@ certificate. Omit it when the certificate is publicly trusted — one from
 `tailscale cert` is — and the agent uses system trust, which also means nothing
 has to be re-pinned when that certificate renews.
 
+**Tagged MSI (Zero-Touch Enrollment).** In addition to command-line properties, the server can
+dynamically append a binary configuration overlay trailer (`[HOMELAB_RMM_CONFIG]...[END_HOMELAB_RMM_CONFIG]`)
+directly to `rmm-agent.msi` when downloaded via the web console (`/install/{token}/msi`).
+When launched, the installer reads the embedded trailer to extract `SERVER`, `TOKEN`, and optional
+`FINGERPRINT`, enabling zero-parameter double-click installation or silent mass deployment via Active
+Directory GPO or Microsoft Intune:
+
+```
+msiexec /i HomelabRMM-Agent.msi /qn
+```
+
+**Debian / Ubuntu Package (`.deb`).** For Debian and Ubuntu endpoints, the web console provides
+dynamic `.deb` package generation via `/install/{token}/deb?arch=amd64`.
+The server builds an `ar` binary package containing the pre-compiled `rmm-agent` executable, the
+systemd unit (`HomelabRMMAgent.service`), and an embedded `agent.json` pre-configured with the
+enrollment token and server URL. Install cleanly with:
+
+```bash
+sudo dpkg -i homelab-rmm-agent_amd64.deb
+```
+The service starts and registers automatically upon package installation.
+
 The package installs to `C:\Program Files\HomelabRMM`, an administrators-only
 directory, and then runs the agent's own `install` subcommand, so exactly one
 tested code path writes `agent.json`, registers the service and confirms it
@@ -534,3 +555,39 @@ $t = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 3am
 $p = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
 Register-ScheduledTask -TaskName 'Homelab RMM cert renewal' -Action $a -Trigger $t -Principal $p
 ```
+
+## 10. Server in-place updates
+
+Homelab RMM supports in-place server self-updating without manual binary replacement:
+
+1. **Check for Updates**: Navigate to *Settings → System* in the web console or call `GET /api/system`.
+   The server checks for staged binaries in `dist/` or updates matching the release tag.
+2. **Apply Update**: Click **Update Server** or invoke `POST /api/server/update` with admin credentials.
+3. **Execution**:
+   - The server inspects the running binary path (`os.Executable()`).
+   - It stages the replacement binary and synchronizes updated `rmm-agent*` binaries to the server's
+     `agents/` directory so fleet devices can be updated from the console.
+   - It performs an atomic binary swap (`rmm-server.exe` / `rmm-server`) and initiates a graceful service restart.
+   - Ongoing agent connections reconnect automatically within seconds.
+
+## 11. Desktop tray companion (`rmm-desktop`)
+
+`rmm-desktop` provides a lightweight system tray application for end users and technicians on Windows:
+
+- **Agent Companion Mode**: Launched without flags in an interactive user session:
+  ```cmd
+  rmm-desktop.exe
+  ```
+  It discovers the local `rmm-agent` service via Named Pipe (`\\.\pipe\homelab-rmm-portal`), displays
+  a system tray icon with connectivity status, and allows the user to open the client self-service
+  portal or review open tickets in one click.
+- **Server URL & Console Mode**:
+  By default, `rmm-desktop` discovers the server URL from local agent configuration (`agent.json`), Windows registry (`HKLM\Software\HomelabRMM\ServerURL`), or `--server-url`:
+  ```cmd
+  rmm-desktop.exe --server-url https://rmm.example.lan:8443
+  ```
+  Pass `--mode server` to open the administrative web console in a dedicated WebView2 window rather than the client self-service portal.
+- **Deployment**:
+  Can be configured to run at user logon via Group Policy, Active Directory login script, or by
+  placing a shortcut in `%ProgramData%\Microsoft\Windows\Start Menu\Programs\Startup` or adding an
+  entry under `HKLM\Software\Microsoft\Windows\CurrentVersion\Run`.

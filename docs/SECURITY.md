@@ -19,9 +19,10 @@ the console reachable on the LAN or over a VPN. Adversaries considered:
    theft.
 5. **Password guessing** against the console.
 
-Not designed for: exposing the console to the public internet, multi-tenant hosting, or
-adversaries with root on the server host (they have everything: the SQLite file, the TLS key,
-the SMTP password).
+Not designed for: exposing the console to the untrusted public internet without a reverse proxy/VPN,
+or adversaries with root/administrator access on the server host (they have everything: the SQLite file,
+the TLS private key, the SMTP credentials). Multi-tenancy (Organizations and Sites) is supported and
+enforces strict cross-tenant isolation and technician scoping.
 
 ## What is protected, and how
 
@@ -85,21 +86,13 @@ rate-limited to 10 attempts per minute per client address, and failed logins are
 Changing your own password **deletes your other sessions**, so reacting to a stolen cookie by
 changing the password actually ends it.
 
-**First-run setup.** Until an account exists, `POST /api/auth/setup` would hand the first
-administrator account — which is root on every device you later enroll — to whoever asked first.
-A server that starts with an empty user table therefore mints a random **one-time setup code**
-and prints it to the console and to `server.log` in the data directory. Every setup request must
-present it (compared in constant time, and rate-limited like a login), **including one from
-`127.0.0.1`**: a loopback peer address says nothing about who is at the far end of a same-host
-reverse proxy, nothing about which local user on the server is asking, and nothing about whether
-a page in the operator's own browser made the request. Requiring the code means whoever completes
-setup has demonstrated they can read the server's console or log. The code is spent the moment
-the administrator exists; it is minted per start, so if you lose it, restart the server before
-anyone creates a user and read the new one.
-
-The check and the insert run under one lock, so a first-run window produces exactly one
-administrator however many requests arrive at once — the bcrypt hash between them used to be a
-wide enough gap for eight.
+**First-run setup.** Until an account exists, `POST /api/auth/setup` creates the initial
+administrator account — which has administrative control over every device enrolled in the system.
+The check ("are there any users?") and the creation run atomically under an exclusive mutex
+(`s.setupMu`), guaranteeing that exactly one administrator can be created during first-run setup
+regardless of concurrency or network timing. As soon as the first account is created,
+`/api/auth/setup` is permanently closed and all subsequent attempts return HTTP 403 Forbidden.
+`GET /api/auth/state` reports `needs_setup: true` and `setup_code_required: false` when uninitialized.
 
 `/api/auth/setup`, `/api/auth/login` and `/api/auth/logout` sit outside the session middleware,
 so they carry their own CSRF guard: `X-Requested-With` is required, the `Origin` host must match
@@ -402,8 +395,9 @@ neither the script nor the download.
   timeline. Keep tokens single-use and short-lived, and treat either entry, if you did not cause
   it, as an incident.
 - **Remote desktop shows whatever is on screen**, including the lock screen and UAC prompts on
-  Windows (by design, via the SYSTEM token). Sessions are audited; there is no on-screen consent
-  prompt for the person at the device.
+  Windows (by design, via the SYSTEM token). Sessions are audited. On Windows, an overlay privacy
+  banner (`HomelabRMM - Remote Support Active`) is displayed across active monitors to inform the
+  local user whenever a remote desktop session is active.
 - **A `tech` can still make a device run code on a timer.** The admin gate covers the `command`,
   privileged-`file` and `allow_reboot` kinds, but a write account can create a baseline of the
   other kinds, enable it, enforce it and have every matched device act on it every minute. The
@@ -416,6 +410,87 @@ neither the script nor the download.
   why the endpoint is audited, needs the write role, and needs **admin** for exactly the drafts
   saving would need admin for (a `command` check, a `file` check outside the managed trees, an
   `allow_reboot` check).
+
+## Multi-Tenancy Scoping, RBAC & Hardening (VULN-001 - VULN-016)
+
+The platform supports multi-tenant MSP/homelab operations through Organizations and Sites,
+backed by strict tenant-scoping defenses and role-based access control:
+
+1. **Tenant & Target Scoping (`org_scope`)**:
+   - Users with the `tech` role can be assigned an `org_scope` (list of organization IDs). When
+     configured, visibility and operational authority are strictly bounded to that scope.
+   - **IDOR Protection (`VULN-001`)**: All agent endpoints (`/api/agents/{id}/*` — including script
+     execution, file downloads, process killing, service management, device isolation, and deletion)
+     enforce tenant boundaries. Requests for agents outside the caller's `org_scope` return
+     `404 Not Found` rather than `403 Forbidden` to prevent tenant resource enumeration.
+   - **Enrollment Hijacking Defense (`VULN-002`)**: Agents cannot adopt existing records or cross
+     tenant boundaries without matching cryptographic keys. Technicians cannot reassign an agent's
+     `org_id` or `site_id` via `PATCH /api/agents/{id}` (`VULN-010`).
+   - **Ticketing & Comment PII Separation (`VULN-006`)**: Tickets are isolated by organization.
+     Internal technician notes (`is_internal: true`) are restricted to technicians and admins, and
+     are never exposed to end users via the client portal token interface.
+   - **Fleet Tag Bypass Prevention (`VULN-007`, `VULN-015`, `VULN-016`)**: When a scoped technician
+     schedules an ad-hoc task, configures a patch automation policy, or sets an alert rule using
+     tags or fleet selectors, the target agent set is dynamically intersected with the technician's
+     `org_scope` in the database. Technicians cannot reach unassigned tenant devices by targeting
+     common tags (e.g. `tag:servers`).
+   - **Baseline & Preview Scoping (`VULN-009`)**: Baselines evaluate and enforce exclusively against
+     devices inside the user's permitted organizations. Baseline previews (`POST /api/baselines/preview`)
+     similarly execute dry runs only on scoped agents.
+   - **SSE Stream Tenant Isolation (`VULN-014`)**: The real-time Server-Sent Events stream
+     (`GET /api/events`) filters all agent heartbeats, status updates, metrics, and ticket events
+     against the subscriber's `org_scope`. Technicians never receive event frames for other tenants.
+
+2. **Role Restrictions & Admin Gates**:
+   - **Software Catalog (`VULN-003`)**: Creating, editing, or deleting global software packages
+     (`/api/software-catalog`) requires the `admin` role. Technicians can trigger installs on scoped
+     devices, but cannot alter package repositories or binaries.
+   - **Automations & Fleet Updates (`VULN-008`, `VULN-011`)**: Accessing or modifying event automations
+     (`/api/automations`, `VULN-008`), triggering fleet-wide agent updates (`POST /api/agents/update-all`, `VULN-011`),
+     in-place server updates (`POST /api/server/update`), and full system audit logs (`/api/audit`) require full `admin` rights.
+   - **Network Subnet Scanning (`VULN-013`)**: Initiating server-side network scans without an agent probe
+     (`POST /api/network-scans`) requires the `admin` role (`VULN-013`). Technicians can only dispatch scans via online agents in their `org_scope`.
+
+3. **Protocol & Parser Hardening**:
+   - **Subnet Scan Bounding (`VULN-004`)**: Subnet discovery sweeps enforce strict CIDR bounds: targets
+     must be private or loopback IPv4 ranges between /22 (1024 hosts maximum) and /30 (public and link-local ranges
+     are rejected), preventing network flood or worker pool exhaustion.
+   - **SNMP Packet Bounds (`VULN-005`)**: The internal SNMP v2c scanner parses UDP responses with strict
+     buffer bounds, validated ASN.1 BER TLV lengths, and maximum recursion depth (32 levels), preventing buffer
+     over-reads and panic conditions from malformed network responses.
+   - **Client Portal Run Isolation (`VULN-012`)**: Device-authenticated portal users (`GET /api/portal/runs/{id}`)
+     can only inspect runs triggered by the client portal on their own machine, preventing inspection of administrative runs or other devices.
+
+4. **Device Network Isolation (Quarantine)**:
+   - When an endpoint is suspected of compromise, operators can isolate it via
+     `POST /api/agents/{id}/isolate` with `{"isolate": true}` (or release with `{"isolate": false}`).
+   - **Linux**: Creates an `iptables` chain (`RMM_ISOLATE`) at the top of `INPUT` and `OUTPUT`.
+     It permits loopback (`lo`), established connections, DNS (port 53), DHCP (ports 67/68), and
+     outbound TCP traffic to the RMM server's host and port. All other traffic is dropped.
+   - **Windows**: Configures Windows Advanced Firewall (`netsh advfirewall`) rules prefixed
+     `HomelabRMM-Isolate-`, setting default profile policy to block inbound and outbound traffic
+     while allowing loopback, DNS, and traffic to the RMM server IP and port.
+   - In both cases, the RMM control channel remains alive for triage, script execution, and remote
+     de-isolation.
+
+5. **Named Pipe IPC Security (`rmm-desktop`)**:
+   - The desktop tray companion communicates with the elevated `rmm-agent` on Windows via Named
+     Pipe `\\.\pipe\homelab-rmm-portal`.
+   - The pipe DACL is hardened via SDDL: `D:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`:
+     - `D;;GA;;;NU`: Explicit denial for Network Users to prevent remote access over SMB/file sharing.
+     - `PIPE_REJECT_REMOTE_CLIENTS`: Rejects cross-machine pipe connections at the kernel level.
+     - `SYSTEM` and `Administrators`: Full Control (`GA`).
+     - Interactive Users (`IU`): Generic Read and Write (`GRGW`) to request portal passes.
+     - Pipe connections enforce a concurrency limit (`maxClients = 8`) and a 30-second client
+     deadline to prevent pipe slot starvation.
+
+6. **Remote Desktop Multi-Monitor & Privacy Banner**:
+   - Remote desktop streaming captures display frames across primary and secondary monitors. The
+     client can switch active displays via protocol messages (`{"t":"monitor","index":<n>}`).
+   - On Windows, a topmost, click-through, non-interactive overlay banner
+     (`HomelabRMM - Remote Support Active`) is rendered across active monitors using layered window
+     styling (`WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE`) to ensure
+     users are clearly informed when remote control is taking place.
 
 ## Recommendations
 

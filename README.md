@@ -50,16 +50,14 @@ and its own script library and baseline kinds. It is simply not where the depth 
   before you save it. Fleet and per-device compliance scores.
 - **Remote terminal** — PowerShell, cmd, bash or sh in a real pseudo-terminal (ConPTY on Windows)
   from the browser.
-- **Remote desktop** — screen streaming with tile diffing, mouse and keyboard, multi-monitor,
-  clipboard paste, Ctrl-Alt-Del; works on the logon screen and UAC prompts on Windows; X11 on
-  Linux.
-- **Device tools** — processes (kill), services (start/stop/restart/enable/disable), Windows
-  event log and journald viewer, file browser with upload/download/rename/delete, reboot,
-  shutdown, lock, log off, and **Wake-on-LAN** relayed through another agent on the same subnet.
-- **Organisation** — groups, tags, custom fields, notes, display names.
-- **Users** — admin / tech / viewer roles (a viewer looks at everything and changes nothing: no
-  writes, and no terminal, remote desktop, file download or enrollment token either), TOTP
-  two-factor authentication, session management, password reset from the CLI.
+- **Remote desktop** — screen streaming with tile diffing, mouse and keyboard, multi-monitor display switching, privacy session banner overlay, clipboard paste, Ctrl-Alt-Del; works on the logon screen and UAC prompts on Windows; X11 on Linux.
+- **Device tools** — processes (kill), services (start/stop/restart/enable/disable), Windows event log and journald viewer, file browser with upload/download/rename/delete, device network isolation / quarantine (firewall lockdown with management channel retention), reboot, shutdown, lock, log off, and **Wake-on-LAN** relayed through another agent on the same subnet.
+- **Multi-tenancy & Organisation** — 3-tier hierarchy (Organizations and Sites), technician scoping (`org_scope`), groups, tags, custom fields, notes, display names.
+- **IT Ticketing** — integrated helpdesk ticketing with status workflow, priority, technician assignment, organization scoping, and public client comments vs confidential internal technician notes.
+- **Software Catalog** — repository of approved software applications (winget and custom installers) with fleet deployment and end-user self-service availability.
+- **Client Portal & Companion** — `rmm-desktop` client companion in the Windows notification area communicating over local Named Pipe IPC (`\\.\pipe\homelab-rmm-portal`); end-user self-service software installation and ticket submission.
+- **Network Discovery & SNMP** — subnet sweeps (ARP/ICMP ping sweeps) and SNMP hardware polling (v2c) for switches, routers, printers, and unmanaged devices.
+- **Users** — admin / tech / viewer roles (a viewer looks at everything and changes nothing: no writes, and no terminal, remote desktop, file download or enrollment token either; technicians can be scoped to specific organizations), TOTP two-factor authentication, session management, password reset from the CLI.
 - **Audit log** of every action with user and source address.
 
 ## Screenshots
@@ -213,6 +211,13 @@ them anyway. The server package installs them by default, since that is where an
 
 Build both packages with `tools\build.ps1 -Target all,msi`; see
 [docs/OPERATIONS.md](docs/OPERATIONS.md) for the server package and its properties.
+
+### Pre-configured packages (MSI overlay & Debian .deb)
+
+For zero-configuration deployment:
+
+- **Windows Tagged MSI**: Download `https://<server>/install/<token>/msi`. The server appends a configuration overlay tag directly to the base MSI containing the server URL, token, and fingerprint. Running `msiexec /i HomelabRMM-Agent.msi /qn` installs and enrolls the agent without requiring command-line properties.
+- **Debian / Ubuntu Package (`.deb`)**: Download `https://<server>/install/<token>/deb?arch=amd64` (or `arm64`). Dynamically generated on demand in pure Go, the package installs `/usr/bin/rmm-agent`, registers the `HomelabRMMAgent.service` systemd unit, and configures `/etc/homelab-rmm/agent.json`. Install with `sudo dpkg -i homelab-rmm-agent_amd64.deb`.
 
 ### The one-liners
 
@@ -384,17 +389,15 @@ state machine, the API and the console.
   place (it holds the device identity). Delete the binary and the config yourself, or use
   `deploy/uninstall.ps1` / `deploy/uninstall.sh` (`-Purge` / `--purge` removes the config too).
   Then delete the device in the console so it does not linger as offline.
-- **Update**: re-run the enrollment one-liner with a fresh token. It stops the service, swaps the
-  binary and re-installs; because `agent.json` already exists for the same server, the device
-  keeps its identity and history. Alternatively stop the service, replace the binary and start
-  it. A push-from-console self-update is on the roadmap (the protocol already has
-  `agent.update`).
-- **Re-enroll** (after a server certificate change or a deleted device): run the one-liner
-  again. An agent whose key was revoked on the server and that still has its original token
-  re-enrolls by itself.
+- **Update**: update agents directly from the web console (*Devices → Actions → Update Agent* or fleet-wide *Update All Agents* via `POST /api/agents/update-all`), which checks staged agent binaries on the server, verifies SHA-256 hashes, swaps the binary, and restarts the service. Alternatively, re-run an enrollment package or one-liner with a fresh token. Because `agent.json` already exists for the same server, the device keeps its identity and history.
+- **Re-enroll** (after a server certificate change or a deleted device): run the one-liner or package again. An agent whose key was revoked on the server and that still has its original token re-enrolls by itself.
 
 ## Upgrading the server
 
+**In-place upgrade (recommended)**:
+When a new server binary is placed in `<data>/update/` (or `dist/`), the console displays an update notification under *Settings → System*. Admins can trigger an in-place upgrade with one click (*Update Server*) or via `POST /api/server/update`. The server verifies the staged binary, swaps the executable in place, and restarts the service automatically.
+
+**Manual upgrade**:
 1. Stop the service (`rmm-server stop`, `systemctl stop HomelabRMMServer` or `docker compose down`).
 2. Replace `rmm-server(.exe)` and the `agents/` folder with the new release (Docker: rebuild or
    pull, then `docker compose up -d`).
@@ -495,8 +498,7 @@ The full threat model, what is and is not protected, and recommendations are in
 
 ## Roadmap
 
-- Agent self-update pushed from the console (`agent.update` exists in the protocol; the
-  server-side release manager does not yet).
+- Native endpoint & cloud backups, mobile device management (MDM), and commercial EDR orchestration (see [docs/ROADMAP.md](docs/ROADMAP.md)).
 - Wayland capture for the Linux remote desktop.
 - macOS agent (the platform contract in `internal/agent/platform_other.go` is ready for it).
 - Published container images and signed releases.
@@ -507,13 +509,15 @@ The full threat model, what is and is not protected, and recommendations are in
 
 | Document | Contents |
 |---|---|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | components, connection model, wire protocol, database schema, alert engine, scheduler, patch flow, desktop relay |
-| [docs/OPERATIONS.md](docs/OPERATIONS.md) | paths, service control, logs, backup and restore, reverse proxies, custom certificates, retention, moving the server |
-| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | dev loop, running an agent locally, tests, cross-compiling, adding a request type end to end |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | components, connection model, wire protocol, database schema, multi-tenancy, ticketing, catalog, discovery, alerts, scheduler, patch flow, desktop relay |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | paths, service control, logs, backup and restore, packaged deployments (MSI overlays & Debian packages), reverse proxies, in-place server upgrades, retention |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | dev loop, running an agent locally, building `rmm-desktop`, tests, cross-compiling, adding a request type end to end |
 | [docs/BASELINES.md](docs/BASELINES.md) | desired state: check kinds, the state machine, versions, ingest, the API and the console |
-| [docs/SECURITY.md](docs/SECURITY.md) | threat model and recommendations |
-| [docs/API.md](docs/API.md) | HTTP API and event stream |
-| [docs/DESKTOP-PROTOCOL.md](docs/DESKTOP-PROTOCOL.md) | remote desktop wire format |
+| [docs/SECURITY.md](docs/SECURITY.md) | threat model, multi-tenancy scoping, hardening mitigations (VULN-001–VULN-016), device quarantine, and recommendations |
+| [docs/API.md](docs/API.md) | HTTP API and Server-Sent Events stream |
+| [docs/DESKTOP-PROTOCOL.md](docs/DESKTOP-PROTOCOL.md) | remote desktop wire format, multi-monitor display switching, and session privacy banner |
+| [docs/ANDROID.md](docs/ANDROID.md) | Android companion shell architecture, certificate pinning, and trust model |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | long-term architectural roadmap and enterprise integrations |
 | [CHANGELOG.md](CHANGELOG.md) | release notes |
 
 ## Building from source
