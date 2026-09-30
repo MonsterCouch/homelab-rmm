@@ -98,23 +98,27 @@ export const KINDS: KindDef[] = [
     id: 'service',
     label: 'Service / unit',
     os: ['windows', 'linux'],
-    help: 'A service must be running or stopped, optionally with a start type.',
+    help: 'A service is installed (or prohibited/absent), running or stopped, optionally with a start type.',
     fixable: true,
-    fixNote: 'Starts or stops the service and sets the start type. A Windows boot/system driver start type is never changed; systemd has no "manual" to set.',
-    keys: ['name', 'state', 'start_type'],
+    fixNote: 'Starts or stops the service and sets the start type, or executes a custom remediation script.',
+    keys: ['name', 'state', 'start_type', 'fix_script', 'fix_lang'],
     defaults: () => ({ name: '', state: 'running', start_type: 'any' }),
-    summary: (p) => `${str(p, 'name') || '(no name)'} ${str(p, 'state')}${str(p, 'start_type') && str(p, 'start_type') !== 'any' ? ` / ${str(p, 'start_type')}` : ''}`,
+    summary: (p) => `${str(p, 'name') || '(no name)'} ${str(p, 'state')}${str(p, 'start_type') && str(p, 'start_type') !== 'any' ? ` / ${str(p, 'start_type')}` : ''}${str(p, 'fix_script') ? ' · custom fix script' : ''}`,
   },
   {
     id: 'package',
-    label: 'Package',
+    label: 'Software / Package',
     os: ['windows', 'linux'],
-    help: 'A package is installed (optionally at a minimum version) or absent.',
+    help: 'Software is installed (optionally checking version) or prohibited (not installed).',
     fixable: true,
-    fixNote: 'Linux installs or removes with the system package manager. On Windows this is check-only unless "allow winget" is set, because winget is not usable from the agent service account.',
-    keys: ['name', 'state', 'min_version', 'allow_winget'],
-    defaults: () => ({ name: '', state: 'present' }),
-    summary: (p) => `${str(p, 'name') || '(no name)'} ${str(p, 'state')}${str(p, 'min_version') ? ` ≥ ${str(p, 'min_version')}` : ''}`,
+    fixNote: 'Installs or uninstalls with custom remediation script, Linux package manager, or Windows winget.',
+    keys: ['name', 'state', 'min_version', 'version', 'version_op', 'allow_winget', 'fix_script', 'fix_lang'],
+    defaults: () => ({ name: '', state: 'installed' }),
+    summary: (p) => {
+      const v = str(p, 'version') || str(p, 'min_version');
+      const op = str(p, 'version_op') || '≥';
+      return `${str(p, 'name') || '(no name)'} ${str(p, 'state')}${v ? ` ${op} ${v}` : ''}${str(p, 'fix_script') ? ' · custom fix script' : ''}`;
+    },
   },
   {
     id: 'registry',
@@ -209,9 +213,9 @@ export const KINDS: KindDef[] = [
     help: 'The device has not been waiting for a reboot longer than max_hours.',
     fixable: true,
     fixNote: 'Only reboots when "allow reboot" is set, at most once a day per device, with a 60 s notice, and never while a script run or a shell session is live.',
-    keys: ['max_hours', 'allow_reboot'],
-    defaults: () => ({ max_hours: 72, allow_reboot: false }),
-    summary: (p) => `≤ ${numOr(p, 'max_hours', 72)} h${bool(p, 'allow_reboot') ? ' · may reboot' : ''}`,
+    keys: ['max_hours', 'allow_reboot', 'warn_user', 'reason', 'display_time_sec', 'max_postpones', 'postpone_delay_min', 'enforce_time'],
+    defaults: () => ({ max_hours: 72, allow_reboot: false, warn_user: true, reason: 'complete system updates', display_time_sec: 120, max_postpones: 3, postpone_delay_min: 60, enforce_time: '23:00' }),
+    summary: (p) => `≤ ${numOr(p, 'max_hours', 72)} h${bool(p, 'allow_reboot') ? (bool(p, 'warn_user') ? ' · prompt user (max ' + numOr(p, 'max_postpones', 3) + ' postpones)' : ' · auto-reboot') : ''}`,
   },
   {
     id: 'disk_free',
@@ -499,23 +503,48 @@ export function validateParams(kind: string, p: BaselineParams): string | null {
       const name = str(p, 'name');
       if (!SERVICE_NAME_RE.test(name)) return 'name: a service or unit name is required';
       if (name.includes('/')) return 'name: a service name cannot contain a slash';
-      const st = oneOf('state', str(p, 'state'), 'running', 'stopped');
+      const st = oneOf('state', str(p, 'state'), 'running', 'stopped', 'installed', 'not_installed', 'present', 'absent');
       if (st) return st;
       const start = str(p, 'start_type');
-      if (start) return oneOf('start_type', start, 'auto', 'manual', 'disabled', 'any');
+      if (start) {
+        const startErr = oneOf('start_type', start, 'auto', 'manual', 'disabled', 'any');
+        if (startErr) return startErr;
+      }
+      if (str(p, 'fix_script')) {
+        if (blen(str(p, 'fix_script')) > LIMITS.commandBody) return `fix_script: exceeds the ${LIMITS.commandBody} byte limit`;
+        const l = str(p, 'fix_lang');
+        if (l) {
+          const lErr = oneOf('fix_lang', l, 'powershell', 'cmd', 'bash', 'sh', 'python');
+          if (lErr) return lErr;
+        }
+      }
       return null;
     }
     case 'package': {
       const name = str(p, 'name');
       if (!packageNameOK(name)) return 'name: a package name, a winget id or a Windows program name is required';
       if (name.endsWith('-') || name.endsWith(':')) return "name: a package name cannot end with '-' or ':'";
-      const st = oneOf('state', str(p, 'state'), 'present', 'absent');
+      const st = oneOf('state', str(p, 'state'), 'present', 'absent', 'installed', 'not_installed');
       if (st) return st;
-      const mv = str(p, 'min_version');
-      if (mv) {
-        if (str(p, 'state') !== 'present') return 'min_version: only applies when state is present';
-        if (blen(mv) > 64) return 'min_version: too long';
-        if (!comparableVersion(mv)) return `min_version: "${mv}" has no numeric field to compare`;
+      const op = str(p, 'version_op');
+      if (op) {
+        const opErr = oneOf('version_op', op, '==', '>=', '<=', '<', '>', '!=');
+        if (opErr) return opErr;
+      }
+      const v = str(p, 'version') || str(p, 'min_version');
+      if (v) {
+        const state = str(p, 'state');
+        if (state !== 'present' && state !== 'installed') return 'version: only applies when state is installed/present';
+        if (blen(v) > 64) return 'version: too long';
+        if (!comparableVersion(v)) return `version: "${v}" has no numeric field to compare`;
+      }
+      if (str(p, 'fix_script')) {
+        if (blen(str(p, 'fix_script')) > LIMITS.commandBody) return `fix_script: exceeds the ${LIMITS.commandBody} byte limit`;
+        const l = str(p, 'fix_lang');
+        if (l) {
+          const lErr = oneOf('fix_lang', l, 'powershell', 'cmd', 'bash', 'sh', 'python');
+          if (lErr) return lErr;
+        }
       }
       return flagErr(p, 'allow_winget');
     }
@@ -611,7 +640,28 @@ export function validateParams(kind: string, p: BaselineParams): string | null {
       const h = numOr(p, 'max_hours', 0);
       if (!Number.isInteger(h) || h < 1) return 'max_hours: must be 1 or more';
       if (h > 24 * 365) return 'max_hours: must be a year or less';
-      return flagErr(p, 'allow_reboot');
+      const allowErr = flagErr(p, 'allow_reboot');
+      if (allowErr) return allowErr;
+      const warnErr = flagErr(p, 'warn_user');
+      if (warnErr) return warnErr;
+      if (bool(p, 'warn_user')) {
+        if (blen(str(p, 'reason')) > 256) return 'reason: at most 256 characters';
+        const disp = numOr(p, 'display_time_sec', 0);
+        if (disp !== 0 && (disp < 10 || disp > 3600)) return 'display_time_sec: must be between 10 and 3600 seconds';
+        const maxP = numOr(p, 'max_postpones', 0);
+        if (maxP < 0 || maxP > 20) return 'max_postpones: must be between 0 and 20';
+        const delay = numOr(p, 'postpone_delay_min', 0);
+        if (delay < 0 || delay > 1440) return 'postpone_delay_min: must be between 0 and 1440 minutes';
+        const enf = str(p, 'enforce_time');
+        if (enf && enf !== 'immediate') {
+          const parts = enf.split(':');
+          if (parts.length !== 2) return 'enforce_time: must be HH:MM or immediate';
+          const hh = parseInt(parts[0], 10);
+          const mm = parseInt(parts[1], 10);
+          if (isNaN(hh) || isNaN(mm) || hh < 0 || hh > 23 || mm < 0 || mm > 59) return 'enforce_time: invalid 24-hour time (00:00 - 23:59) or immediate';
+        }
+      }
+      return null;
     }
     case 'disk_free': {
       const mount = str(p, 'mount');
@@ -706,7 +756,11 @@ function required(kind: string, key: string): boolean {
 }
 
 function optionalFlag(kind: string, key: string): boolean {
-  return (kind === 'package' && key === 'allow_winget') || (kind === 'group_members' && key === 'allow_domain') || (kind === 'reboot_pending' && key === 'allow_reboot');
+  return (
+    (kind === 'package' && key === 'allow_winget') ||
+    (kind === 'group_members' && key === 'allow_domain') ||
+    (kind === 'reboot_pending' && (key === 'allow_reboot' || key === 'warn_user'))
+  );
 }
 
 /** The body the API takes: position is the array index, so it is never sent. */

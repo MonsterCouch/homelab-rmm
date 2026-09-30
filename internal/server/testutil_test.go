@@ -80,10 +80,8 @@ func newTestServerWith(t *testing.T, cfg Config) (*Server, *httptest.Server, *br
 	t.Helper()
 	s, ts := newServerOnly(t, cfg)
 	b := newBrowser(t, ts)
-	// The code is ignored for a genuine loopback caller, but a fixture that
-	// configures 127.0.0.1 as a trusted proxy is no longer treated as local,
-	// so send it either way.
-	b.mustJSON("POST", "/api/auth/setup", map[string]string{"username": "admin", "password": "password123", "code": s.setupCode}, nil)
+	// Complete first-run setup without needing a code.
+	b.mustJSON("POST", "/api/auth/setup", map[string]string{"username": "admin", "password": "password123"}, nil)
 	return s, ts, b
 }
 

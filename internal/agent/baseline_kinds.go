@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -555,6 +556,30 @@ func commandFix(ctx context.Context, c *checkCtx) (string, error) {
 	return detail, nil
 }
 
+func executeFixScript(ctx context.Context, c *checkCtx, lang, body string) (string, error) {
+	if strings.TrimSpace(body) == "" {
+		return "", errors.New("no remediation script provided")
+	}
+	if lang == "" {
+		if runtime.GOOS == "windows" {
+			lang = "powershell"
+		} else {
+			lang = "bash"
+		}
+	}
+	res := c.e.runScript(ctx, c, "fix", lang, body)
+	detail := blScriptDetail(res)
+	switch {
+	case res.TimedOut:
+		return detail, errors.New(orText(res.Error, "the remediation script timed out"))
+	case res.Error != "":
+		return detail, errors.New("the remediation script could not run: " + res.Error)
+	case res.ExitCode != 0:
+		return detail, fmt.Errorf("the remediation script exited with %d", res.ExitCode)
+	}
+	return detail, nil
+}
+
 // runScript executes a check or fix body through the same runner the console
 // uses: a temp directory, a 0700 file, an interpreter invoked with
 // exec.Command arguments - never a shell string.
@@ -778,6 +803,29 @@ func rebootPendingCheck(ctx context.Context, c *checkCtx) kindResult {
 	return blFail(want, observed, "")
 }
 
+func isEnforceTimeDue(now time.Time, enforceTime string) bool {
+	if enforceTime == "" || enforceTime == "immediate" {
+		return true
+	}
+	parts := strings.Split(enforceTime, ":")
+	if len(parts) != 2 {
+		return true
+	}
+	h, errH := strconv.Atoi(parts[0])
+	m, errM := strconv.Atoi(parts[1])
+	if errH != nil || errM != nil {
+		return true
+	}
+	curH, curM, _ := now.Clock()
+	curTotal := curH*60 + curM
+	targetTotal := h*60 + m
+	diff := curTotal - targetTotal
+	if diff >= 0 && diff < 120 {
+		return true
+	}
+	return false
+}
+
 func rebootPendingFix(ctx context.Context, c *checkCtx) (string, error) {
 	var p baselines.RebootPendingParams
 	if err := c.params(&p); err != nil {
@@ -800,13 +848,58 @@ func rebootPendingFix(ctx context.Context, c *checkCtx) (string, error) {
 	if c.e.rebootedRecently() {
 		return "", skipf("this device was already restarted by a baseline in the last 24 hours")
 	}
+
+	reason := p.Reason
+	if reason == "" {
+		reason = "clear a pending reboot"
+	}
+
+	if p.WarnUser {
+		maxP := p.MaxPostpones
+		if maxP <= 0 {
+			maxP = 3
+		}
+		count, until := c.e.getPostpones(c.check.ID)
+		nowUnix := c.e.now().Unix()
+		if count < maxP && until > nowUnix {
+			return "", skipf("restart postponed by user until %s (%d of %d postpones used)",
+				time.Unix(until, 0).Format("15:04"), count, maxP)
+		}
+
+		if count < maxP {
+			remaining := maxP - count
+			act, promptErr := promptRebootUser(ctx, reason, p.DisplayTimeSec, remaining, maxP)
+			if promptErr != nil {
+				slog.Warn("reboot prompt error", "check", c.check.ID, "err", promptErr)
+			}
+			switch act {
+			case "postpone":
+				newCount := c.e.addPostpone(c.check.ID, p.PostponeDelayMin)
+				return "", skipf("user chose to postpone restart (%d of %d postpones used)", newCount, maxP)
+			case "timeout":
+				newCount := c.e.addPostpone(c.check.ID, p.PostponeDelayMin)
+				return "", skipf("reboot prompt timed out; postponed restart (%d of %d postpones used)", newCount, maxP)
+			case "reboot":
+				slog.Info("user approved immediate restart", "check", c.check.ID)
+			case "headless":
+				// Headless device, proceed with reboot
+			}
+		} else {
+			if !isEnforceTimeDue(c.e.now(), p.EnforceTime) {
+				return "", skipf("postpone limit reached (%d of %d); waiting for scheduled reboot at %s", count, maxP, p.EnforceTime)
+			}
+		}
+	}
+
 	if !pkgOpMutex.TryLock() {
 		return "", busyf("another package operation is in progress")
 	}
 	defer pkgOpMutex.Unlock()
-	if err := powerAction(protocol.Power{Action: "reboot", Delay: 60, Message: "Restarting to clear a pending reboot (RMM baseline)"}); err != nil {
+	msg := fmt.Sprintf("Restarting to %s (Homelab RMM baseline)", reason)
+	if err := powerAction(protocol.Power{Action: "reboot", Delay: 60, Message: msg}); err != nil {
 		return "", err
 	}
+	c.e.clearPostpones(c.check.ID)
 	c.e.markRebooted()
 	return "", pendingf("a restart was scheduled with a 60 second notice")
 }

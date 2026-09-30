@@ -64,6 +64,9 @@ const (
 	ReqBaselineEvaluate  = "baseline.evaluate"  // evaluate assigned baselines now; reply is an ACK, results arrive as TypeBaseline frames
 	ReqBaselineRemediate = "baseline.remediate" // run the fixes for listed checks now; reply is an ACK, the result arrives as a TypeBaseline frame
 	ReqBaselinePreview   = "baseline.preview"   // evaluate an unsaved spec, never storing or fixing; reply BaselineReport
+	ReqDeviceIsolate     = "device.isolate"     // firewall isolate or release endpoint
+	ReqNetworkScan       = "network.scan"       // agent-driven subnet probe
+	ReqSNMPPoll          = "snmp.poll"          // agent-driven SNMP query
 )
 
 // TypeBaseline is sent by the agent after every evaluation pass (scheduled,
@@ -408,6 +411,19 @@ type DesktopStartResult struct {
 	Note    string `json:"note,omitempty"`
 }
 
+// ---- Device Isolation ----
+
+type DeviceIsolate struct {
+	Isolate    bool   `json:"isolate"`
+	ServerHost string `json:"server_host,omitempty"`
+	ServerPort int    `json:"server_port,omitempty"`
+}
+
+type DeviceIsolateResult struct {
+	Isolated bool   `json:"isolated"`
+	Message  string `json:"message,omitempty"`
+}
+
 // ---- Baselines (desired state) ----
 //
 // A baseline is a set of checks that describe how a device should look. The
@@ -480,6 +496,41 @@ type AgentUpdate struct {
 	URL     string `json:"url"`
 	SHA256  string `json:"sha256"`
 	Version string `json:"version"`
+}
+
+// ---- Network Discovery & SNMP ----
+
+type NetworkScanReq struct {
+	Subnet string `json:"subnet"`
+}
+
+type DiscoveredHost struct {
+	IP            string `json:"ip"`
+	MAC           string `json:"mac"`
+	Hostname      string `json:"hostname"`
+	Vendor        string `json:"vendor"`
+	OS            string `json:"os"`
+	DeviceType    string `json:"device_type"`
+	OpenPorts     []int  `json:"open_ports"`
+	SNMPEnabled   bool   `json:"snmp_enabled"`
+	SNMPSysName   string `json:"snmp_sys_name"`
+	SNMPSysDescr  string `json:"snmp_sys_descr"`
+	SNMPSysUpTime int64  `json:"snmp_sys_uptime"`
+}
+
+type NetworkScanResp struct {
+	Hosts []DiscoveredHost `json:"hosts"`
+}
+
+type SNMPPollReq struct {
+	IP        string `json:"ip"`
+	Community string `json:"community,omitempty"`
+}
+
+type SNMPPollResp struct {
+	SysName   string `json:"sys_name"`
+	SysDescr  string `json:"sys_descr"`
+	SysUpTime int64  `json:"sys_uptime"`
 }
 
 // Must marshals v, panicking on failure; every payload here is a plain struct

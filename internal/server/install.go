@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -31,6 +32,30 @@ func (s *Server) agentBinaryPath(osName, arch string) string {
 	for _, c := range candidates {
 		if st, err := os.Stat(c); err == nil && !st.IsDir() {
 			return c
+		}
+	}
+	if dev := devDistDir(); dev != "" {
+		p := filepath.Join(dev, name)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+// devDistDir returns a directory to look for binaries in dev mode if explicitly
+// configured via RMM_DEV_DIST_DIR or RMM_DEV_DIST. It verifies that the path
+// exists and is a directory before returning it.
+func devDistDir() string {
+	if d := os.Getenv("RMM_DEV_DIST_DIR"); d != "" {
+		if st, err := os.Stat(d); err == nil && st.IsDir() {
+			return d
+		}
+		return ""
+	}
+	if os.Getenv("RMM_DEV_DIST") != "" {
+		if st, err := os.Stat("dist"); err == nil && st.IsDir() {
+			return "dist"
 		}
 	}
 	return ""
@@ -100,6 +125,13 @@ func (s *Server) handleAgentDownload(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if dev := devDistDir(); dev != "" {
+		p := filepath.Join(dev, file)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			http.ServeFile(w, r, p)
+			return
+		}
+	}
 	writeErr(w, 404, "agent binary not found on the server; place it in "+s.cfg.path("agents"))
 }
 
@@ -161,6 +193,117 @@ func (s *Server) handleInstallScript(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeErr(w, http.StatusBadRequest, "unsupported os")
 	}
+}
+
+// agentMSIPath locates the base Windows agent MSI installer.
+func (s *Server) agentMSIPath() string {
+	candidates := []string{
+		s.cfg.path(filepath.Join("agents", "rmm-agent.msi")),
+		s.cfg.path(filepath.Join("agents", "rmm-agent-v0.3.0-x64.msi")),
+		s.cfg.path(filepath.Join("agents", "rmm-agent-windows-amd64.msi")),
+	}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates,
+			filepath.Join(filepath.Dir(exe), "agents", "rmm-agent.msi"),
+			filepath.Join(filepath.Dir(exe), "agents", "rmm-agent-v0.3.0-x64.msi"),
+			filepath.Join(filepath.Dir(exe), "rmm-agent.msi"),
+			filepath.Join(filepath.Dir(exe), "rmm-agent-v0.3.0-x64.msi"),
+		)
+	}
+	for _, c := range candidates {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	if dev := devDistDir(); dev != "" {
+		devCandidates := []string{
+			filepath.Join(dev, "rmm-agent.msi"),
+			filepath.Join(dev, "rmm-agent-windows-amd64.msi"),
+			filepath.Join(dev, "rmm-agent-v0.3.0-x64.msi"),
+		}
+		for _, c := range devCandidates {
+			if st, err := os.Stat(c); err == nil && !st.IsDir() {
+				return c
+			}
+		}
+		matches, _ := filepath.Glob(filepath.Join(dev, "rmm-agent*.msi"))
+		sort.Sort(sort.Reverse(sort.StringSlice(matches)))
+		for _, m := range matches {
+			if !strings.Contains(m, "rmm-server") {
+				if st, err := os.Stat(m); err == nil && !st.IsDir() {
+					return m
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// handleInstallMSI serves the native Windows MSI installer with a custom
+// appended binary overlay containing the pre-configured server URL, token,
+// and certificate fingerprint.
+func (s *Server) handleInstallMSI(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	if !tokenRe.MatchString(token) || s.db.checkEnrollToken(token) != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	msiPath := s.agentMSIPath()
+	if msiPath == "" {
+		writeErr(w, http.StatusNotFound, "base agent MSI installer not found on server; place rmm-agent-v0.3.0-x64.msi in agents/")
+		return
+	}
+
+	baseBytes, err := os.ReadFile(msiPath)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to read base agent MSI")
+		return
+	}
+
+	fp := strings.ToLower(strings.ReplaceAll(s.PinFingerprint(), ":", ""))
+	tagOverlay := fmt.Sprintf("\n[HOMELAB_RMM_CONFIG]\nSERVER=%s\nTOKEN=%s\nFINGERPRINT=%s\n[END_HOMELAB_RMM_CONFIG]\n", s.PublicURL(), token, fp)
+
+	w.Header().Set("Content-Type", "application/x-msi")
+	w.Header().Set("Content-Disposition", `attachment; filename="HomelabRMM-Agent.msi"`)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Length", strconv.Itoa(len(baseBytes)+len(tagOverlay)))
+
+	w.Write(baseBytes)
+	io.WriteString(w, tagOverlay)
+}
+
+// handleInstallDeb dynamically builds and serves a pure-Go Debian/Ubuntu (.deb)
+// package pre-configured with agent.json, systemd service, and Linux binary.
+func (s *Server) handleInstallDeb(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	if !tokenRe.MatchString(token) || s.db.checkEnrollToken(token) != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	arch := r.URL.Query().Get("arch")
+	if arch == "" {
+		arch = "amd64"
+	}
+	if !archRe.MatchString(arch) {
+		writeErr(w, http.StatusBadRequest, "unsupported arch")
+		return
+	}
+
+	debBytes, err := s.buildDebPackage(token, arch)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to build deb package: "+err.Error())
+		return
+	}
+
+	filename := fmt.Sprintf("homelab-rmm-agent_%s.deb", arch)
+	w.Header().Set("Content-Type", "application/vnd.debian.binary-package")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Length", strconv.Itoa(len(debBytes)))
+
+	w.Write(debBytes)
 }
 
 // linuxSumCases renders the `case "$ARCH"` arms that give the Linux script the

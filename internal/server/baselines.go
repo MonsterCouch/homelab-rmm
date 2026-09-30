@@ -790,6 +790,7 @@ func (e *baselineEngine) recordEvent(agentID, kind, msg string) {
 	if _, err := e.s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,'{}')`, agentID, now(), kind, msg); err != nil {
 		slog.Debug("record drift event", "agent", agentID, "err", err)
 	}
+	e.s.hub.broadcast(hubEvent{Kind: "event", AgentID: agentID, Data: map[string]any{"ts": now(), "kind": kind, "message": msg}})
 }
 
 func driftMessage(o resultOutcome) string {

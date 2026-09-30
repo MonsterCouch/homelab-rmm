@@ -22,6 +22,10 @@ type Agent struct {
 	Version           string              `json:"version"`
 	GroupID           *int64              `json:"group_id"`
 	GroupName         string              `json:"group_name,omitempty"`
+	OrgID             string              `json:"org_id"`
+	OrgName           string              `json:"org_name,omitempty"`
+	SiteID            string              `json:"site_id"`
+	SiteName          string              `json:"site_name,omitempty"`
 	Tags              []string            `json:"tags"`
 	CustomFields      map[string]string   `json:"custom_fields"`
 	Notes             string              `json:"notes"`
@@ -36,11 +40,15 @@ type Agent struct {
 	Inventory         *protocol.Inventory `json:"inventory,omitempty"`
 	OpenAlerts        int                 `json:"open_alerts"`
 	PatchesAvailable  int                 `json:"patches_available"`
+	Isolated          bool                `json:"isolated"`
+	IsolatedAt        int64               `json:"isolated_at"`
+	IsolatedBy        string              `json:"isolated_by,omitempty"`
 }
 
 const agentCols = `a.id, a.hostname, a.display_name, a.os, a.platform, a.arch, a.version, a.group_id, COALESCE(g.name,''),
+	COALESCE(a.org_id,''), COALESCE(o.name,''), COALESCE(a.site_id,''), COALESCE(s.name,''),
 	a.tags, a.custom_fields, a.notes, a.last_ip, a.last_seen, a.online, a.monitored_services, a.maintenance_until, a.enrolled_at,
-	a.pending_reboot, a.last_metrics,
+	a.pending_reboot, a.isolated, a.isolated_at, a.isolated_by, a.last_metrics,
 	(SELECT COUNT(*) FROM alerts al WHERE al.agent_id = a.id AND al.status != 'resolved'),
 	(SELECT COUNT(*) FROM patches p WHERE p.agent_id = a.id AND p.status IN ('available','approved'))`
 
@@ -48,9 +56,11 @@ func scanAgent(rows interface{ Scan(...any) error }, withInventory bool) (*Agent
 	var a Agent
 	var tags, cf, ms, lm, inv string
 	var gid sql.NullInt64
+	var isoInt int
 	dest := []any{&a.ID, &a.Hostname, &a.DisplayName, &a.OS, &a.Platform, &a.Arch, &a.Version, &gid, &a.GroupName,
+		&a.OrgID, &a.OrgName, &a.SiteID, &a.SiteName,
 		&tags, &cf, &a.Notes, &a.LastIP, &a.LastSeen, &a.Online, &ms, &a.MaintenanceUntil, &a.EnrolledAt,
-		&a.PendingReboot, &lm, &a.OpenAlerts, &a.PatchesAvailable}
+		&a.PendingReboot, &isoInt, &a.IsolatedAt, &a.IsolatedBy, &lm, &a.OpenAlerts, &a.PatchesAvailable}
 	if withInventory {
 		dest = append(dest, &inv)
 	}
@@ -60,6 +70,7 @@ func scanAgent(rows interface{ Scan(...any) error }, withInventory bool) (*Agent
 	if gid.Valid {
 		a.GroupID = &gid.Int64
 	}
+	a.Isolated = (isoInt == 1)
 	a.Tags = []string{}
 	json.Unmarshal([]byte(tags), &a.Tags)
 	a.CustomFields = map[string]string{}
@@ -85,7 +96,11 @@ func scanAgent(rows interface{ Scan(...any) error }, withInventory bool) (*Agent
 }
 
 func (d *DB) ListAgents() ([]*Agent, error) {
-	rows, err := d.Query(`SELECT ` + agentCols + ` FROM agents a LEFT JOIN groups g ON g.id = a.group_id ORDER BY a.online DESC, a.hostname`)
+	rows, err := d.Query(`SELECT ` + agentCols + ` FROM agents a
+		LEFT JOIN groups g ON g.id = a.group_id
+		LEFT JOIN organizations o ON o.id = a.org_id
+		LEFT JOIN sites s ON s.id = a.site_id
+		ORDER BY a.online DESC, a.hostname`)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +117,11 @@ func (d *DB) ListAgents() ([]*Agent, error) {
 }
 
 func (d *DB) GetAgent(id string) (*Agent, error) {
-	row := d.QueryRow(`SELECT `+agentCols+`, a.inventory FROM agents a LEFT JOIN groups g ON g.id = a.group_id WHERE a.id = ?`, id)
+	row := d.QueryRow(`SELECT `+agentCols+`, a.inventory FROM agents a
+		LEFT JOIN groups g ON g.id = a.group_id
+		LEFT JOIN organizations o ON o.id = a.org_id
+		LEFT JOIN sites s ON s.id = a.site_id
+		WHERE a.id = ?`, id)
 	a, err := scanAgent(row, true)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, errNotFound
@@ -174,8 +193,10 @@ func (d *DB) enrollAgent(token string, hello protocol.Hello, ip string, isOnline
 			usesLeft int
 			expires  int64
 			gid      sql.NullInt64
+			orgID    sql.NullString
+			siteID   sql.NullString
 		)
-		if err := tx.QueryRow(`SELECT id, uses_left, expires_at, group_id FROM enroll_tokens WHERE token = ?`, token).Scan(&tid, &usesLeft, &expires, &gid); err != nil {
+		if err := tx.QueryRow(`SELECT id, uses_left, expires_at, group_id, org_id, site_id FROM enroll_tokens WHERE token = ?`, token).Scan(&tid, &usesLeft, &expires, &gid, &orgID, &siteID); err != nil {
 			return errors.New("unknown token")
 		}
 		if expires < now() {
@@ -193,11 +214,20 @@ func (d *DB) enrollAgent(token string, hello protocol.Hello, ip string, isOnline
 				return errors.New("token exhausted")
 			}
 		}
+		finalOrg := "org_default"
+		if orgID.Valid && orgID.String != "" {
+			finalOrg = orgID.String
+		}
+		finalSite := "site_default"
+		if siteID.Valid && siteID.String != "" {
+			finalSite = siteID.String
+		}
 		// A re-enrollment from the same hostname+os replaces the old record's
 		// key instead of creating a duplicate device (reinstalls are common).
 		// Liveness comes from the hub, not the column.
+		// Scope to finalOrg to prevent cross-tenant device hijacking.
 		var candidates []string
-		crows, qerr := tx.Query(`SELECT id FROM agents WHERE hostname = ? AND os = ? ORDER BY online ASC`, hello.Hostname, hello.OS)
+		crows, qerr := tx.Query(`SELECT id FROM agents WHERE hostname = ? AND os = ? AND org_id = ? ORDER BY online ASC`, hello.Hostname, hello.OS, finalOrg)
 		if qerr == nil {
 			for crows.Next() {
 				var id string
@@ -224,8 +254,8 @@ func (d *DB) enrollAgent(token string, hello protocol.Hello, ip string, isOnline
 		// it failed to adopt is the one it was aiming at.
 		res.DuplicateHostname = len(candidates) > 0
 		res.ID = randomHex(8)
-		_, err := tx.Exec(`INSERT INTO agents(id, key_hash, hostname, os, platform, arch, version, group_id, last_ip, enrolled_at, last_seen)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?)`, res.ID, hashKey(res.Key), hello.Hostname, hello.OS, hello.Platform, hello.Arch, hello.Version, gid, ip, now(), now())
+		_, err := tx.Exec(`INSERT INTO agents(id, key_hash, hostname, os, platform, arch, version, group_id, org_id, site_id, last_ip, enrolled_at, last_seen)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, res.ID, hashKey(res.Key), hello.Hostname, hello.OS, hello.Platform, hello.Arch, hello.Version, gid, finalOrg, finalSite, ip, now(), now())
 		return err
 	})
 	if err != nil {
@@ -334,6 +364,8 @@ type AgentUpdate struct {
 	Tags              []string          `json:"tags"`
 	CustomFields      map[string]string `json:"custom_fields"`
 	Notes             *string           `json:"notes"`
+	OrgID             *string           `json:"org_id"`
+	SiteID            *string           `json:"site_id"`
 	MonitoredServices []string          `json:"monitored_services"`
 	MaintenanceUntil  *int64            `json:"maintenance_until"`
 }
@@ -413,6 +445,12 @@ func (d *DB) UpdateAgent(id string, u AgentUpdate) error {
 	if u.Notes != nil {
 		set, args = append(set, "notes = ?"), append(args, *u.Notes)
 	}
+	if u.OrgID != nil {
+		set, args = append(set, "org_id = ?"), append(args, *u.OrgID)
+	}
+	if u.SiteID != nil {
+		set, args = append(set, "site_id = ?"), append(args, *u.SiteID)
+	}
 	if u.MonitoredServices != nil {
 		set, args = append(set, "monitored_services = ?"), append(args, jsonText(u.MonitoredServices))
 	}
@@ -434,17 +472,43 @@ func (d *DB) DeleteAgent(id string) error {
 
 // Targets selects devices for tasks, alert rules and patch policies.
 type Targets struct {
-	All    bool     `json:"all"`
-	Agents []string `json:"agents,omitempty"`
-	Groups []int64  `json:"groups,omitempty"`
-	Tags   []string `json:"tags,omitempty"`
-	OS     string   `json:"os,omitempty"`
+	All           bool     `json:"all"`
+	Agents        []string `json:"agents,omitempty"`
+	Groups        []int64  `json:"groups,omitempty"`
+	Tags          []string `json:"tags,omitempty"`
+	OS            string   `json:"os,omitempty"`
+	Organizations []string `json:"organizations,omitempty"`
+	Sites         []string `json:"sites,omitempty"`
 }
 
 // Matches reports whether a device is selected by the target set.
 func (t Targets) Matches(a *Agent) bool {
 	if t.OS != "" && a.OS != t.OS {
 		return false
+	}
+	if len(t.Organizations) > 0 {
+		matchedOrg := false
+		for _, org := range t.Organizations {
+			if org == a.OrgID {
+				matchedOrg = true
+				break
+			}
+		}
+		if !matchedOrg {
+			return false
+		}
+	}
+	if len(t.Sites) > 0 {
+		matchedSite := false
+		for _, site := range t.Sites {
+			if site == a.SiteID {
+				matchedSite = true
+				break
+			}
+		}
+		if !matchedSite {
+			return false
+		}
 	}
 	if t.All {
 		return true
@@ -467,6 +531,10 @@ func (t Targets) Matches(a *Agent) bool {
 				return true
 			}
 		}
+	}
+	hasSelector := len(t.Agents) > 0 || len(t.Groups) > 0 || len(t.Tags) > 0
+	if !hasSelector && (len(t.Organizations) > 0 || len(t.Sites) > 0) {
+		return true
 	}
 	return false
 }
@@ -520,6 +588,8 @@ type EnrollToken struct {
 	Token     string `json:"token"`
 	Name      string `json:"name"`
 	GroupID   *int64 `json:"group_id"`
+	OrgID     string `json:"org_id"`
+	SiteID    string `json:"site_id"`
 	UsesLeft  int    `json:"uses_left"`
 	ExpiresAt int64  `json:"expires_at"`
 	CreatedBy string `json:"created_by"`
@@ -527,7 +597,7 @@ type EnrollToken struct {
 }
 
 func (d *DB) ListEnrollTokens() ([]EnrollToken, error) {
-	rows, err := d.Query(`SELECT id, token, name, group_id, uses_left, expires_at, created_by, created_at FROM enroll_tokens WHERE expires_at > ? AND uses_left != 0 ORDER BY created_at DESC`, now())
+	rows, err := d.Query(`SELECT id, token, name, group_id, COALESCE(org_id, 'org_default'), COALESCE(site_id, 'site_default'), uses_left, expires_at, created_by, created_at FROM enroll_tokens WHERE expires_at > ? AND uses_left != 0 ORDER BY created_at DESC`, now())
 	if err != nil {
 		return nil, err
 	}
@@ -536,7 +606,7 @@ func (d *DB) ListEnrollTokens() ([]EnrollToken, error) {
 	for rows.Next() {
 		var t EnrollToken
 		var gid sql.NullInt64
-		if err := rows.Scan(&t.ID, &t.Token, &t.Name, &gid, &t.UsesLeft, &t.ExpiresAt, &t.CreatedBy, &t.CreatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.Token, &t.Name, &gid, &t.OrgID, &t.SiteID, &t.UsesLeft, &t.ExpiresAt, &t.CreatedBy, &t.CreatedAt); err != nil {
 			return nil, err
 		}
 		if gid.Valid {
@@ -546,3 +616,15 @@ func (d *DB) ListEnrollTokens() ([]EnrollToken, error) {
 	}
 	return out, rows.Err()
 }
+
+func (d *DB) SetAgentIsolated(id string, isolated bool, by string) error {
+	var isoInt int
+	var isoAt int64
+	if isolated {
+		isoInt = 1
+		isoAt = now()
+	}
+	_, err := d.Exec(`UPDATE agents SET isolated = ?, isolated_at = ?, isolated_by = ? WHERE id = ?`, isoInt, isoAt, by, id)
+	return err
+}
+

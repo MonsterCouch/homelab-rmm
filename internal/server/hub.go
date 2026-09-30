@@ -33,6 +33,7 @@ type Hub struct {
 type hubEvent struct {
 	Kind    string `json:"kind"` // agent_online, agent_offline, metrics, inventory, alert, event, run, baseline
 	AgentID string `json:"agent_id,omitempty"`
+	OrgID   string `json:"org_id,omitempty"`
 	Data    any    `json:"data,omitempty"`
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -20,19 +21,140 @@ const (
 	longTimeout  = 20 * time.Minute
 )
 
+// canAccessAgent reports whether the user is permitted to view or manage the agent
+// under their assigned multi-tenant scope. Admins and unscoped users may access any agent.
+func (s *Server) canAccessAgent(u *User, agentOrgID string) bool {
+	if u == nil {
+		return false
+	}
+	// A client contact reaches their own organization's devices only, and
+	// never "all of them" by having no scope.
+	if u.IsPOC() {
+		return agentOrgID != "" && agentOrgID == u.ContactOrg()
+	}
+	if u.IsAdmin() || len(u.OrgScope) == 0 {
+		return true
+	}
+	for _, o := range u.OrgScope {
+		if agentOrgID == o {
+			return true
+		}
+	}
+	return false
+}
+
+// getScopedAgent fetches an agent by ID and ensures the requesting user has permission
+// to access it under their multi-tenant OrgScope.
+func (s *Server) getScopedAgent(w http.ResponseWriter, r *http.Request, agentID string) (*Agent, bool) {
+	a, err := s.db.GetAgent(agentID)
+	if err != nil {
+		fail(w, err)
+		return nil, false
+	}
+	u := userFrom(r.Context())
+	if !s.canAccessAgent(u, a.OrgID) {
+		writeErr(w, http.StatusNotFound, "agent not found")
+		return nil, false
+	}
+	return a, true
+}
+
+// validateTargetsScope checks whether user u is permitted to target the devices specified by t.
+// Administrators can target anything.
+// Scoped technicians and users cannot target globally (Targets.All), cannot target without specifying
+// an organization scope, and cannot target organizations, sites, or agents outside their assigned OrgScope.
+func (s *Server) validateTargetsScope(u *User, t Targets) error {
+	if u == nil {
+		return errors.New("unauthenticated")
+	}
+	if u.IsAdmin() {
+		return nil
+	}
+	// Global targeting requires administrator privileges
+	if t.All && len(t.Organizations) == 0 && len(t.Sites) == 0 {
+		return errors.New("global targeting requires administrator privileges")
+	}
+	// Tags and groups are fleet-wide selectors; non-administrators must bind them to an organization or site within scope
+	if (len(t.Tags) > 0 || len(t.Groups) > 0) && len(t.Organizations) == 0 && len(t.Sites) == 0 {
+		return errors.New("targeting by tags or groups requires specifying an organization or site within your scope")
+	}
+	// Non-admin technicians must not leave targets unscoped (which would match all organizations)
+	if len(t.Organizations) == 0 && len(t.Agents) == 0 && len(t.Sites) == 0 {
+		return errors.New("targets must be scoped to your assigned organization or devices")
+	}
+	// Verify each specified organization is within user's scope
+	for _, org := range t.Organizations {
+		if !s.canAccessAgent(u, org) {
+			return errors.New("targets outside assigned organization scope")
+		}
+	}
+	// Verify each specified agent is within user's scope
+	for _, agentID := range t.Agents {
+		var orgID string
+		if err := s.db.QueryRow(`SELECT org_id FROM agents WHERE id = ?`, agentID).Scan(&orgID); err != nil {
+			return errors.New("target agent not found")
+		}
+		if !s.canAccessAgent(u, orgID) {
+			return errors.New("targets outside assigned organization scope")
+		}
+	}
+	// Verify each specified site belongs to an organization within user's scope
+	for _, siteID := range t.Sites {
+		var orgID string
+		if err := s.db.QueryRow(`SELECT org_id FROM sites WHERE id = ?`, siteID).Scan(&orgID); err != nil {
+			return errors.New("target site not found")
+		}
+		if !s.canAccessAgent(u, orgID) {
+			return errors.New("targets outside assigned organization scope")
+		}
+	}
+	// Verify that any currently matching devices are all within user's scope
+	matched, err := s.db.ResolveTargets(t)
+	if err != nil {
+		return err
+	}
+	for _, a := range matched {
+		if !s.canAccessAgent(u, a.OrgID) {
+			return errors.New("targets match devices outside assigned organization scope")
+		}
+	}
+	return nil
+}
+
+// canAccessTargets reports whether user u has permission to access or run an entity targeting t.
+func (s *Server) canAccessTargets(u *User, t Targets) bool {
+	return s.validateTargetsScope(u, t) == nil
+}
+
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	agents, err := s.agentsWithLiveness()
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	writeJSON(w, 200, agents)
+	reqOrg := r.URL.Query().Get("org_id")
+	reqSite := r.URL.Query().Get("site_id")
+	me := userFrom(r.Context())
+
+	filtered := make([]*Agent, 0, len(agents))
+	for _, a := range agents {
+		if !s.canAccessAgent(me, a.OrgID) {
+			continue
+		}
+		if reqOrg != "" && a.OrgID != reqOrg {
+			continue
+		}
+		if reqSite != "" && a.SiteID != reqSite {
+			continue
+		}
+		filtered = append(filtered, a)
+	}
+	writeJSON(w, 200, filtered)
 }
 
 func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
-	a, err := s.db.GetAgent(r.PathValue("id"))
-	if err != nil {
-		fail(w, err)
+	a, ok := s.getScopedAgent(w, r, r.PathValue("id"))
+	if !ok {
 		return
 	}
 	a.Online = s.hub.IsOnline(a.ID)
@@ -50,8 +172,12 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	if _, err := s.db.GetAgent(id); err != nil {
-		fail(w, err)
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
+	u := userFrom(r.Context())
+	if !u.IsAdmin() && (in.OrgID != nil || in.SiteID != nil) {
+		writeErr(w, http.StatusForbidden, "only administrators can change organization or site")
 		return
 	}
 	// A group or tag change moves the device in and out of target sets, so
@@ -80,7 +206,11 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	s.hub.Disconnect(id)
+	s.portal.dropAgent(id)
 	if err := s.db.DeleteAgent(id); err != nil {
 		fail(w, err)
 		return
@@ -94,6 +224,9 @@ func (s *Server) handleDeleteAgent(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	to := queryInt(r, "to", now())
 	from := queryInt(r, "from", to-3600)
 	rows, err := s.db.MetricsRange(id, from, to, int(queryInt(r, "points", 400)))
@@ -105,18 +238,22 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgentEvents(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(`SELECT id, ts, kind, message, fields FROM agent_events WHERE agent_id = ? ORDER BY ts DESC LIMIT ?`, r.PathValue("id"), queryInt(r, "limit", 100))
+	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
+	rows, err := s.db.Query(`SELECT id, ts, kind, message, fields FROM agent_events WHERE agent_id = ? ORDER BY ts DESC LIMIT ?`, id, queryInt(r, "limit", 100))
 	if err != nil {
 		fail(w, err)
 		return
 	}
 	defer rows.Close()
 	type ev struct {
-		ID      int64             `json:"id"`
-		TS      int64             `json:"ts"`
-		Kind    string            `json:"kind"`
-		Message string            `json:"message"`
-		Fields  map[string]string `json:"fields"`
+		ID      int64          `json:"id"`
+		TS      int64          `json:"ts"`
+		Kind    string         `json:"kind"`
+		Message string         `json:"message"`
+		Fields  map[string]any `json:"fields"`
 	}
 	out := []ev{}
 	for rows.Next() {
@@ -130,9 +267,13 @@ func (s *Server) handleAgentEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAgentRefresh(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
 	defer cancel()
-	if err := s.hub.Request(ctx, r.PathValue("id"), protocol.ReqInventoryRefresh, nil, nil); err != nil {
+	if err := s.hub.Request(ctx, id, protocol.ReqInventoryRefresh, nil, nil); err != nil {
 		fail(w, err)
 		return
 	}
@@ -142,10 +283,14 @@ func (s *Server) handleAgentRefresh(w http.ResponseWriter, r *http.Request) {
 // ---- processes ----
 
 func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
 	defer cancel()
 	var out []protocol.Process
-	if err := s.hub.Request(ctx, r.PathValue("id"), protocol.ReqProcList, nil, &out); err != nil {
+	if err := s.hub.Request(ctx, id, protocol.ReqProcList, nil, &out); err != nil {
 		fail(w, err)
 		return
 	}
@@ -156,6 +301,10 @@ func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProcKill(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	var in protocol.ProcKill
 	if err := readJSON(r, &in); err != nil {
 		fail(w, err)
@@ -163,7 +312,7 @@ func (s *Server) handleProcKill(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
 	defer cancel()
-	if err := s.hub.Request(ctx, r.PathValue("id"), protocol.ReqProcKill, in, nil); err != nil {
+	if err := s.hub.Request(ctx, id, protocol.ReqProcKill, in, nil); err != nil {
 		// A refusal is audited too. "Nobody tried" and "someone tried and the
 		// device said no" are different answers to the question this log is
 		// read to answer, and the attempt is fully attributed right here.
@@ -178,10 +327,14 @@ func (s *Server) handleProcKill(w http.ResponseWriter, r *http.Request) {
 // ---- services ----
 
 func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
 	defer cancel()
 	var out []protocol.Service
-	if err := s.hub.Request(ctx, r.PathValue("id"), protocol.ReqSvcList, nil, &out); err != nil {
+	if err := s.hub.Request(ctx, id, protocol.ReqSvcList, nil, &out); err != nil {
 		fail(w, err)
 		return
 	}
@@ -192,6 +345,10 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleServiceAction(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	var in protocol.SvcAction
 	if err := readJSON(r, &in); err != nil {
 		fail(w, err)
@@ -200,15 +357,15 @@ func (s *Server) handleServiceAction(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
 	defer cancel()
 	var out protocol.Service
-	if err := s.hub.Request(ctx, r.PathValue("id"), protocol.ReqSvcAction, in, &out); err != nil {
+	if err := s.hub.Request(ctx, id, protocol.ReqSvcAction, in, &out); err != nil {
 		// Audited on the way out as well: a stop the SCM denied is exactly
 		// what somebody probing which security services they can turn off
 		// looks like, and only the failure path sees it.
-		s.audit(r, "service."+in.Action, r.PathValue("id"), auditFailure(map[string]any{"name": in.Name}, err))
+		s.audit(r, "service."+in.Action, id, auditFailure(map[string]any{"name": in.Name}, err))
 		fail(w, err)
 		return
 	}
-	s.audit(r, "service."+in.Action, r.PathValue("id"), in.Name)
+	s.audit(r, "service."+in.Action, id, in.Name)
 	writeJSON(w, 200, out)
 }
 
@@ -224,6 +381,10 @@ func auditFailure(details map[string]any, err error) map[string]any {
 // ---- event log ----
 
 func (s *Server) handleEventLog(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	q := protocol.EventLogQuery{
 		Log:     r.URL.Query().Get("log"),
 		Level:   r.URL.Query().Get("level"),
@@ -234,7 +395,7 @@ func (s *Server) handleEventLog(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
 	defer cancel()
 	var out []protocol.EventLogEntry
-	if err := s.hub.Request(ctx, r.PathValue("id"), protocol.ReqEventLogQuery, q, &out); err != nil {
+	if err := s.hub.Request(ctx, id, protocol.ReqEventLogQuery, q, &out); err != nil {
 		fail(w, err)
 		return
 	}
@@ -247,10 +408,14 @@ func (s *Server) handleEventLog(w http.ResponseWriter, r *http.Request) {
 // ---- files ----
 
 func (s *Server) handleFsList(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
 	defer cancel()
 	var out protocol.FsListResult
-	if err := s.hub.Request(ctx, r.PathValue("id"), protocol.ReqFsList, protocol.FsList{Path: r.URL.Query().Get("path")}, &out); err != nil {
+	if err := s.hub.Request(ctx, id, protocol.ReqFsList, protocol.FsList{Path: r.URL.Query().Get("path")}, &out); err != nil {
 		fail(w, err)
 		return
 	}
@@ -266,6 +431,9 @@ const fsChunk = 4 << 20
 // file never sits in server memory whole.
 func (s *Server) handleFsDownload(w http.ResponseWriter, r *http.Request) {
 	id, p := r.PathValue("id"), r.URL.Query().Get("path")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	if p == "" {
 		writeErr(w, 400, "path required")
 		return
@@ -305,6 +473,9 @@ func (s *Server) handleFsDownload(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleFsUpload(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	dest := r.URL.Query().Get("path")
 	if dest == "" {
 		writeErr(w, 400, "path required")
@@ -345,6 +516,10 @@ func (s *Server) handleFsUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fsSimple(w http.ResponseWriter, r *http.Request, typ, action string) {
+	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	var in json.RawMessage
 	if err := readJSON(r, &in); err != nil {
 		fail(w, err)
@@ -352,14 +527,14 @@ func (s *Server) fsSimple(w http.ResponseWriter, r *http.Request, typ, action st
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
 	defer cancel()
-	if err := s.hub.Request(ctx, r.PathValue("id"), typ, in, nil); err != nil {
+	if err := s.hub.Request(ctx, id, typ, in, nil); err != nil {
 		// Audit the attempt, not only the success: probing a fleet for paths
 		// that cannot be read or removed otherwise leaves no trace at all.
-		s.audit(r, action, r.PathValue("id"), auditFailure(map[string]any{"request": string(in)}, err))
+		s.audit(r, action, id, auditFailure(map[string]any{"request": string(in)}, err))
 		fail(w, err)
 		return
 	}
-	s.audit(r, action, r.PathValue("id"), string(in))
+	s.audit(r, action, id, string(in))
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -385,6 +560,9 @@ var validPowerActions = map[string]bool{
 
 func (s *Server) handlePower(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	var in protocol.Power
 	if err := readJSON(r, &in); err != nil {
 		fail(w, err)
@@ -423,9 +601,8 @@ func (s *Server) handlePower(w http.ResponseWriter, r *http.Request) {
 // sleeping device. Query "via" picks the sender; default is any online agent
 // that shares a /24 with one of the target's known addresses.
 func (s *Server) handleWakeOnLan(w http.ResponseWriter, r *http.Request) {
-	target, err := s.db.GetAgent(r.PathValue("id"))
-	if err != nil {
-		fail(w, err)
+	target, ok := s.getScopedAgent(w, r, r.PathValue("id"))
+	if !ok {
 		return
 	}
 	var macs []string
@@ -558,20 +735,29 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
 // ---- enrollment ----
 
 func (s *Server) handleListEnroll(w http.ResponseWriter, r *http.Request) {
-	t, err := s.db.ListEnrollTokens()
+	tokens, err := s.db.ListEnrollTokens()
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"tokens": t, "public_url": s.PublicURL(), "fingerprint": s.PinFingerprint(), "cert_fingerprint": s.Fingerprint()})
+	me := userFrom(r.Context())
+	filtered := make([]EnrollToken, 0, len(tokens))
+	for _, tok := range tokens {
+		if s.canAccessAgent(me, tok.OrgID) {
+			filtered = append(filtered, tok)
+		}
+	}
+	writeJSON(w, 200, map[string]any{"tokens": filtered, "public_url": s.PublicURL(), "fingerprint": s.PinFingerprint(), "cert_fingerprint": s.Fingerprint()})
 }
 
 func (s *Server) handleCreateEnroll(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Name     string `json:"name"`
-		GroupID  *int64 `json:"group_id"`
-		Uses     int    `json:"uses"`
-		TTLHours int    `json:"ttl_hours"`
+		Name     string  `json:"name"`
+		GroupID  *int64  `json:"group_id"`
+		OrgID    *string `json:"org_id"`
+		SiteID   *string `json:"site_id"`
+		Uses     int     `json:"uses"`
+		TTLHours int     `json:"ttl_hours"`
 	}
 	readJSON(r, &in)
 	// uses_left is {-1} + [1..]: -1 is unlimited and anything else non-positive
@@ -586,17 +772,34 @@ func (s *Server) handleCreateEnroll(w http.ResponseWriter, r *http.Request) {
 	if in.TTLHours <= 0 {
 		in.TTLHours = 24
 	}
+	me := userFrom(r.Context())
+	orgID := "org_default"
+	if in.OrgID != nil && *in.OrgID != "" {
+		orgID = *in.OrgID
+	} else if me != nil && !me.IsAdmin() && len(me.OrgScope) > 0 {
+		orgID = me.OrgScope[0]
+	}
+	if !s.canAccessAgent(me, orgID) {
+		writeErr(w, http.StatusForbidden, "unauthorized organization for enrollment token")
+		return
+	}
+	siteID := "site_default"
+	if in.SiteID != nil && *in.SiteID != "" {
+		siteID = *in.SiteID
+	}
 	tok := randomToken(24)
-	res, err := s.db.Exec(`INSERT INTO enroll_tokens(token, name, group_id, uses_left, expires_at, created_by, created_at) VALUES(?,?,?,?,?,?,?)`,
-		tok, in.Name, in.GroupID, in.Uses, time.Now().Add(time.Duration(in.TTLHours)*time.Hour).Unix(), actor(r), now())
+	res, err := s.db.Exec(`INSERT INTO enroll_tokens(token, name, group_id, org_id, site_id, uses_left, expires_at, created_by, created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+		tok, in.Name, in.GroupID, orgID, siteID, in.Uses, time.Now().Add(time.Duration(in.TTLHours)*time.Hour).Unix(), actor(r), now())
 	if err != nil {
 		fail(w, err)
 		return
 	}
 	id, _ := res.LastInsertId()
-	s.audit(r, "enroll.create", in.Name, map[string]any{"uses": in.Uses, "ttl_hours": in.TTLHours})
+	s.audit(r, "enroll.create", in.Name, map[string]any{"uses": in.Uses, "ttl_hours": in.TTLHours, "org_id": orgID, "site_id": siteID})
 	writeJSON(w, 201, map[string]any{
 		"id": id, "token": tok,
+		"org_id":  orgID,
+		"site_id": siteID,
 		"windows": s.installCommandWindows(tok),
 		"linux":   s.installCommandLinux(tok),
 	})
@@ -604,6 +807,16 @@ func (s *Server) handleCreateEnroll(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteEnroll(w http.ResponseWriter, r *http.Request) {
 	id, _ := pathInt(r, "id")
+	var orgID string
+	if err := s.db.QueryRow(`SELECT org_id FROM enroll_tokens WHERE id = ?`, id).Scan(&orgID); err != nil {
+		writeErr(w, 404, "enroll token not found")
+		return
+	}
+	me := userFrom(r.Context())
+	if !s.canAccessAgent(me, orgID) {
+		writeErr(w, 404, "enroll token not found")
+		return
+	}
 	s.db.Exec(`DELETE FROM enroll_tokens WHERE id = ?`, id)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
@@ -618,3 +831,71 @@ func (s *Server) installCommandWindows(token string) string {
 func (s *Server) installCommandLinux(token string) string {
 	return fmt.Sprintf(`curl -fsSk '%s/install/%s?os=linux' | sudo bash`, s.PublicURL(), token)
 }
+
+func (s *Server) handleIsolateAgent(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	target, ok := s.getScopedAgent(w, r, id)
+	if !ok {
+		return
+	}
+	var in struct {
+		Isolate bool `json:"isolate"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	user := userFrom(r.Context())
+	username := ""
+	if user != nil {
+		username = user.Username
+	}
+
+	serverURL := s.PublicURL()
+	serverHost := ""
+	serverPort := 443
+	if u, err := url.Parse(serverURL); err == nil {
+		serverHost = u.Hostname()
+		if p := u.Port(); p != "" {
+			if pi, err := strconv.Atoi(p); err == nil {
+				serverPort = pi
+			}
+		} else if u.Scheme == "http" {
+			serverPort = 80
+		}
+	}
+
+	reqPayload := protocol.DeviceIsolate{
+		Isolate:    in.Isolate,
+		ServerHost: serverHost,
+		ServerPort: serverPort,
+	}
+
+	actionName := "device.isolate"
+	if !in.Isolate {
+		actionName = "device.release"
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	var res protocol.DeviceIsolateResult
+	err := s.hub.Request(ctx, id, protocol.ReqDeviceIsolate, reqPayload, &res)
+	if err != nil && !errors.Is(err, ErrAgentOffline) {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	if err := s.db.SetAgentIsolated(id, in.Isolate, username); err != nil {
+		fail(w, err)
+		return
+	}
+
+	s.audit(r, actionName, id, map[string]any{"isolated": in.Isolate, "by": username, "target": target.DisplayName})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"isolated": in.Isolate,
+	})
+}
+

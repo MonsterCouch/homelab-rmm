@@ -74,64 +74,17 @@ has an environment twin (`RMM_LISTEN`, `RMM_DATA_DIR`, `RMM_PUBLIC_URL`, `RMM_CE
 Docker image and the example systemd unit use. `RMM_DEBUG=1` switches both binaries to debug logging (every API
 request is logged with its duration).
 
-### First run: the one-time setup code
+### First run: creating the administrator
 
-Until an account exists, anyone who can reach the port could complete the setup form and become
-the administrator. So a server that starts with an **empty user table mints a random setup code**
-and prints it two ways:
+On first startup with no users in the database, navigate to the web console in your browser (e.g. `https://localhost:8443` or your configured public URL). The console presents the welcome setup form to create the initial administrator account.
 
-```
-==== FIRST-RUN SETUP CODE: 3f9a1c07 ====
-```
-
-on the console (stderr: `journalctl -u HomelabRMMServer`, `docker logs`) and — the place to look
-when it runs as a Windows service, where stderr goes nowhere — as a `WARN` line in `server.log`
-in the data directory:
-
-```
-level=WARN msg="FIRST RUN: no users yet. ..." setup_code=3f9a1c07
-```
-
-**The short way to get it back is `rmm-server setup-code`.** It reads the most recent code out
-of `server.log`, which is the only durable copy — the code is minted in memory and never stored,
-so the database does not have it:
-
-```
-C:\Program Files\HomelabRMM Server> .\rmm-server.exe setup-code
-
-==== FIRST-RUN SETUP CODE: 3f9a1c07 ====
-
-Enter it in the Setup code field at https://rmm.example.ts.net:8443
-```
-
-Run it **elevated**: the data directory is locked down to SYSTEM and Administrators, so an
-unprivileged prompt cannot read the log. Pass `--data` if the server does not use the default
-directory. If an account already exists the command says so instead of printing a spent code,
-because from that point the form stops asking and the recovery you want is
-`rmm-server user passwd`. If the log holds no code at all, restart the server while the user
-table is still empty and a fresh one is minted.
-
-- The setup form **always** shows a **Setup code** field and the request is refused with 403
-  until it matches — from the LAN, from behind a reverse proxy, and from a browser on the server
-  itself. There is no loopback exemption: a peer address of `127.0.0.1` can equally be a same-host
-  reverse proxy relaying the whole LAN, any local process on the box, or a hostile page open in
-  your own browser, and none of those should be able to claim the account that is root on every
-  device you later enroll. Reading the code proves you can see the server's console or log, which
-  is the thing worth proving.
-- Wrong codes are rate-limited like logins and audited as `setup.refused`.
-- Concurrent setup requests do not race: the "no users yet?" check and the insert are one step,
-  so a first-run window produces exactly one administrator.
-- **Lost the code?** Restart the server *before anyone creates a user*: a new code is minted on
-  every start that finds no users, so `rmm-server restart` (or `systemctl restart
-  HomelabRMMServer`) prints a fresh one. Once the first account exists the code stops being
-  minted and stops being asked for — from then on recovery is `rmm-server user passwd`.
-- **Docker**: read it from the container log —
-  `docker logs homelab-rmm 2>&1 | grep -i "setup code"` (`docker compose logs rmm` with the
-  compose file). The image is distroless, so there is no shell to `docker exec` into; the same
-  code is in `/data/server.log` inside the volume if you need it later, as the `setup_code=`
-  attribute of the `FIRST RUN` warning
-  (`docker run --rm -v rmm-data:/data busybox grep setup_code /data/server.log`). A fresh code
-  needs `docker compose restart rmm` while the user table is still empty.
+- Concurrent setup requests do not race: the "no users yet?" check and the insert are atomic, so a first-run window produces exactly one administrator.
+- Once the first administrator is created, first-run setup is closed and all subsequent visits route to `/login`.
+- If you ever need to reset the administrator password or add users from the command line, use:
+  ```
+  rmm-server user passwd --username <name>
+  rmm-server user add --username <name> --role admin
+  ```
 
 ### Users from the command line
 

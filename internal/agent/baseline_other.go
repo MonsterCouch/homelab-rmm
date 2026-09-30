@@ -28,3 +28,7 @@ func errString(err error) string {
 	}
 	return err.Error()
 }
+
+func promptRebootUser(ctx context.Context, reason string, displaySec, postponesRemaining, maxPostpones int) (string, error) {
+	return "headless", nil
+}

@@ -23,6 +23,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /ws/desktop-agent", s.handleDesktopAgentWS)
 	mux.HandleFunc("GET /api/agent-download/{file}", s.handleAgentDownload)
 	mux.HandleFunc("GET /install/{token}", s.handleInstallScript)
+	mux.HandleFunc("GET /install/{token}/msi", s.handleInstallMSI)
+	mux.HandleFunc("GET /install/{token}/deb", s.handleInstallDeb)
 
 	// auth. These hang off the OUTER mux - there is no session yet - so
 	// requireUser's CSRF check never runs on them and authGuard applies it.
@@ -31,7 +33,26 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/auth/login", s.authGuard(s.handleLogin))
 	mux.HandleFunc("POST /api/auth/logout", s.authGuard(s.handleLogout))
 
+	// Client portal. A device user gets in with a pass the device's agent
+	// asked for (portal_auth.go); a console user with their session. These
+	// hang off the outer mux because a device user has no console session.
+	mux.HandleFunc("POST /api/agent/portal-pass", s.handleAgentPortalPass)
+	mux.HandleFunc("GET /portal/start", s.handlePortalStart)
+	mux.HandleFunc("GET /api/portal/config", s.portalGuard(s.handlePortalConfig))
+	mux.HandleFunc("GET /api/portal/software", s.portalGuard(s.handlePortalSoftware))
+	mux.HandleFunc("POST /api/portal/software/action", s.portalGuard(s.handlePortalSoftwareAction))
+	mux.HandleFunc("GET /api/portal/runs/{id}", s.portalGuard(s.handlePortalGetRun))
+	mux.HandleFunc("GET /api/portal/tickets", s.portalGuard(s.handlePortalListTickets))
+	mux.HandleFunc("GET /api/portal/tickets/{id}", s.portalGuard(s.handlePortalGetTicket))
+	mux.HandleFunc("POST /api/portal/tickets", s.portalGuard(s.handlePortalCreateTicket))
+	mux.HandleFunc("POST /api/portal/tickets/{id}/comments", s.portalGuard(s.handlePortalAddComment))
+
+	mux.HandleFunc("GET /api/agent/update-check", s.handleAgentUpdateCheck)
+
 	api := http.NewServeMux()
+	api.HandleFunc("GET /api/server/version", s.handleServerVersionInfo)
+	api.HandleFunc("POST /api/server/update", s.requireAdmin(s.handleServerUpdate))
+	api.HandleFunc("POST /api/agents/update-all", s.requireAdmin(s.handleDispatchAllAgentsUpdate))
 	api.HandleFunc("GET /api/me", s.handleMe)
 	api.HandleFunc("POST /api/me/password", s.handleChangePassword)
 	api.HandleFunc("POST /api/me/totp/begin", s.handleTOTPBegin)
@@ -44,6 +65,7 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("GET /api/agents/{id}", s.handleGetAgent)
 	api.HandleFunc("PATCH /api/agents/{id}", s.requireWrite(s.handleUpdateAgent))
 	api.HandleFunc("DELETE /api/agents/{id}", s.requireWrite(s.handleDeleteAgent))
+	api.HandleFunc("POST /api/agents/{id}/update", s.requireWrite(s.handleDispatchAgentUpdate))
 	api.HandleFunc("GET /api/agents/{id}/metrics", s.handleAgentMetrics)
 	api.HandleFunc("GET /api/agents/{id}/events", s.handleAgentEvents)
 	api.HandleFunc("POST /api/agents/{id}/refresh", s.requireWrite(s.handleAgentRefresh))
@@ -60,12 +82,23 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("POST /api/agents/{id}/fs/rename", s.requireWrite(s.handleFsRename))
 	api.HandleFunc("POST /api/agents/{id}/power", s.requireWrite(s.handlePower))
 	api.HandleFunc("POST /api/agents/{id}/wol", s.requireWrite(s.handleWakeOnLan))
+	api.HandleFunc("POST /api/agents/{id}/isolate", s.requireWrite(s.handleIsolateAgent))
 	api.HandleFunc("POST /api/agents/{id}/run", s.requireWrite(s.handleRunScriptOnAgent))
 	api.HandleFunc("GET /api/agents/{id}/patches", s.handleAgentPatches)
 	api.HandleFunc("POST /api/agents/{id}/patches/scan", s.requireWrite(s.handlePatchScan))
 	api.HandleFunc("POST /api/agents/{id}/patches/install", s.requireWrite(s.handlePatchInstall))
 	api.HandleFunc("GET /ws/shell/{id}", s.requireWrite(s.handleShellWS))
 	api.HandleFunc("GET /ws/desktop/{id}", s.requireWrite(s.handleDesktopViewerWS))
+
+	api.HandleFunc("GET /api/organizations", s.handleListOrganizations)
+	api.HandleFunc("POST /api/organizations", s.requireAdmin(s.handleCreateOrganization))
+	api.HandleFunc("PUT /api/organizations/{id}", s.requireAdmin(s.handleUpdateOrganization))
+	api.HandleFunc("DELETE /api/organizations/{id}", s.requireAdmin(s.handleDeleteOrganization))
+	api.HandleFunc("GET /api/organizations/{id}/sites", s.handleListSites)
+	api.HandleFunc("GET /api/sites", s.handleListSites)
+	api.HandleFunc("POST /api/organizations/{id}/sites", s.requireAdmin(s.handleCreateSite))
+	api.HandleFunc("PUT /api/sites/{id}", s.requireAdmin(s.handleUpdateSite))
+	api.HandleFunc("DELETE /api/sites/{id}", s.requireAdmin(s.handleDeleteSite))
 
 	api.HandleFunc("GET /api/groups", s.handleListGroups)
 	api.HandleFunc("POST /api/groups", s.requireWrite(s.handleCreateGroup))
@@ -94,10 +127,10 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("DELETE /api/tasks/{id}", s.requireWrite(s.handleDeleteTask))
 	api.HandleFunc("POST /api/tasks/{id}/run", s.requireWrite(s.handleRunTask))
 
-	api.HandleFunc("GET /api/automations", s.handleListAutomations)
-	api.HandleFunc("POST /api/automations", s.requireWrite(s.handleCreateAutomation))
-	api.HandleFunc("PUT /api/automations/{id}", s.requireWrite(s.handleUpdateAutomation))
-	api.HandleFunc("DELETE /api/automations/{id}", s.requireWrite(s.handleDeleteAutomation))
+	api.HandleFunc("GET /api/automations", s.requireAdmin(s.handleListAutomations))
+	api.HandleFunc("POST /api/automations", s.requireAdmin(s.handleCreateAutomation))
+	api.HandleFunc("PUT /api/automations/{id}", s.requireAdmin(s.handleUpdateAutomation))
+	api.HandleFunc("DELETE /api/automations/{id}", s.requireAdmin(s.handleDeleteAutomation))
 
 	api.HandleFunc("GET /api/alert-rules", s.handleListAlertRules)
 	api.HandleFunc("POST /api/alert-rules", s.requireWrite(s.handleCreateAlertRule))
@@ -133,6 +166,33 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("PUT /api/patch-policies/{id}", s.requireWrite(s.handleUpdatePatchPolicy))
 	api.HandleFunc("DELETE /api/patch-policies/{id}", s.requireWrite(s.handleDeletePatchPolicy))
 
+	// Software Catalog & Privileged Self-Service Execution
+	api.HandleFunc("GET /api/software-catalog", s.handleListSoftwareCatalog)
+	api.HandleFunc("POST /api/software-catalog", s.requireAdmin(s.handleCreateSoftwareCatalogItem))
+	api.HandleFunc("GET /api/software-catalog/{id}", s.handleGetSoftwareCatalogItem)
+	api.HandleFunc("PUT /api/software-catalog/{id}", s.requireAdmin(s.handleUpdateSoftwareCatalogItem))
+	api.HandleFunc("DELETE /api/software-catalog/{id}", s.requireAdmin(s.handleDeleteSoftwareCatalogItem))
+	api.HandleFunc("POST /api/agents/{id}/software/install", s.requireWrite(s.handleAgentSoftwareInstall))
+	api.HandleFunc("POST /api/agents/{id}/software/uninstall", s.requireWrite(s.handleAgentSoftwareUninstall))
+
+	// Network Discovery & SNMP Polling
+	api.HandleFunc("GET /api/discovered-devices", s.handleListDiscoveredDevices)
+	api.HandleFunc("GET /api/discovered-devices/{id}", s.handleGetDiscoveredDevice)
+	api.HandleFunc("PUT /api/discovered-devices/{id}", s.requireWrite(s.handleUpdateDiscoveredDevice))
+	api.HandleFunc("DELETE /api/discovered-devices/{id}", s.requireWrite(s.handleDeleteDiscoveredDevice))
+	api.HandleFunc("POST /api/discovered-devices/{id}/poll", s.requireWrite(s.handlePollDiscoveredDeviceSNMP))
+	api.HandleFunc("GET /api/network-scans", s.handleListNetworkScans)
+	api.HandleFunc("POST /api/network-scans", s.requireWrite(s.handleStartNetworkScan))
+
+	// Integrated Helpdesk Ticketing System
+	api.HandleFunc("GET /api/tickets", s.handleListTickets)
+	api.HandleFunc("GET /api/tickets/{id}", s.handleGetTicket)
+	api.HandleFunc("POST /api/tickets", s.handleCreateTicket)
+	api.HandleFunc("PUT /api/tickets/{id}", s.requireWrite(s.handleUpdateTicket))
+	api.HandleFunc("DELETE /api/tickets/{id}", s.requireAdmin(s.handleDeleteTicket))
+	api.HandleFunc("POST /api/tickets/{id}/comments", s.requireWrite(s.handleAddTicketComment))
+	api.HandleFunc("GET /api/agents/{id}/tickets", s.handleAgentTickets)
+
 	api.HandleFunc("GET /api/settings", s.requireAdmin(s.handleGetSettings))
 	api.HandleFunc("PUT /api/settings", s.requireAdmin(s.handlePutSettings))
 	api.HandleFunc("POST /api/settings/test-mail", s.requireAdmin(s.handleTestMail))
@@ -140,7 +200,7 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("POST /api/users", s.requireAdmin(s.handleCreateUser))
 	api.HandleFunc("PUT /api/users/{id}", s.requireAdmin(s.handleUpdateUser))
 	api.HandleFunc("DELETE /api/users/{id}", s.requireAdmin(s.handleDeleteUser))
-	api.HandleFunc("GET /api/audit", s.handleAudit)
+	api.HandleFunc("GET /api/audit", s.requireAdmin(s.handleAudit))
 	api.HandleFunc("GET /api/system", s.handleSystemInfo)
 
 	mux.Handle("/api/", s.requireUser(api))
@@ -284,10 +344,8 @@ func (s *Server) handleAuthState(w http.ResponseWriter, r *http.Request) {
 	}
 	needs := s.db.UserCount() == 0
 	writeJSON(w, 200, map[string]any{
-		"needs_setup": needs,
-		// There is no exemption: whoever completes first-run setup proves they
-		// can read the server's console or log. See handleSetup.
-		"setup_code_required": needs,
+		"needs_setup":         needs,
+		"setup_code_required": false,
 		"user":                u,
 		"version":             Version,
 	})
@@ -325,29 +383,12 @@ func (s *Server) authGuard(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// SetupCode is the one-time first-run code, or "" once an administrator
-// exists (or if this process started with users and therefore minted none).
+// SetupCode is deprecated and returns "" since a setup code is no longer required.
 func (s *Server) SetupCode() string {
-	s.setupMu.Lock()
-	defer s.setupMu.Unlock()
-	return s.setupCode
+	return ""
 }
 
 // handleSetup creates the first administrator.
-//
-// Two things make it dangerous. It is unauthenticated by definition, so
-// between the server starting and the operator reaching the form, anyone who
-// can open a socket to the port - a machine on the LAN, a browser behind a
-// reverse proxy, any local process, or a hostile page via CSRF - could claim
-// the account that is root on every enrolled device. And the check "is there a
-// user yet?" is separated from the insert by a ~250 ms bcrypt hash, so
-// concurrent requests all passed it and each created an administrator.
-//
-// So: the one-time code printed at startup is ALWAYS required (there is no
-// loopback exemption - a peer address of 127.0.0.1 proves nothing about who is
-// at the other end of a same-host proxy, and says nothing about which local
-// user is asking), and the check and the insert happen under setupMu so first
-// run really is once.
 func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
 	if s.db.UserCount() > 0 {
@@ -372,15 +413,6 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "already set up")
 		return
 	}
-	// An empty s.setupCode means this process did not mint one (it started
-	// with users that have since gone): refuse rather than accept an empty
-	// code, and say how to get a new one.
-	if s.setupCode == "" || !constantTimeEqual(strings.ToLower(strings.TrimSpace(in.Code)), s.setupCode) {
-		s.db.Audit(in.Username, ip, "setup.refused", "", "wrong setup code")
-		slog.Warn("first-run setup refused: wrong setup code", "ip", ip, "username", in.Username)
-		writeErr(w, http.StatusForbidden, "wrong setup code: use the one-time code the server printed at startup (console, or server.log in the data directory). Restart the server before anyone creates a user to mint a new one")
-		return
-	}
 	if strings.TrimSpace(in.Username) == "" {
 		writeErr(w, 400, "username required")
 		return
@@ -390,7 +422,6 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	s.setupCode = "" // spent
 	s.db.Audit(in.Username, ip, "setup", "", nil)
 	tok, err := s.db.createSession(id, ip, r.UserAgent())
 	if err != nil {
@@ -528,6 +559,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	fl.Flush()
 	ping := time.NewTicker(25 * time.Second)
 	defer ping.Stop()
+	me := userFrom(r.Context())
 	for {
 		select {
 		case <-r.Context().Done():
@@ -536,6 +568,25 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, ": ping\n\n")
 			fl.Flush()
 		case ev := <-ch:
+			if me != nil && !me.IsAdmin() {
+				agentOrgID := ev.OrgID
+				if agentOrgID == "" && ev.AgentID != "" {
+					if err := s.db.QueryRow(`SELECT org_id FROM agents WHERE id = ?`, ev.AgentID).Scan(&agentOrgID); err != nil {
+						continue
+					}
+				}
+				if agentOrgID != "" {
+					if !s.canAccessAgent(me, agentOrgID) {
+						continue
+					}
+				} else if len(me.OrgScope) > 0 || me.IsPOC() {
+					// A scoped user must not receive unscoped agent/device events
+					switch ev.Kind {
+					case "event", "run", "metrics", "inventory", "baseline", "agent_online", "agent_offline":
+						continue
+					}
+				}
+			}
 			b, _ := json.Marshal(ev)
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Kind, b)
 			fl.Flush()
@@ -546,16 +597,33 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 // ---- dashboard ----
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	// The hub, not the agents.online column: the column is wiped at every
-	// startup, so the dashboard used to report "0 online" beside a device
-	// list on the same screen that showed them all up.
 	agents, err := s.agentsWithLiveness()
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	var online, offline, reboot, windows, linux int
+	reqOrg := r.URL.Query().Get("org_id")
+	reqSite := r.URL.Query().Get("site_id")
+	me := userFrom(r.Context())
+
+	var scopedAgents []*Agent
+	allowedAgentIDs := make(map[string]bool)
 	for _, a := range agents {
+		if !s.canAccessAgent(me, a.OrgID) {
+			continue
+		}
+		if reqOrg != "" && a.OrgID != reqOrg {
+			continue
+		}
+		if reqSite != "" && a.SiteID != reqSite {
+			continue
+		}
+		scopedAgents = append(scopedAgents, a)
+		allowedAgentIDs[a.ID] = true
+	}
+
+	var online, offline, reboot, windows, linux int
+	for _, a := range scopedAgents {
 		if a.Online {
 			online++
 		} else {
@@ -571,36 +639,63 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			linux++
 		}
 	}
-	var openAlerts, critical, patches, runsToday, runsFailed int
-	// COALESCE: SUM() over no rows is NULL, which fails the Scan halfway
-	// through. The counts happened to survive because database/sql assigns
-	// left to right, which is not something to rely on.
-	if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(severity = 'critical'), 0) FROM alerts WHERE status != 'resolved'`).Scan(&openAlerts, &critical); err != nil {
-		slog.Warn("dashboard alert counts", "err", err)
+
+	rawAlerts, _ := s.db.ListAlerts("open", "", 500)
+	var openAlerts, critical int
+	filteredAlerts := []Alert{}
+	for _, al := range rawAlerts {
+		if allowedAgentIDs[al.AgentID] {
+			openAlerts++
+			if al.Severity == "critical" {
+				critical++
+			}
+			if len(filteredAlerts) < 10 {
+				filteredAlerts = append(filteredAlerts, al)
+			}
+		}
 	}
-	if err := s.db.QueryRow(`SELECT COUNT(DISTINCT agent_id) FROM patches WHERE status IN ('available','approved')`).Scan(&patches); err != nil {
-		slog.Warn("dashboard patch count", "err", err)
+
+	patchAgentSet := make(map[string]bool)
+	if patchList, err := s.db.ListPatches("", "available", 2000); err == nil {
+		for _, p := range patchList {
+			if allowedAgentIDs[p.AgentID] {
+				patchAgentSet[p.AgentID] = true
+			}
+		}
 	}
+	if appPatchList, err := s.db.ListPatches("", "approved", 2000); err == nil {
+		for _, p := range appPatchList {
+			if allowedAgentIDs[p.AgentID] {
+				patchAgentSet[p.AgentID] = true
+			}
+		}
+	}
+	patches := len(patchAgentSet)
+
+	rawRuns, _ := s.db.ListRuns("", 50)
+	var runsToday, runsFailed int
+	filteredRuns := []Run{}
 	dayAgo := now() - 86400
-	if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(status IN ('failed','timeout')), 0) FROM script_runs WHERE started_at > ?`, dayAgo).Scan(&runsToday, &runsFailed); err != nil {
-		slog.Warn("dashboard run counts", "err", err)
+	for _, run := range rawRuns {
+		if allowedAgentIDs[run.AgentID] {
+			if run.StartedAt > dayAgo {
+				runsToday++
+				if run.Status == "failed" || run.Status == "timeout" {
+					runsFailed++
+				}
+			}
+			if len(filteredRuns) < 10 {
+				filteredRuns = append(filteredRuns, run)
+			}
+		}
 	}
-	alerts, err := s.db.ListAlerts("open", "", 10)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	runs, err := s.db.ListRuns("", 10)
-	if err != nil {
-		fail(w, err)
-		return
-	}
+
 	writeJSON(w, 200, map[string]any{
 		"agents_online": online, "agents_offline": offline, "pending_reboot": reboot,
 		"windows": windows, "linux": linux,
 		"open_alerts": openAlerts, "critical_alerts": critical, "devices_need_patches": patches,
 		"runs_24h": runsToday, "runs_failed_24h": runsFailed,
-		"recent_alerts": alerts, "recent_runs": runs,
+		"recent_alerts": filteredAlerts, "recent_runs": filteredRuns,
 		"server_version": Version, "uptime": int64(time.Since(s.startedAt).Seconds()),
 	})
 }

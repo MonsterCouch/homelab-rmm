@@ -9,3 +9,5 @@ import "os"
 // and a chmod fixes a directory that predates it (or was created with a
 // looser umask by hand).
 func secureDir(path string) error { return os.Chmod(path, 0o700) }
+
+func saveRegistryClientInfo(serverURL, agentID string) {}

@@ -45,6 +45,87 @@ const blankForm = (): Form => ({
   checks: [],
 });
 
+function renderRemediationAction(c: BaselineCheck, enforceBaseline: boolean) {
+  if (!c.remediate) {
+    return <Chip outline>Audit Only</Chip>;
+  }
+
+  let label = 'Auto-Fix';
+  let tone: 'purple' | 'warn' | 'danger' | 'info' = 'purple';
+  let title = 'Remediates drift automatically';
+
+  if (c.kind === 'package') {
+    if (c.params.fix_script) {
+      label = `Script (${c.params.fix_lang || 'ps1'})`;
+      title = 'Custom script remediation';
+    } else if (c.params.allow_winget) {
+      label = 'Winget';
+      title = 'Winget silent package manager';
+    } else if (c.os_filter === 'linux') {
+      label = 'apt / dnf';
+      title = 'Linux package manager';
+    } else {
+      label = 'Pkg Mgr';
+      title = 'System package manager';
+    }
+  } else if (c.kind === 'service') {
+    if (c.params.fix_script) {
+      label = `Script (${c.params.fix_lang || 'ps1'})`;
+      title = 'Custom script remediation';
+    } else {
+      label = 'Service Mgr';
+      title = 'Built-in sc.exe / systemctl service control';
+    }
+  } else if (c.kind === 'command') {
+    label = `Fix Script (${c.params.language || 'bash'})`;
+    title = 'Executes custom fix script';
+  } else if (c.kind === 'registry') {
+    label = 'Reg Write';
+    title = 'Atomic Win32 registry set';
+  } else if (c.kind === 'file') {
+    label = c.params.state === 'absent' ? 'File Remove' : 'File Sync';
+    title = 'Atomic file update or deletion';
+  } else if (c.kind === 'reboot_pending') {
+    if (c.params.warn_user !== false) {
+      label = `Prompt User (${c.params.max_postpones ?? 3}x)`;
+      tone = 'warn';
+      title = `Interactive prompt with up to ${c.params.max_postpones ?? 3} postpones, enforcing at ${c.params.enforce_time || '23:00'}`;
+    } else {
+      label = 'Auto Reboot';
+      tone = 'danger';
+      title = 'Unattended restart with 60-second system warning';
+    }
+  } else if (c.kind === 'firewall') {
+    label = 'Firewall Policy';
+    title = 'Enforces firewall state';
+  } else if (c.kind === 'time_sync') {
+    label = 'Time Sync';
+    title = 'Enables & resyncs time service';
+  } else if (c.kind === 'windows_feature') {
+    label = 'Win Feature';
+    title = 'Enables or disables optional feature';
+  } else if (c.kind === 'sysctl') {
+    label = 'sysctl Write';
+    title = 'Enforces Linux kernel parameters';
+  } else if (c.kind === 'group_members') {
+    label = 'Group Prune';
+    title = 'Removes unauthorized accounts from local group';
+  }
+
+  return (
+    <div className="row" style={{ gap: 4, alignItems: 'center', flexWrap: 'nowrap' }}>
+      <Chip tone={tone} title={title}>
+        {label}
+      </Chip>
+      {!enforceBaseline && (
+        <span className="muted small" title="Check has remediation configured, but baseline-level enforcement is currently off">
+          (audit)
+        </span>
+      )}
+    </div>
+  );
+}
+
 export function BaselineEditor() {
   const { id } = useParams();
   const baselineId = id ? Number(id) : 0;
@@ -208,6 +289,19 @@ export function BaselineEditor() {
         <div className="card">
           <div className="card-head">Basics</div>
           <div className="card-body">
+            <Field label="Target Operating System" hint="Select the OS first to filter available checks and endpoints.">
+              <div className="row" style={{ gap: 16 }}>
+                <label className="row" style={{ gap: 6, cursor: 'pointer', fontWeight: !f.targets.os ? 600 : 400 }}>
+                  <input type="radio" name="bl-os" checked={!f.targets.os} disabled={!canWrite} onChange={() => upd({ targets: { ...f.targets, os: undefined } })} /> Cross-Platform / Any
+                </label>
+                <label className="row" style={{ gap: 6, cursor: 'pointer', fontWeight: f.targets.os === 'windows' ? 600 : 400 }}>
+                  <input type="radio" name="bl-os" checked={f.targets.os === 'windows'} disabled={!canWrite} onChange={() => upd({ targets: { ...f.targets, os: 'windows' } })} /> Windows
+                </label>
+                <label className="row" style={{ gap: 6, cursor: 'pointer', fontWeight: f.targets.os === 'linux' ? 600 : 400 }}>
+                  <input type="radio" name="bl-os" checked={f.targets.os === 'linux'} disabled={!canWrite} onChange={() => upd({ targets: { ...f.targets, os: 'linux' } })} /> Linux
+                </label>
+              </div>
+            </Field>
             <Field label="Name" htmlFor="bl-name">
               <input id="bl-name" value={f.name} maxLength={LIMITS.name} disabled={!canWrite} onChange={(e) => upd({ name: e.target.value })} />
             </Field>
@@ -267,19 +361,8 @@ export function BaselineEditor() {
                     label="Email a digest of new critical drift"
                   />
                 </span>
-                <span data-testid="bl-enforce">
-                  <Switch checked={f.enforce} disabled={!canWrite} onChange={(enforce) => upd({ enforce })} label="Enforce: let the agent fix drift" />
-                </span>
               </div>
             </Field>
-            {f.enforce && (
-              <div className="banner warn" role="note">
-                <span>
-                  <b>The agent will change these devices without asking.</b> Every check below with remediation on will be fixed on its own schedule, on every matched device,
-                  and reported as <code>fixed</code>. Preview first.
-                </span>
-              </div>
-            )}
           </div>
         </div>
 
@@ -298,6 +381,79 @@ export function BaselineEditor() {
               </div>
             )}
           </div>
+        </div>
+      </div>
+
+      <div className="card" style={{ marginTop: 14, border: f.enforce ? '1px solid var(--accent)' : undefined }}>
+        <div className="card-head" style={{ justifyContent: 'space-between' }}>
+          <span>Compliance & Enforcement Policy</span>
+          <Chip tone={f.enforce ? 'purple' : 'info'}>
+            {f.enforce ? 'Auto-Enforce & Remediate' : 'Audit & Alert Only'}
+          </Chip>
+        </div>
+        <div className="card-body stack" style={{ gap: 12 }}>
+          <p className="small muted" style={{ margin: 0 }}>
+            Choose whether this baseline only measures compliance and opens drift alerts, or actively enforces settings on endpoints.
+          </p>
+          <div className="grid cols-2" style={{ gap: 14 }}>
+            <label
+              className="card"
+              style={{
+                padding: '12px 14px',
+                margin: 0,
+                cursor: canWrite ? 'pointer' : 'default',
+                border: !f.enforce ? '2px solid var(--primary)' : '1px solid var(--border)',
+                background: !f.enforce ? 'rgba(59, 130, 246, 0.08)' : 'var(--bg-card)',
+              }}
+            >
+              <div className="row" style={{ gap: 8, alignItems: 'center', marginBottom: 4 }}>
+                <input
+                  type="radio"
+                  name="bl-enforce-mode"
+                  checked={!f.enforce}
+                  disabled={!canWrite}
+                  onChange={() => upd({ enforce: false })}
+                />
+                <b>Audit & Alert Only</b>
+              </div>
+              <div className="small muted">
+                Monitors checks on schedule, flags drift in the Activity log, and opens alerts. Never alters system state.
+              </div>
+            </label>
+
+            <label
+              className="card"
+              style={{
+                padding: '12px 14px',
+                margin: 0,
+                cursor: canWrite ? 'pointer' : 'default',
+                border: f.enforce ? '2px solid var(--accent)' : '1px solid var(--border)',
+                background: f.enforce ? 'rgba(168, 85, 247, 0.08)' : 'var(--bg-card)',
+              }}
+            >
+              <div className="row" style={{ gap: 8, alignItems: 'center', marginBottom: 4 }}>
+                <input
+                  type="radio"
+                  name="bl-enforce-mode"
+                  checked={f.enforce}
+                  disabled={!canWrite}
+                  onChange={() => upd({ enforce: true })}
+                />
+                <b>Auto-Enforce & Remediate</b>
+              </div>
+              <div className="small muted">
+                The agent actively fixes drifted settings using built-in actions, custom scripts, or interactive prompts.
+              </div>
+            </label>
+          </div>
+
+          {f.enforce && (
+            <div className="banner warn" role="note" style={{ margin: 0 }}>
+              <span>
+                ⚡ <b>Active Enforcement Mode:</b> Every check below with remediation enabled will be automatically fixed by the agent on matched devices. Review each check's <b>Remediation Action Preview</b> before saving.
+              </span>
+            </div>
+          )}
         </div>
       </div>
 
@@ -324,7 +480,7 @@ export function BaselineEditor() {
                   <th>Check</th>
                   <th>Kind</th>
                   <th>Severity</th>
-                  <th>Fix</th>
+                  <th>Remediation Action</th>
                   <th>OS</th>
                   <th>Timeout</th>
                   <th />
@@ -364,7 +520,7 @@ export function BaselineEditor() {
                       <td>
                         <SeverityChip severity={c.severity} />
                       </td>
-                      <td>{c.remediate ? <Chip tone="purple">fix</Chip> : <span className="faint">report</span>}</td>
+                      <td>{renderRemediationAction(c, f.enforce)}</td>
                       <td className="muted small">{c.os_filter ? osLabel(c.os_filter) : 'any'}</td>
                       <td className="muted small">{c.timeout_sec}s</td>
                       <td>
@@ -394,6 +550,7 @@ export function BaselineEditor() {
         <CheckDialog
           check={editing.check}
           isAdmin={isAdmin}
+          osFilter={f.targets.os}
           onClose={() => setEditing(null)}
           onSave={(c) => {
             setCheck(editing.index, c);

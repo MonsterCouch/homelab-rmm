@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net"
@@ -23,17 +24,54 @@ const (
 	RoleAdmin     = "admin"
 	RoleTech      = "tech"
 	RoleViewer    = "viewer"
+	// RoleContact is a client's point of contact: someone at a client
+	// business who sees that one organization's tickets in the portal and
+	// cannot use the management console at all. Stored as "poc".
+	RoleContact = "poc"
 )
+
+func validRole(role string) bool {
+	return role == RoleAdmin || role == RoleTech || role == RoleViewer || role == RoleContact
+}
+
+// checkRoleScope is the one rule tying a role to its organizations: a client
+// contact belongs to exactly one, which must exist. Everyone else may have
+// any scope (none means every organization).
+func (d *DB) checkRoleScope(role string, orgScope []string) error {
+	if role != RoleContact {
+		return nil
+	}
+	if len(orgScope) != 1 {
+		return errors.New("a client contact must belong to exactly one organization")
+	}
+	var one int
+	if err := d.QueryRow(`SELECT 1 FROM organizations WHERE id = ?`, orgScope[0]).Scan(&one); err != nil {
+		return errors.New("that organization does not exist")
+	}
+	return nil
+}
 
 // User is the authenticated principal attached to a request context.
 type User struct {
-	ID          int64  `json:"id"`
-	Username    string `json:"username"`
-	Role        string `json:"role"`
-	Email       string `json:"email"`
-	TOTPEnabled bool   `json:"totp_enabled"`
-	CreatedAt   int64  `json:"created_at"`
-	LastLogin   int64  `json:"last_login"`
+	ID          int64    `json:"id"`
+	Username    string   `json:"username"`
+	Role        string   `json:"role"`
+	Email       string   `json:"email"`
+	OrgScope    []string `json:"org_scope"`
+	TOTPEnabled bool     `json:"totp_enabled"`
+	CreatedAt   int64    `json:"created_at"`
+	LastLogin   int64    `json:"last_login"`
+}
+
+func parseOrgScope(s string) []string {
+	var out []string
+	if s != "" {
+		_ = json.Unmarshal([]byte(s), &out)
+	}
+	if out == nil {
+		out = []string{}
+	}
+	return out
 }
 
 type ctxKey int
@@ -46,9 +84,25 @@ func userFrom(ctx context.Context) *User {
 }
 
 // CanWrite reports whether the role may change state. Viewers are read-only;
-// techs can do everything except manage users and global settings.
-func (u *User) CanWrite() bool { return u != nil && u.Role != RoleViewer }
-func (u *User) IsAdmin() bool  { return u != nil && u.Role == RoleAdmin }
+// techs can do everything except manage users and global settings. It names
+// the roles that may, so a role added later is read-only until it is listed.
+func (u *User) CanWrite() bool {
+	return u != nil && (u.Role == RoleAdmin || u.Role == RoleTech)
+}
+func (u *User) IsAdmin() bool { return u != nil && u.Role == RoleAdmin }
+
+// IsPOC reports whether u is a client contact (see RoleContact).
+func (u *User) IsPOC() bool { return u != nil && u.Role == RoleContact }
+
+// ContactOrg is the one organization a client contact belongs to, or "" if
+// u is not a contact or (from an old record) has no single organization, in
+// which case they see nothing.
+func (u *User) ContactOrg() string {
+	if !u.IsPOC() || len(u.OrgScope) != 1 {
+		return ""
+	}
+	return u.OrgScope[0]
+}
 
 func randomToken(nBytes int) string {
 	b := make([]byte, nBytes)
@@ -78,18 +132,30 @@ func checkPassword(hash, pw string) bool {
 // ---- users ----
 
 func (d *DB) CreateUser(username, password, role, email string) (int64, error) {
+	return d.CreateUserWithScope(username, password, role, email, nil)
+}
+
+func (d *DB) CreateUserWithScope(username, password, role, email string, orgScope []string) (int64, error) {
 	if len(password) < 8 {
 		return 0, errors.New("password must be at least 8 characters")
 	}
-	if role != RoleAdmin && role != RoleTech && role != RoleViewer {
+	if !validRole(role) {
 		return 0, errors.New("invalid role")
+	}
+	if err := d.checkRoleScope(role, orgScope); err != nil {
+		return 0, err
 	}
 	h, err := hashPassword(password)
 	if err != nil {
 		return 0, err
 	}
-	res, err := d.Exec(`INSERT INTO users(username, password_hash, role, email, created_at) VALUES(?,?,?,?,?)`,
-		strings.TrimSpace(username), h, role, email, now())
+	scopeJSON := "[]"
+	if len(orgScope) > 0 {
+		b, _ := json.Marshal(orgScope)
+		scopeJSON = string(b)
+	}
+	res, err := d.Exec(`INSERT INTO users(username, password_hash, role, email, org_scope, created_at) VALUES(?,?,?,?,?,?)`,
+		strings.TrimSpace(username), h, role, email, scopeJSON, now())
 	if err != nil {
 		return 0, err
 	}
@@ -103,7 +169,7 @@ func (d *DB) UserCount() int {
 }
 
 func (d *DB) ListUsers() ([]User, error) {
-	rows, err := d.Query(`SELECT id, username, role, email, totp_enabled, created_at, last_login FROM users ORDER BY username`)
+	rows, err := d.Query(`SELECT id, username, role, email, COALESCE(org_scope, '[]'), totp_enabled, created_at, last_login FROM users ORDER BY username`)
 	if err != nil {
 		return nil, err
 	}
@@ -111,9 +177,11 @@ func (d *DB) ListUsers() ([]User, error) {
 	var out []User
 	for rows.Next() {
 		var u User
-		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.Email, &u.TOTPEnabled, &u.CreatedAt, &u.LastLogin); err != nil {
+		var scope string
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.Email, &scope, &u.TOTPEnabled, &u.CreatedAt, &u.LastLogin); err != nil {
 			return nil, err
 		}
+		u.OrgScope = parseOrgScope(scope)
 		out = append(out, u)
 	}
 	return out, rows.Err()
@@ -131,16 +199,18 @@ type loginResult struct {
 func (d *DB) authenticate(username, password, code string) (*loginResult, error) {
 	var (
 		u      User
+		scope  string
 		hash   string
 		secret string
 	)
-	err := d.QueryRow(`SELECT id, username, role, email, totp_enabled, created_at, last_login, password_hash, totp_secret FROM users WHERE username = ?`, username).
-		Scan(&u.ID, &u.Username, &u.Role, &u.Email, &u.TOTPEnabled, &u.CreatedAt, &u.LastLogin, &hash, &secret)
+	err := d.QueryRow(`SELECT id, username, role, email, COALESCE(org_scope, '[]'), totp_enabled, created_at, last_login, password_hash, totp_secret FROM users WHERE username = ?`, username).
+		Scan(&u.ID, &u.Username, &u.Role, &u.Email, &scope, &u.TOTPEnabled, &u.CreatedAt, &u.LastLogin, &hash, &secret)
 	if err != nil {
 		// burn time so a missing user costs as much as a wrong password
 		bcrypt.CompareHashAndPassword([]byte("$2a$12$7EqJtq98hPqEX7fNZaFWoOhi5XkKzN0vY7zgQ/1Y6yQ8n6jvJ6Yy6"), []byte(password))
 		return nil, errors.New("invalid credentials")
 	}
+	u.OrgScope = parseOrgScope(scope)
 	if !checkPassword(hash, password) {
 		return nil, errors.New("invalid credentials")
 	}
@@ -165,13 +235,15 @@ func (d *DB) userBySession(token string) *User {
 		return nil
 	}
 	var u User
+	var scope string
 	var exp int64
-	err := d.QueryRow(`SELECT u.id, u.username, u.role, u.email, u.totp_enabled, u.created_at, u.last_login, s.expires_at
+	err := d.QueryRow(`SELECT u.id, u.username, u.role, u.email, COALESCE(u.org_scope, '[]'), u.totp_enabled, u.created_at, u.last_login, s.expires_at
 		FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?`, token).
-		Scan(&u.ID, &u.Username, &u.Role, &u.Email, &u.TOTPEnabled, &u.CreatedAt, &u.LastLogin, &exp)
+		Scan(&u.ID, &u.Username, &u.Role, &u.Email, &scope, &u.TOTPEnabled, &u.CreatedAt, &u.LastLogin, &exp)
 	if err != nil || exp < now() {
 		return nil
 	}
+	u.OrgScope = parseOrgScope(scope)
 	return &u
 }
 
@@ -337,12 +409,27 @@ func (s *Server) requireUser(next http.Handler) http.Handler {
 			writeErr(w, http.StatusUnauthorized, "not signed in")
 			return
 		}
+		if u.IsPOC() && !contactMayUse(r) {
+			writeErr(w, http.StatusForbidden, "client contacts can only use the support portal")
+			return
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Header.Get("X-Requested-With") == "" && !isWebSocket(r) {
 			writeErr(w, http.StatusForbidden, "missing X-Requested-With header")
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey, u)))
 	})
+}
+
+// contactMayUse is all of the console a client contact may reach: their own
+// account (to change their password or set up two-step sign-in). Tickets
+// live under /api/portal, which does not come through here.
+func contactMayUse(r *http.Request) bool {
+	switch r.URL.Path {
+	case "/api/me", "/api/me/password", "/api/me/totp/begin", "/api/me/totp/confirm", "/api/me/totp/disable":
+		return true
+	}
+	return false
 }
 
 func (s *Server) requireWrite(next http.HandlerFunc) http.HandlerFunc {

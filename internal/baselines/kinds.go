@@ -326,17 +326,23 @@ func DecodeLenient(raw json.RawMessage, v any) error {
 // ServiceParams is the `service` kind. StartType "" means "any" (A37).
 type ServiceParams struct {
 	Name      string `json:"name"`
-	State     string `json:"state"`      // running, stopped
+	State     string `json:"state"`      // running, stopped, installed, not_installed, present, absent
 	StartType string `json:"start_type"` // auto, manual, disabled, any (default)
+	FixScript string `json:"fix_script,omitempty"`
+	FixLang   string `json:"fix_lang,omitempty"`
 }
 
 // PackageParams is the `package` kind. AllowWinget opts a Windows device in
 // to a winget remediation that is refused by default (A38).
 type PackageParams struct {
 	Name        string `json:"name"`
-	State       string `json:"state"` // present, absent
-	MinVersion  string `json:"min_version"`
+	State       string `json:"state"` // present, absent, installed, not_installed
+	MinVersion  string `json:"min_version,omitempty"`
+	Version     string `json:"version,omitempty"`
+	VersionOp   string `json:"version_op,omitempty"` // ==, >=, <=, <, >, !=
 	AllowWinget bool   `json:"allow_winget"`
+	FixScript   string `json:"fix_script,omitempty"`
+	FixLang     string `json:"fix_lang,omitempty"`
 }
 
 // RegistryParams is the `registry` kind. Value's JSON type is fixed by Type.
@@ -411,8 +417,14 @@ type WindowsFeatureParams struct {
 // RebootPendingParams is the `reboot_pending` kind. AllowReboot turns the
 // check into the most dangerous remediation in the product (A41).
 type RebootPendingParams struct {
-	MaxHours    int  `json:"max_hours"`
-	AllowReboot bool `json:"allow_reboot"`
+	MaxHours         int    `json:"max_hours"`
+	AllowReboot      bool   `json:"allow_reboot"`
+	WarnUser         bool   `json:"warn_user,omitempty"`
+	Reason           string `json:"reason,omitempty"`
+	DisplayTimeSec   int    `json:"display_time_sec,omitempty"`
+	MaxPostpones     int    `json:"max_postpones,omitempty"`
+	PostponeDelayMin int    `json:"postpone_delay_min,omitempty"`
+	EnforceTime      string `json:"enforce_time,omitempty"`
 }
 
 // DiskFreeParams is the `disk_free` kind; check only.
@@ -542,12 +554,22 @@ func validateService(raw json.RawMessage, dec decodeFunc) error {
 	if strings.ContainsAny(p.Name, `/`) {
 		return errors.New("name: a service name cannot contain a slash")
 	}
-	if err := oneOf("state", p.State, "running", "stopped"); err != nil {
+	if err := oneOf("state", p.State, "running", "stopped", "installed", "not_installed", "present", "absent"); err != nil {
 		return err
 	}
 	if p.StartType != "" {
 		if err := oneOf("start_type", p.StartType, "auto", "manual", "disabled", "any"); err != nil {
 			return err
+		}
+	}
+	if p.FixScript != "" {
+		if len(p.FixScript) > MaxCommandBodyBytes {
+			return fmt.Errorf("fix_script: %d bytes exceeds the %d byte limit", len(p.FixScript), MaxCommandBodyBytes)
+		}
+		if p.FixLang != "" {
+			if err := oneOf("fix_lang", p.FixLang, "powershell", "cmd", "bash", "sh", "python"); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -565,18 +587,41 @@ func validatePackage(raw json.RawMessage, dec decodeFunc) error {
 	case '-', ':':
 		return errors.New("name: a package name cannot end with '-' or ':'")
 	}
-	if err := oneOf("state", p.State, "present", "absent"); err != nil {
+	if err := oneOf("state", p.State, "present", "absent", "installed", "not_installed"); err != nil {
 		return err
 	}
-	if p.MinVersion != "" {
-		if p.State != "present" {
-			return errors.New("min_version: only applies when state is present")
+	targetVer := p.Version
+	if targetVer == "" {
+		targetVer = p.MinVersion
+	}
+	if p.VersionOp != "" {
+		if err := oneOf("version_op", p.VersionOp, "==", ">=", "<=", "<", ">", "!="); err != nil {
+			return err
 		}
-		if len(p.MinVersion) > 64 {
-			return errors.New("min_version: too long")
+	}
+	fieldPrefix := "version"
+	if p.MinVersion != "" && p.Version == "" {
+		fieldPrefix = "min_version"
+	}
+	if targetVer != "" {
+		if p.State != "present" && p.State != "installed" {
+			return fmt.Errorf("%s: only applies when state is present or installed", fieldPrefix)
 		}
-		if _, err := CompareVersions(p.MinVersion, p.MinVersion); err != nil {
-			return fmt.Errorf("min_version: %q has no numeric field to compare", p.MinVersion)
+		if len(targetVer) > 64 {
+			return fmt.Errorf("%s: too long", fieldPrefix)
+		}
+		if _, err := CompareVersions(targetVer, targetVer); err != nil {
+			return fmt.Errorf("%s: %q has no numeric field to compare", fieldPrefix, targetVer)
+		}
+	}
+	if p.FixScript != "" {
+		if len(p.FixScript) > MaxCommandBodyBytes {
+			return fmt.Errorf("fix_script: %d bytes exceeds the %d byte limit", len(p.FixScript), MaxCommandBodyBytes)
+		}
+		if p.FixLang != "" {
+			if err := oneOf("fix_lang", p.FixLang, "powershell", "cmd", "bash", "sh", "python"); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -739,6 +784,31 @@ func validateRebootPending(raw json.RawMessage, dec decodeFunc) error {
 	}
 	if p.MaxHours > 24*365 {
 		return errors.New("max_hours: must be a year or less")
+	}
+	if p.WarnUser {
+		if len(p.Reason) > 256 {
+			return errors.New("reason: at most 256 characters")
+		}
+		if p.DisplayTimeSec != 0 && (p.DisplayTimeSec < 10 || p.DisplayTimeSec > 3600) {
+			return errors.New("display_time_sec: must be between 10 and 3600 seconds")
+		}
+		if p.MaxPostpones < 0 || p.MaxPostpones > 20 {
+			return errors.New("max_postpones: must be between 0 and 20")
+		}
+		if p.PostponeDelayMin < 0 || p.PostponeDelayMin > 1440 {
+			return errors.New("postpone_delay_min: must be between 0 and 1440 minutes")
+		}
+		if p.EnforceTime != "" && p.EnforceTime != "immediate" {
+			parts := strings.Split(p.EnforceTime, ":")
+			if len(parts) != 2 {
+				return errors.New("enforce_time: must be HH:MM or immediate")
+			}
+			h, errH := strconv.Atoi(parts[0])
+			m, errM := strconv.Atoi(parts[1])
+			if errH != nil || errM != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+				return errors.New("enforce_time: invalid 24-hour time (00:00 - 23:59) or immediate")
+			}
+		}
 	}
 	return nil
 }

@@ -232,6 +232,27 @@ function TaskEditor({ task, scripts, onClose, onSaved }: { task: Task; scripts: 
     }
   };
 
+  const handleTargetsChange = (newTargets: Targets) => {
+    let scriptId = form.script_id;
+    let args = form.args;
+    if (newTargets.os !== form.targets.os && scriptId) {
+      const cur = scripts.find((s) => s.id === scriptId);
+      if (cur && newTargets.os && cur.os_filter && cur.os_filter !== newTargets.os) {
+        scriptId = null;
+        args = [];
+      }
+    }
+    upd({
+      targets: newTargets,
+      script_id: scriptId,
+      args,
+    });
+  };
+
+  const handleOSChange = (newOS?: string) => {
+    handleTargetsChange({ ...form.targets, os: newOS });
+  };
+
   return (
     <Modal
       title={isNew ? 'New task' : `Edit task: ${task.name}`}
@@ -247,6 +268,19 @@ function TaskEditor({ task, scripts, onClose, onSaved }: { task: Task; scripts: 
       }
     >
       {error && <div className="form-error" role="alert">{error}</div>}
+      <Field label="Target Operating System" hint="Filter scripts and endpoints to this operating system.">
+        <div className="row" style={{ gap: 16 }}>
+          <label className="row" style={{ gap: 6, cursor: 'pointer', fontWeight: !form.targets.os ? 600 : 400 }}>
+            <input type="radio" name="task-os" checked={!form.targets.os} onChange={() => handleOSChange(undefined)} /> Cross-Platform / Any
+          </label>
+          <label className="row" style={{ gap: 6, cursor: 'pointer', fontWeight: form.targets.os === 'windows' ? 600 : 400 }}>
+            <input type="radio" name="task-os" checked={form.targets.os === 'windows'} onChange={() => handleOSChange('windows')} /> Windows
+          </label>
+          <label className="row" style={{ gap: 6, cursor: 'pointer', fontWeight: form.targets.os === 'linux' ? 600 : 400 }}>
+            <input type="radio" name="task-os" checked={form.targets.os === 'linux'} onChange={() => handleOSChange('linux')} /> Linux
+          </label>
+        </div>
+      </Field>
       <div className="form-row">
         <Field label="Name">
           <input value={form.name} autoFocus onChange={(e) => upd({ name: e.target.value })} />
@@ -268,15 +302,17 @@ function TaskEditor({ task, scripts, onClose, onSaved }: { task: Task; scripts: 
 
       {form.kind === 'script' && (
         <>
-          <Field label="Script">
+          <Field label="Script" hint={form.targets.os ? `Filtered to ${form.targets.os}-compatible scripts` : undefined}>
             <select value={form.script_id ?? ''} onChange={(e) => upd({ script_id: e.target.value ? +e.target.value : null })}>
               <option value="">— choose —</option>
-              {scripts.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name} ({s.language}
-                  {s.os_filter ? `, ${s.os_filter}` : ''})
-                </option>
-              ))}
+              {scripts
+                .filter((s) => !form.targets.os || !s.os_filter || s.os_filter === form.targets.os)
+                .map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name} ({s.language}
+                    {s.os_filter ? `, ${s.os_filter}` : ''})
+                  </option>
+                ))}
             </select>
           </Field>
           {script && script.params.length > 0 && (
@@ -310,7 +346,7 @@ function TaskEditor({ task, scripts, onClose, onSaved }: { task: Task; scripts: 
       )}
 
       <Field label="Targets">
-        <TargetPicker value={form.targets} onChange={(targets) => upd({ targets })} agents={agents.data ?? []} groups={groups.data ?? []} />
+        <TargetPicker value={form.targets} onChange={handleTargetsChange} agents={agents.data ?? []} groups={groups.data ?? []} />
       </Field>
       <Field label="Schedule">
         <CronEditor value={form.schedule} onChange={(schedule) => upd({ schedule })} serverError={cronError} />
@@ -362,6 +398,8 @@ export function normTargets(t: Targets): Targets {
     if (t.agents?.length) out.agents = t.agents;
     if (t.groups?.length) out.groups = t.groups;
     if (t.tags?.length) out.tags = t.tags;
+    if (t.organizations?.length) out.organizations = t.organizations;
+    if (t.sites?.length) out.sites = t.sites;
   }
   if (t.os) out.os = t.os;
   return out;

@@ -755,25 +755,45 @@ export function Desktop({ agent, canWrite }: TabProps) {
   };
   const toggleMod = (id: keyof Mods) => setMods((m) => ({ ...m, [id]: !m[id] }));
 
+  const cycleMonitor = () => {
+    if (monitors.length <= 1) return;
+    const currentPos = monitors.findIndex((m) => m.index === monitor);
+    const nextPos = (currentPos + 1) % monitors.length;
+    const nextIdx = monitors[nextPos].index;
+    setMonitor(nextIdx);
+    send({ t: 'monitor', index: nextIdx });
+    toast.info(`Switched to Display ${nextIdx + 1}`, `${monitors[nextPos].w}×${monitors[nextPos].h}`);
+  };
+
   const monitorSelect = monitors.length > 1 && (
-    <select
-      value={monitor}
-      disabled={!live}
-      onChange={(e) => {
-        const idx = +e.target.value;
-        setMonitor(idx);
-        send({ t: 'monitor', index: idx });
-      }}
-      style={{ width: 200 }}
-      aria-label="Monitor"
-    >
-      {monitors.map((mo) => (
-        <option key={mo.index} value={mo.index}>
-          Monitor {mo.index + 1} · {mo.w}×{mo.h}
-          {mo.primary ? ' (primary)' : ''}
-        </option>
-      ))}
-    </select>
+    <div className="row" style={{ gap: 4 }}>
+      <Button
+        size="sm"
+        onClick={cycleMonitor}
+        disabled={!live}
+        title="Cycle to next display"
+        aria-label="Cycle display"
+      >
+        🖥️ Display {monitor + 1}/{monitors.length}
+      </Button>
+      <select
+        value={monitor}
+        disabled={!live}
+        onChange={(e) => {
+          const idx = +e.target.value;
+          setMonitor(idx);
+          send({ t: 'monitor', index: idx });
+        }}
+        style={{ width: 170 }}
+        aria-label="Monitor"
+      >
+        {monitors.map((mo) => (
+          <option key={mo.index} value={mo.index}>
+            Disp {mo.index + 1} ({mo.w}×{mo.h}){mo.primary ? ' ★' : ''}
+          </option>
+        ))}
+      </select>
+    </div>
   );
   const qualityControl = (
     <label className="row small muted" style={{ gap: 6 }}>

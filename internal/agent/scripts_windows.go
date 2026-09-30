@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/windows/registry"
@@ -191,4 +192,80 @@ func cmdScriptCommand(ctx context.Context, file string, args []string) (*exec.Cm
 	cmd := exec.CommandContext(ctx, exe, append([]string{"/d", "/c", file}, args...)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{CmdLine: cmdScriptLine(exe, file, args)}
 	return cmd, nil
+}
+
+// withScriptEnv augments the script runner's environment on Windows.
+// The agent runs as LocalSystem (NT AUTHORITY\SYSTEM) and only inherits
+// the machine PATH. Critical tools installed via AppX/MSIX (such as WinGet /
+// Microsoft.DesktopAppInstaller) are located in %ProgramFiles%\WindowsApps
+// and only have execution aliases in per-user AppData folders.
+// withScriptEnv discovers the WinGet installation directory and prepends it
+// to the PATH environment variable so that scripts invoking "winget" succeed.
+func withScriptEnv(env []string) []string {
+	out := append([]string(nil), env...)
+	wingetDir, ok := wingetInstallDir()
+	if !ok {
+		return out
+	}
+	found := false
+	for i, e := range out {
+		if name, val, ok := strings.Cut(e, "="); ok && strings.EqualFold(name, "PATH") {
+			if !strings.Contains(strings.ToLower(val), strings.ToLower(wingetDir)) {
+				out[i] = "PATH=" + wingetDir + ";" + val
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		out = append(out, "PATH="+wingetDir)
+	}
+	return out
+}
+
+// wingetInstallDir locates the directory containing winget.exe.
+func wingetInstallDir() (string, bool) {
+	// 1. Check if winget is already accessible via PATH
+	if p, err := exec.LookPath("winget.exe"); err == nil {
+		return filepath.Dir(p), true
+	}
+	// 2. Scan %ProgramFiles%\WindowsApps for Microsoft.DesktopAppInstaller_*
+	for _, base := range []string{os.Getenv("ProgramW6432"), os.Getenv("ProgramFiles")} {
+		if base == "" {
+			continue
+		}
+		appsDir := filepath.Join(base, "WindowsApps")
+		entries, err := os.ReadDir(appsDir)
+		if err == nil {
+			var bestDir string
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				name := e.Name()
+				if strings.HasPrefix(name, "Microsoft.DesktopAppInstaller_") && strings.HasSuffix(name, "_8wekyb3d8bbwe") {
+					candidate := filepath.Join(appsDir, name)
+					if isFile(filepath.Join(candidate, "winget.exe")) {
+						bestDir = candidate
+					}
+				}
+			}
+			if bestDir != "" {
+				return bestDir, true
+			}
+		}
+		// Fallback to Glob if ReadDir was not permitted
+		matches, _ := filepath.Glob(filepath.Join(appsDir, "Microsoft.DesktopAppInstaller_*_8wekyb3d8bbwe", "winget.exe"))
+		if len(matches) > 0 {
+			return filepath.Dir(matches[len(matches)-1]), true
+		}
+	}
+	// 3. Fallback to LocalAppData (if running in a user session)
+	if local := os.Getenv("LOCALAPPDATA"); local != "" {
+		p := filepath.Join(local, `Microsoft\WindowsApps`, "winget.exe")
+		if isFile(p) {
+			return filepath.Dir(p), true
+		}
+	}
+	return "", false
 }

@@ -20,6 +20,7 @@ import type {
   BaselineStatus,
   ComplianceSummary,
   Dashboard,
+  DiscoveredDevice,
   EnrollCreate,
   EnrollCreated,
   EnrollList,
@@ -29,8 +30,13 @@ import type {
   LoginResponse,
   MailSettings,
   MetricRow,
+  NetworkScan,
+  Organization,
   Patch,
   PatchPolicy,
+  PortalConfig,
+  PortalSoftwareActionReq,
+  PortalSoftwareItem,
   PowerAction,
   Process,
   Run,
@@ -39,9 +45,15 @@ import type {
   Script,
   Service,
   ServiceAction,
+  ServerVersionInfo,
   Settings,
+  Site,
+  SoftwareCatalogItem,
   SystemInfo,
   Task,
+  Ticket,
+  TicketComment,
+  TicketWithComments,
   TOTPBegin,
   User,
   WolResult,
@@ -170,7 +182,7 @@ function normBaselineDetail(b: BaselineDetail): BaselineDetail {
 export const api = {
   // ---- auth ----
   authState: () => get<AuthState>('/api/auth/state', { noRedirect: true }),
-  setup: (username: string, password: string, email: string, code: string) =>
+  setup: (username: string, password: string, email: string, code = '') =>
     post<Ok>('/api/auth/setup', { username, password, email, code }, { noRedirect: true }),
   login: (username: string, password: string, code: string) =>
     post<LoginResponse>('/api/auth/login', { username, password, code }, { noRedirect: true }),
@@ -187,7 +199,7 @@ export const api = {
   audit: (limit = 500) => list(get<AuditRow[] | null>(`/api/audit${qs({ limit })}`)),
 
   // ---- devices ----
-  agents: () => list(get<Agent[] | null>('/api/agents')).then((l) => l.map(normAgent)),
+  agents: (params?: { org_id?: string; site_id?: string }) => list(get<Agent[] | null>(`/api/agents${qs(params ?? {})}`)).then((l) => l.map(normAgent)),
   agent: (id: string) => get<Agent>(`/api/agents/${enc(id)}`).then(normAgent),
   updateAgent: (id: string, u: AgentUpdate) => patch<Agent>(`/api/agents/${enc(id)}`, u).then(normAgent),
   deleteAgent: (id: string) => del<Ok>(`/api/agents/${enc(id)}`),
@@ -213,11 +225,24 @@ export const api = {
   power: (id: string, action: PowerAction, delay_sec: number, message: string) =>
     post<Ok>(`/api/agents/${enc(id)}/power`, { action, delay_sec, message }),
   wol: (id: string) => post<WolResult>(`/api/agents/${enc(id)}/wol`),
+  isolateAgent: (id: string, isolate: boolean) =>
+    post<{ ok: boolean; isolated: boolean }>(`/api/agents/${enc(id)}/isolate`, { isolate }),
   runOnAgent: (id: string, input: RunScriptInput) => post<{ run_id: string }>(`/api/agents/${enc(id)}/run`, input),
   agentPatches: (id: string) => get<AgentPatches>(`/api/agents/${enc(id)}/patches`).then((r) => ({ ...r, patches: arr(r.patches).map((p) => ({ ...p, categories: arr(p.categories) })) })),
   patchScan: (id: string) => post<AgentPatches>(`/api/agents/${enc(id)}/patches/scan`).then((r) => ({ ...r, patches: arr(r.patches).map((p) => ({ ...p, categories: arr(p.categories) })) })),
   patchInstall: (id: string, body: { ids?: string[]; all?: boolean; reboot_if_required: boolean }) =>
     post<Ok>(`/api/agents/${enc(id)}/patches/install`, body),
+
+  // ---- organizations & sites ----
+  organizations: () => list(get<Organization[] | null>('/api/organizations')),
+  createOrganization: (o: { name: string }) => post<Organization>('/api/organizations', o),
+  updateOrganization: (id: string, o: { name: string }) => put<Organization>(`/api/organizations/${enc(id)}`, o),
+  deleteOrganization: (id: string) => del<Ok>(`/api/organizations/${enc(id)}`),
+  sites: (orgId: string) => list(get<Site[] | null>(`/api/organizations/${enc(orgId)}/sites`)),
+  allSites: () => list(get<Site[] | null>('/api/sites')),
+  createSite: (orgId: string, s: { name: string }) => post<Site>(`/api/organizations/${enc(orgId)}/sites`, s),
+  updateSite: (id: string, s: { name: string }) => put<Site>(`/api/sites/${enc(id)}`, s),
+  deleteSite: (id: string) => del<Ok>(`/api/sites/${enc(id)}`),
 
   // ---- groups / enrollment ----
   groups: () => list(get<Group[] | null>('/api/groups')),
@@ -317,11 +342,73 @@ export const api = {
   saveSettings: (s: Settings) => put<Settings>('/api/settings', s),
   testMail: (smtp: MailSettings) => post<Ok>('/api/settings/test-mail', smtp),
   users: () => list(get<User[] | null>('/api/users')),
-  createUser: (u: { username: string; password: string; role: string; email: string }) =>
+  createUser: (u: { username: string; password: string; role: string; email: string; org_scope?: string[] }) =>
     post<{ id: number }>('/api/users', u),
-  updateUser: (id: number, u: { role?: string; email?: string; password?: string; reset_totp?: boolean }) =>
+  updateUser: (id: number, u: { role?: string; email?: string; password?: string; reset_totp?: boolean; org_scope?: string[] }) =>
     put<Ok>(`/api/users/${id}`, u),
   deleteUser: (id: number) => del<Ok>(`/api/users/${id}`),
+
+  // ---- software catalog & privileged execution ----
+  softwareCatalog: (os?: string) => list(get<SoftwareCatalogItem[] | null>(`/api/software-catalog${os ? `?os=${encodeURIComponent(os)}` : ''}`)),
+  softwareCatalogItem: (id: string) => get<SoftwareCatalogItem>(`/api/software-catalog/${encodeURIComponent(id)}`),
+  createSoftwareCatalogItem: (it: Partial<SoftwareCatalogItem>) => post<SoftwareCatalogItem>('/api/software-catalog', it),
+  updateSoftwareCatalogItem: (id: string, it: Partial<SoftwareCatalogItem>) => put<SoftwareCatalogItem>(`/api/software-catalog/${encodeURIComponent(id)}`, it),
+  deleteSoftwareCatalogItem: (id: string) => del<Ok>(`/api/software-catalog/${encodeURIComponent(id)}`),
+  installSoftware: (agentId: string, req: { catalog_id?: string; custom_cmd?: string }) =>
+    post<{ run_id: string; status: string; app_name: string }>(`/api/agents/${enc(agentId)}/software/install`, req),
+  uninstallSoftware: (agentId: string, req: { catalog_id?: string; custom_cmd?: string }) =>
+    post<{ run_id: string; status: string; app_name: string }>(`/api/agents/${enc(agentId)}/software/uninstall`, req),
+
+  // ---- network discovery & SNMP ----
+  discoveredDevices: (org_id = '', site_id = '', status = '') =>
+    list(get<DiscoveredDevice[] | null>(`/api/discovered-devices${qs({ org_id, site_id, status })}`)),
+  discoveredDevice: (id: string) => get<DiscoveredDevice>(`/api/discovered-devices/${enc(id)}`),
+  updateDiscoveredDevice: (id: string, dev: Partial<DiscoveredDevice>) =>
+    put<DiscoveredDevice>(`/api/discovered-devices/${enc(id)}`, dev),
+  deleteDiscoveredDevice: (id: string) => del<Ok>(`/api/discovered-devices/${enc(id)}`),
+  pollSNMP: (id: string) => post<DiscoveredDevice>(`/api/discovered-devices/${enc(id)}/poll`),
+  networkScans: () => list(get<NetworkScan[] | null>('/api/network-scans')),
+  startNetworkScan: (subnet: string, agent_id = '') =>
+    post<NetworkScan>('/api/network-scans', { subnet, agent_id }),
+
+  // ---- helpdesk tickets ----
+  tickets: (params: { status?: string; priority?: string; agent_id?: string; org_id?: string; assigned_to?: string; q?: string } = {}) =>
+    list(get<Ticket[] | null>(`/api/tickets${qs(params)}`)),
+  ticket: (id: number) => get<Ticket & { comments: TicketComment[] }>(`/api/tickets/${id}`),
+  createTicket: (t: Partial<Ticket>) => post<Ticket>('/api/tickets', t),
+  updateTicket: (id: number, t: Partial<Ticket>) => put<Ticket>(`/api/tickets/${id}`, t),
+  deleteTicket: (id: number) => del<Ok>(`/api/tickets/${id}`),
+  addTicketComment: (ticketId: number, c: { body: string; is_internal?: boolean }) =>
+    post<TicketComment>(`/api/tickets/${ticketId}/comments`, c),
+  agentTickets: (agentId: string) => list(get<Ticket[] | null>(`/api/agents/${enc(agentId)}/tickets`)),
+
+  // ---- client portal ----
+  // Who the caller is (device and signed-in user) comes from the portal
+  // sign-in the tray app's pass set up, never from these parameters.
+  // agent_id only picks a device for a console user viewing the portal.
+  // A 401 here means "reopen from the tray", not "go to the console login".
+  portalConfig: (params: { agent_id?: string } = {}) =>
+    get<PortalConfig>(`/api/portal/config${qs(params)}`, { noRedirect: true }),
+  portalSoftware: (params: { agent_id?: string } = {}) =>
+    list(get<PortalSoftwareItem[] | null>(`/api/portal/software${qs(params)}`, { noRedirect: true })),
+  portalSoftwareAction: (req: PortalSoftwareActionReq) =>
+    post<{ ok: boolean; run_id: string; message: string; status: string; app_name: string }>('/api/portal/software/action', req, { noRedirect: true }),
+  portalRun: (id: string) =>
+    get<{ id: string; status: string; exit_code: number; stdout: string; stderr: string; started_at: number; finished_at: number }>(`/api/portal/runs/${enc(id)}`, { noRedirect: true }),
+  portalTickets: (params: { agent_id?: string; status?: string; q?: string } = {}) =>
+    list(get<Ticket[] | null>(`/api/portal/tickets${qs(params)}`, { noRedirect: true })),
+  portalTicket: (id: number) =>
+    get<TicketWithComments>(`/api/portal/tickets/${id}`, { noRedirect: true }),
+  portalCreateTicket: (req: { agent_id?: string; subject: string; description: string; requester_name: string; requester_email?: string; requester_phone?: string; priority?: string }) =>
+    post<{ ok: boolean; id: number }>('/api/portal/tickets', req, { noRedirect: true }),
+  portalAddComment: (id: number, req: { body: string }) =>
+    post<TicketComment>(`/api/portal/tickets/${id}/comments`, req, { noRedirect: true }),
+
+  // ---- system & agent updates ----
+  serverVersion: () => get<ServerVersionInfo>('/api/server/version'),
+  updateServer: () => post<{ ok: boolean; message: string }>('/api/server/update'),
+  dispatchAgentUpdate: (agentId: string) => post<{ ok: boolean; message: string }>(`/api/agents/${enc(agentId)}/update`),
+  updateAllAgents: () => post<{ ok: boolean; dispatched_to: number; message: string }>('/api/agents/update-all'),
 };
 
 export type Api = typeof api;

@@ -20,14 +20,14 @@ const Ctx = createContext<AuthCtx | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null | undefined>(undefined);
   const [needsSetup, setNeedsSetup] = useState(false);
-  const [setupCodeRequired, setSetupCodeRequired] = useState(true);
+  const [setupCodeRequired, setSetupCodeRequired] = useState(false);
   const [version, setVersion] = useState('');
 
   const refresh = useCallback(async () => {
     try {
       const st = await api.authState();
       setNeedsSetup(st.needs_setup);
-      setSetupCodeRequired(st.setup_code_required ?? true);
+      setSetupCodeRequired(st.setup_code_required ?? false);
       setVersion(st.version);
       setUser(st.user);
     } catch {
@@ -65,7 +65,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       refresh,
       setUser,
       logout,
-      canWrite: !!user && user.role !== 'viewer',
+      canWrite: !!user && (user.role === 'admin' || user.role === 'tech'),
       isAdmin: !!user && user.role === 'admin',
     }),
     [user, needsSetup, setupCodeRequired, version, refresh, logout],

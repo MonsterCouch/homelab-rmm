@@ -1,18 +1,18 @@
 import { useState, type FormEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
+import { LogoMark } from '../components/Icons';
 import { Button, Field } from '../components/ui';
 import { useAuth } from '../state/auth';
 import { errMsg } from '../state/toast';
 
 export function Setup() {
-  const { refresh, setupCodeRequired: codeRequired } = useAuth();
+  const { refresh } = useAuth();
   const navigate = useNavigate();
   const [username, setUsername] = useState('admin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
-  const [code, setCode] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -23,7 +23,7 @@ export function Setup() {
     if (password !== confirm) return setError('Passwords do not match.');
     setBusy(true);
     try {
-      await api.setup(username.trim(), password, email.trim(), code.trim());
+      await api.setup(username.trim(), password, email.trim());
       await refresh();
       navigate('/', { replace: true });
     } catch (err) {
@@ -37,7 +37,8 @@ export function Setup() {
     <div className="auth">
       <form className="card" onSubmit={submit}>
         <div className="brand">
-          <span className="logo">R</span> Homelab RMM
+          <LogoMark size={28} className="brand-logo" />
+          <span className="brand-name">Homelab RMM</span>
         </div>
         <h1 style={{ marginBottom: 4 }}>Welcome</h1>
         <p className="muted" style={{ marginBottom: 18 }}>
@@ -96,33 +97,11 @@ export function Setup() {
             autoCapitalize="none"
             autoCorrect="off"
             spellCheck={false}
-            enterKeyHint={codeRequired ? 'next' : 'go'}
+            enterKeyHint="go"
             required
             onChange={(e) => setConfirm(e.target.value)}
           />
         </Field>
-        {codeRequired && (
-          <Field
-            label="Setup code"
-            htmlFor="su-code"
-            hint="The one-time code the server printed at startup. Cannot see it? Run “rmm-server setup-code” on the server in an elevated prompt — it reads the code back out of server.log, which is the only place it lands when the service starts the server and there is no console to print to. Lost it entirely? Restart the server before anyone creates a user and it mints a new one."
-          >
-            {/* The code is lower-case hex printed by the server: autocapitalise
-                or autocorrect it and first-run setup fails on the phone. */}
-            <input
-              id="su-code"
-              value={code}
-              autoComplete="off"
-              autoCapitalize="none"
-              autoCorrect="off"
-              spellCheck={false}
-              inputMode="text"
-              enterKeyHint="go"
-              required
-              onChange={(e) => setCode(e.target.value)}
-            />
-          </Field>
-        )}
         <Button type="submit" variant="primary" busy={busy} style={{ width: '100%', marginTop: 6 }}>
           Create administrator
         </Button>

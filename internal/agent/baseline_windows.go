@@ -16,6 +16,7 @@ import (
 	"os/user"
 	"strings"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -77,21 +78,36 @@ func winServiceCheck(ctx context.Context, c *checkCtx) kindResult {
 	if err := c.params(&p); err != nil {
 		return blError("valid parameters", "invalid parameters", err.Error())
 	}
-	want := p.State + " / " + orText(p.StartType, "any")
+	want := p.State
+	if p.StartType != "" && p.StartType != "any" {
+		want += " / " + p.StartType
+	}
 	c.setExpected(want)
 	if !winValidServiceName(p.Name) {
 		return blError(want, "refused", fmt.Sprintf("%q is not a valid service name", p.Name))
 	}
+	isAbsent := p.State == "absent" || p.State == "not_installed"
+	isPresent := p.State == "present" || p.State == "installed"
+
 	state, startType, err := winServiceState(p.Name)
 	if err != nil {
 		if errors.Is(err, errServiceNotFound) {
-			return blError(want, "no such service", err.Error())
+			if isAbsent {
+				return blPass(want, "not installed")
+			}
+			if isPresent {
+				return blFail(want, "not installed", "the service is not installed on this device")
+			}
+			return blFail(want, "not installed", "the service does not exist")
 		}
 		return blError(want, "unknown", err.Error())
 	}
 	observed := state + " / " + startType
+	if isAbsent {
+		return blFail(want, observed, "the service is installed but was expected to be absent")
+	}
 	var diffs []string
-	if state != p.State {
+	if !isPresent && state != p.State {
 		diffs = append(diffs, "the service is "+state)
 	}
 	if !winStartTypeOK(p.StartType, startType) {
@@ -113,6 +129,9 @@ func winServiceFix(ctx context.Context, c *checkCtx) (string, error) {
 	}
 	if blIsOwnService(p.Name) {
 		return "", errOwnService
+	}
+	if strings.TrimSpace(p.FixScript) != "" {
+		return executeFixScript(ctx, c, p.FixLang, p.FixScript)
 	}
 	state, startType, err := winServiceState(p.Name)
 	if err != nil {
@@ -146,15 +165,17 @@ func winServiceFix(ctx context.Context, c *checkCtx) (string, error) {
 		}
 		log = append(log, "set start type to "+p.StartType)
 	}
-	if state != p.State {
-		action := "stop"
-		if p.State == "running" {
-			action = "start"
+	if p.State == "running" || p.State == "stopped" {
+		if state != p.State {
+			action := "stop"
+			if p.State == "running" {
+				action = "start"
+			}
+			if _, err := serviceAction(p.Name, action); err != nil {
+				return strings.Join(log, "; "), err
+			}
+			log = append(log, action+"ed the service")
 		}
-		if _, err := serviceAction(p.Name, action); err != nil {
-			return strings.Join(log, "; "), err
-		}
-		log = append(log, action+"ed the service")
 	}
 	if len(log) == 0 {
 		return "", errors.New("nothing to change")
@@ -192,9 +213,18 @@ func winPackageCheck(ctx context.Context, c *checkCtx) kindResult {
 	if err := c.params(&p); err != nil {
 		return blError("valid parameters", "invalid parameters", err.Error())
 	}
+	isAbsent := p.State == "absent" || p.State == "not_installed"
 	want := p.State
-	if p.MinVersion != "" {
-		want = "present >= " + p.MinVersion
+	targetVer := p.Version
+	if targetVer == "" {
+		targetVer = p.MinVersion
+	}
+	op := p.VersionOp
+	if op == "" {
+		op = ">="
+	}
+	if targetVer != "" {
+		want = fmt.Sprintf("installed %s %s", op, targetVer)
 	}
 	c.setExpected(want)
 	present, version, source := winPackagePresent(ctx, p.Name)
@@ -202,7 +232,7 @@ func winPackageCheck(ctx context.Context, c *checkCtx) kindResult {
 	if present {
 		observed = strings.TrimSpace("present " + version)
 	}
-	if p.State == "absent" {
+	if isAbsent {
 		if present {
 			return blFail(want, observed, "found through "+source)
 		}
@@ -211,15 +241,15 @@ func winPackageCheck(ctx context.Context, c *checkCtx) kindResult {
 	if !present {
 		return blFail(want, observed, "not found through "+source)
 	}
-	if p.MinVersion == "" {
+	if targetVer == "" {
 		return blPass(want, observed)
 	}
-	cmp, err := baselines.CompareVersions(version, p.MinVersion)
+	ok, err := baselines.CheckVersion(version, targetVer, op)
 	if err != nil {
 		return blError(want, observed, err.Error())
 	}
-	if cmp < 0 {
-		return blFail(want, observed, fmt.Sprintf("%s is older than the required %s", version, p.MinVersion))
+	if !ok {
+		return blFail(want, observed, fmt.Sprintf("%s does not satisfy %s %s", version, op, targetVer))
 	}
 	return blPass(want, observed)
 }
@@ -233,8 +263,11 @@ func winPackageFix(ctx context.Context, c *checkCtx) (string, error) {
 	if err := c.params(&p); err != nil {
 		return "", err
 	}
+	if strings.TrimSpace(p.FixScript) != "" {
+		return executeFixScript(ctx, c, p.FixLang, p.FixScript)
+	}
 	if !p.AllowWinget {
-		return "", errors.New("winget is not usable from the agent service account")
+		return "", errors.New("winget is not usable from the agent service account; configure a custom remediation script or allow winget")
 	}
 	exe, err := resolveWinget()
 	if err != nil {
@@ -248,7 +281,7 @@ func winPackageFix(ctx context.Context, c *checkCtx) (string, error) {
 	defer cancel()
 	args := []string{"install", "--id", p.Name, "--exact", "--silent",
 		"--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"}
-	if p.State == "absent" {
+	if p.State == "absent" || p.State == "not_installed" {
 		args = []string{"uninstall", "--id", p.Name, "--exact", "--silent",
 			"--accept-source-agreements", "--disable-interactivity"}
 	}
@@ -740,4 +773,72 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+const (
+	wtsMBYesNo          = 0x00000004
+	wtsMBIconExclamation = 0x00000030
+	wtsIDOK              = 1
+	wtsIDCANCEL          = 2
+	wtsIDYES             = 6
+	wtsIDNO              = 7
+	wtsIDTIMEOUT         = 32000
+)
+
+func winPromptReboot(reason string, displaySec, postponesRemaining, maxPostpones int) (string, error) {
+	sid, err := interactiveSessionID()
+	if err != nil {
+		return "headless", nil
+	}
+	if procWTSSendMessageW.Find() != nil {
+		return "headless", nil
+	}
+	title := "System Restart Required - Homelab RMM"
+	msgReason := reason
+	if msgReason == "" {
+		msgReason = "apply required updates"
+	}
+	msg := fmt.Sprintf("Your device needs to restart to %s.\n\nPostpones remaining: %d of %d.\n\nClick 'Yes' to Reboot Now, or 'No' to Postpone.",
+		msgReason, postponesRemaining, maxPostpones)
+
+	titleUTF16, err := windows.UTF16FromString(title)
+	if err != nil {
+		return "", err
+	}
+	msgUTF16, err := windows.UTF16FromString(msg)
+	if err != nil {
+		return "", err
+	}
+	if displaySec <= 0 {
+		displaySec = 120
+	}
+	var resp uint32
+	ret, _, callErr := procWTSSendMessageW.Call(
+		wtsCurrentServerHandle,
+		uintptr(sid),
+		uintptr(unsafe.Pointer(&titleUTF16[0])),
+		uintptr(len(titleUTF16)*2),
+		uintptr(unsafe.Pointer(&msgUTF16[0])),
+		uintptr(len(msgUTF16)*2),
+		uintptr(wtsMBYesNo|wtsMBIconExclamation),
+		uintptr(displaySec),
+		uintptr(unsafe.Pointer(&resp)),
+		1,
+	)
+	if ret == 0 {
+		return "headless", fmt.Errorf("WTSSendMessageW: %w", callErr)
+	}
+	switch resp {
+	case wtsIDYES, wtsIDOK:
+		return "reboot", nil
+	case wtsIDNO, wtsIDCANCEL:
+		return "postpone", nil
+	case wtsIDTIMEOUT, 0:
+		return "timeout", nil
+	}
+	return "timeout", nil
+}
+
+func promptRebootUser(ctx context.Context, reason string, displaySec, postponesRemaining, maxPostpones int) (string, error) {
+	return winPromptReboot(reason, displaySec, postponesRemaining, maxPostpones)
 }

@@ -13,12 +13,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/baselines"
 )
@@ -135,8 +137,16 @@ func lnxServiceCheck(ctx context.Context, c *checkCtx) kindResult {
 	if err != nil {
 		return blError(want, "unknown", err.Error())
 	}
+	isAbsent := p.State == "absent" || p.State == "not_installed"
+	isPresent := p.State == "present" || p.State == "installed"
 	if props["LoadState"] == "not-found" {
-		return blError(want, "no such unit", fmt.Sprintf("%s does not exist on this device", unit))
+		if isAbsent {
+			return blPass(want, "not installed")
+		}
+		if isPresent {
+			return blFail(want, "not installed", fmt.Sprintf("%s does not exist on this device", unit))
+		}
+		return blFail(want, "not installed", fmt.Sprintf("%s does not exist on this device", unit))
 	}
 	state := unitState(props["ActiveState"], props["SubState"])
 	fileState := props["UnitFileState"]
@@ -145,6 +155,9 @@ func lnxServiceCheck(ctx context.Context, c *checkCtx) kindResult {
 		startType = "disabled"
 	}
 	observed := state + " / " + startType
+	if isAbsent {
+		return blFail(want, observed, "the service unit exists but was expected to be absent")
+	}
 	wantStart := p.StartType
 	if wantStart == "" {
 		wantStart = "any"
@@ -154,7 +167,7 @@ func lnxServiceCheck(ctx context.Context, c *checkCtx) kindResult {
 			fmt.Sprintf("%s is a %s unit: systemd has no [Install] section to enable, so its start type cannot be changed", unit, fileState))
 	}
 	var diffs []string
-	if state != p.State {
+	if !isPresent && state != p.State {
 		diffs = append(diffs, "the service is "+state)
 	}
 	if !lnxStartTypeOK(wantStart, startType) {
@@ -195,6 +208,9 @@ func lnxServiceFix(ctx context.Context, c *checkCtx) (string, error) {
 	if blIsOwnService(p.Name) {
 		return "", errOwnService
 	}
+	if strings.TrimSpace(p.FixScript) != "" {
+		return executeFixScript(ctx, c, p.FixLang, p.FixScript)
+	}
 	if !hasCmd("systemctl") {
 		return "", errNoSystemd
 	}
@@ -234,17 +250,19 @@ func lnxServiceFix(ctx context.Context, c *checkCtx) (string, error) {
 			}
 		}
 	}
-	state := unitState(props["ActiveState"], props["SubState"])
-	if state != p.State {
-		verb := "stop"
-		if p.State == "running" {
-			verb = "start"
+	if p.State == "running" || p.State == "stopped" {
+		state := unitState(props["ActiveState"], props["SubState"])
+		if state != p.State {
+			verb := "stop"
+			if p.State == "running" {
+				verb = "start"
+			}
+			out, err := lnxSystemctl(ctx, verb, unit)
+			if err != nil {
+				return strings.Join(log, "; "), err
+			}
+			log = append(log, out)
 		}
-		out, err := lnxSystemctl(ctx, verb, unit)
-		if err != nil {
-			return strings.Join(log, "; "), err
-		}
-		log = append(log, out)
 	}
 	if len(log) == 0 {
 		return "", errors.New("nothing to change")
@@ -318,9 +336,18 @@ func lnxPackageCheck(ctx context.Context, c *checkCtx) kindResult {
 	if !validPkgID(p.Name) {
 		return blError(p.State, "refused", fmt.Sprintf("%q is not a valid package name", p.Name))
 	}
+	isAbsent := p.State == "absent" || p.State == "not_installed"
+	targetVer := p.Version
+	if targetVer == "" {
+		targetVer = p.MinVersion
+	}
+	op := p.VersionOp
+	if op == "" {
+		op = ">="
+	}
 	want := p.State
-	if p.MinVersion != "" {
-		want = "present >= " + p.MinVersion
+	if targetVer != "" {
+		want = fmt.Sprintf("installed %s %s", op, targetVer)
 	}
 	c.setExpected(want)
 	present, version, err := lnxPkgInstalled(ctx, p.Name)
@@ -331,7 +358,7 @@ func lnxPackageCheck(ctx context.Context, c *checkCtx) kindResult {
 	if present {
 		observed = strings.TrimSpace("present " + version)
 	}
-	if p.State == "absent" {
+	if isAbsent {
 		if present {
 			return blFail(want, observed, "")
 		}
@@ -340,15 +367,15 @@ func lnxPackageCheck(ctx context.Context, c *checkCtx) kindResult {
 	if !present {
 		return blFail(want, observed, "")
 	}
-	if p.MinVersion == "" {
+	if targetVer == "" {
 		return blPass(want, observed)
 	}
-	cmp, err := baselines.CompareVersions(version, p.MinVersion)
+	ok, err := baselines.CheckVersion(version, targetVer, op)
 	if err != nil {
 		return blError(want, observed, err.Error())
 	}
-	if cmp < 0 {
-		return blFail(want, observed, fmt.Sprintf("%s is older than the required %s", version, p.MinVersion))
+	if !ok {
+		return blFail(want, observed, fmt.Sprintf("%s does not satisfy %s %s", version, op, targetVer))
 	}
 	return blPass(want, observed)
 }
@@ -357,6 +384,9 @@ func lnxPackageFix(ctx context.Context, c *checkCtx) (string, error) {
 	var p baselines.PackageParams
 	if err := c.params(&p); err != nil {
 		return "", err
+	}
+	if strings.TrimSpace(p.FixScript) != "" {
+		return executeFixScript(ctx, c, p.FixLang, p.FixScript)
 	}
 	if !validPkgID(p.Name) {
 		return "", fmt.Errorf("%q is not a valid package name", p.Name)
@@ -369,7 +399,7 @@ func lnxPackageFix(ctx context.Context, c *checkCtx) (string, error) {
 		return "", busyf("another package operation is in progress")
 	}
 	defer pkgOpMutex.Unlock()
-	install := p.State == "present"
+	install := p.State == "present" || p.State == "installed"
 	var (
 		env  []string
 		name string
@@ -752,4 +782,48 @@ func lnxSysctlPersist(key, value string) error {
 		return err
 	}
 	return blWriteFileAtomic(path, sb.String(), "0644")
+}
+
+func lnxPromptReboot(ctx context.Context, reason string, displaySec, postponesRemaining, maxPostpones int) (string, error) {
+	if displaySec <= 0 {
+		displaySec = 120
+	}
+	msgReason := reason
+	if msgReason == "" {
+		msgReason = "apply required updates"
+	}
+	text := fmt.Sprintf("Your device needs to restart to %s.\n\nPostpones remaining: %d of %d.\n\nChoose 'Reboot now' or 'Postpone'.",
+		msgReason, postponesRemaining, maxPostpones)
+	title := "System Restart Required - Homelab RMM"
+
+	hasZenity := hasCmd("zenity")
+	if !hasZenity {
+		return "headless", nil
+	}
+	pctx, cancel := context.WithTimeout(ctx, time.Duration(displaySec+5)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(pctx, "zenity", "--question", "--title="+title, "--text="+text,
+		"--ok-label=Reboot now", "--cancel-label=Postpone", fmt.Sprintf("--timeout=%d", displaySec))
+	if os.Getenv("DISPLAY") == "" && os.Getenv("WAYLAND_DISPLAY") == "" {
+		cmd.Env = append(os.Environ(), "DISPLAY=:0")
+	}
+	err := cmd.Run()
+	if err == nil {
+		return "reboot", nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if exitErr.ExitCode() == 1 {
+			return "postpone", nil
+		}
+		if exitErr.ExitCode() == 5 {
+			return "timeout", nil
+		}
+	}
+	return "headless", nil
+}
+
+func promptRebootUser(ctx context.Context, reason string, displaySec, postponesRemaining, maxPostpones int) (string, error) {
+	return lnxPromptReboot(ctx, reason, displaySec, postponesRemaining, maxPostpones)
 }

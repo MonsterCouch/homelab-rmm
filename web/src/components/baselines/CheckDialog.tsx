@@ -8,7 +8,7 @@ import { useMemo, useState } from 'react';
 import type { BaselineCheck, BaselineKind, BaselineParams, Severity } from '../../api/types';
 import { CodeEditor } from '../CodeEditor';
 import { Modal } from '../Modal';
-import { Button, Field, Switch, TagInput } from '../ui';
+import { Button, Chip, Field, Switch, TagInput } from '../ui';
 import {
   KINDS,
   LIMITS,
@@ -32,6 +32,7 @@ interface Props {
   onSave: (c: BaselineCheck) => void;
   onClose: () => void;
   isAdmin: boolean;
+  osFilter?: string;
 }
 
 const REBOOT_PHRASE = 'REBOOT';
@@ -51,12 +52,253 @@ function dropInapplicable(kind: string, p: BaselineParams): BaselineParams {
   return out;
 }
 
-export function CheckDialog({ check, onSave, onClose, isAdmin }: Props) {
+export function generateRemediationPreview(kind: BaselineKind, params: BaselineParams, osFilter?: string): {
+  type: 'script' | 'command' | 'interactive' | 'api';
+  title: string;
+  preview: string;
+} {
+  switch (kind) {
+    case 'package': {
+      const script = str(params, 'fix_script');
+      const lang = str(params, 'fix_lang') || (osFilter === 'windows' ? 'powershell' : 'bash');
+      const pkg = str(params, 'name') || '<package>';
+      const isAbsent = str(params, 'state') === 'absent' || str(params, 'state') === 'not_installed';
+      if (script.trim()) {
+        return {
+          type: 'script',
+          title: `Custom Remediation Script (${lang})`,
+          preview: script,
+        };
+      }
+      if (osFilter === 'windows') {
+        return {
+          type: 'command',
+          title: 'Windows Package Manager (winget)',
+          preview: bool(params, 'allow_winget')
+            ? `winget ${isAbsent ? 'uninstall' : 'install'} --id "${pkg}" --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity`
+            : '# WARNING: winget is refused by default from the agent service account.\n# Configure a Custom Remediation Script (PowerShell) to install or remove this package reliably.',
+        };
+      }
+      if (osFilter === 'linux') {
+        return {
+          type: 'command',
+          title: 'Linux System Package Manager',
+          preview: `# Debian/Ubuntu (apt), RHEL/Fedora (dnf), Arch (pacman)\napt-get -y -q ${isAbsent ? 'remove' : 'install'} -- "${pkg}"`,
+        };
+      }
+      return {
+        type: 'command',
+        title: 'Platform Package Manager',
+        preview: `# Linux: apt-get / dnf / pacman ${isAbsent ? 'remove' : 'install'} -- "${pkg}"\n# Windows: winget ${isAbsent ? 'uninstall' : 'install'} --id "${pkg}" (requires allow_winget: true)`,
+      };
+    }
+    case 'service': {
+      const script = str(params, 'fix_script');
+      const lang = str(params, 'fix_lang') || (osFilter === 'windows' ? 'powershell' : 'bash');
+      const svc = str(params, 'name') || '<service>';
+      const st = str(params, 'state') || 'running';
+      const start = str(params, 'start_type') || 'any';
+      if (script.trim()) {
+        return {
+          type: 'script',
+          title: `Custom Remediation Script (${lang})`,
+          preview: script,
+        };
+      }
+      const lines: (string | null)[] = [
+        '# Windows Service Control Manager:',
+        start !== 'any' ? `sc.exe config "${svc}" start= ${start}` : null,
+        st === 'running' ? `sc.exe start "${svc}"` : st === 'stopped' ? `sc.exe stop "${svc}"` : null,
+        '',
+        '# Linux systemd:',
+        start === 'disabled' ? `systemctl disable "${svc}"` : start === 'auto' ? `systemctl enable "${svc}"` : null,
+        st === 'running' ? `systemctl start "${svc}"` : st === 'stopped' ? `systemctl stop "${svc}"` : null,
+      ];
+      return {
+        type: 'command',
+        title: 'Built-in Service Manager Actions',
+        preview: lines.filter((x): x is string => x !== null).join('\n'),
+      };
+    }
+    case 'command': {
+      const fix = str(params, 'fix');
+      const lang = str(params, 'language') || 'bash';
+      return {
+        type: 'script',
+        title: `Fix Script (${lang})`,
+        preview: fix.trim() || '# No fix script defined. Check will evaluate drift but cannot self-heal.',
+      };
+    }
+    case 'registry': {
+      return {
+        type: 'api',
+        title: 'Win32 Registry Write (Atomic)',
+        preview: `# Windows Registry Set-ItemProperty:\nKey:   ${str(params, 'path') || 'HKLM\\SOFTWARE\\...'}\nValue: ${str(params, 'name') || '(Default)'}\nType:  ${str(params, 'type') || 'dword'}\nData:  ${JSON.stringify(params.value ?? null)}`,
+      };
+    }
+    case 'file': {
+      const isAbsent = str(params, 'state') === 'absent';
+      const path = str(params, 'path') || '/path/to/file';
+      const content = str(params, 'content');
+      if (isAbsent) {
+        return {
+          type: 'command',
+          title: 'File Removal',
+          preview: `# Delete regular file:\nrm -f "${path}"`,
+        };
+      }
+      return {
+        type: 'script',
+        title: `Atomic File Write (${content.length} chars)`,
+        preview: content
+          ? `# Write to atomic temp file and replace ${path}:\n${content}`
+          : '# Check-only: Content is empty, so missing or drifted files will not be created or overwritten.',
+      };
+    }
+    case 'firewall': {
+      return {
+        type: 'command',
+        title: 'Firewall Policy Enforcement',
+        preview: params.enabled === false
+          ? '# Windows: netsh advfirewall set allprofiles state off\n# Linux: ufw disable || systemctl stop firewalld'
+          : '# Windows: netsh advfirewall set allprofiles state on\n# Linux: ufw enable || systemctl start firewalld',
+      };
+    }
+    case 'time_sync': {
+      return {
+        type: 'command',
+        title: 'Time Synchronization Service',
+        preview: params.enabled === false
+          ? '# Disable time sync service'
+          : '# Windows: net start w32time && w32tm /resync\n# Linux: systemctl enable --now chronyd || systemd-timesyncd',
+      };
+    }
+    case 'windows_feature': {
+      const st = str(params, 'state') || 'disabled';
+      const name = str(params, 'name') || '<FeatureName>';
+      const verb = st === 'enabled' ? 'Enable' : 'Disable';
+      return {
+        type: 'command',
+        title: 'Windows Optional Feature Deployment',
+        preview: `powershell.exe -NoProfile -Command "${verb}-WindowsOptionalFeature -Online -FeatureName '${name}' -NoRestart"`,
+      };
+    }
+    case 'reboot_pending': {
+      const warn = params.warn_user !== false;
+      const reason = str(params, 'reason') || 'complete system updates';
+      const maxP = numOr(params, 'max_postpones', 3);
+      const delay = numOr(params, 'postpone_delay_min', 60);
+      const disp = numOr(params, 'display_time_sec', 120);
+      const enf = str(params, 'enforce_time') || '23:00';
+      if (warn) {
+        return {
+          type: 'interactive',
+          title: 'Interactive Desktop Prompt & Schedule Enforcement',
+          preview: [
+            '┌────────────────────────────────────────────────────────────────────────┐',
+            '│  ⚠  System Restart Required - Homelab RMM                              │',
+            '├────────────────────────────────────────────────────────────────────────┤',
+            `│  Your device needs to restart to ${reason}.`,
+            '│',
+            `│  Postpones remaining: ${maxP} of ${maxP}`,
+            '│',
+            `│  [ Reboot now ]                    [ Postpone (${delay}m) ]             │`,
+            '└────────────────────────────────────────────────────────────────────────┘',
+            `Display Timeout: ${disp}s (auto-postpones if unattended)`,
+            `Schedule Enforce: Once postpones reach ${maxP}, restarts at ${enf}`,
+            `Command: shutdown.exe /r /t 60 /c "Restarting to ${reason}"`,
+          ].join('\n'),
+        };
+      }
+      return {
+        type: 'command',
+        title: 'Automatic Background Reboot',
+        preview: `# Windows: shutdown.exe /r /t 60 /c "Restarting to clear a pending reboot (Homelab RMM baseline)"\n# Linux: shutdown -r +1 "Restarting to clear a pending reboot (Homelab RMM baseline)"`,
+      };
+    }
+    case 'group_members': {
+      const grp = str(params, 'group') || '<group>';
+      return {
+        type: 'command',
+        title: 'Local Group Membership Pruning',
+        preview: [
+          '# Windows:',
+          `net localgroup "${grp}" <unauthorized_user> /delete`,
+          '',
+          '# Linux:',
+          `gpasswd -d <unauthorized_user> "${grp}"`,
+          '# (Preserves root, Administrator, current agent account, and domain accounts unless allowed)',
+        ].join('\n'),
+      };
+    }
+    case 'sysctl': {
+      const k = str(params, 'key') || '<sysctl.key>';
+      const v = str(params, 'value') || '<value>';
+      return {
+        type: 'command',
+        title: 'Linux Kernel Parameter Enforcement',
+        preview: `# Write persistent configuration:\necho "${k} = ${v}" > /etc/sysctl.d/90-homelab-rmm.conf\n\n# Apply immediately:\nsysctl -w ${k}="${v}"`,
+      };
+    }
+    case 'disk_free': {
+      return {
+        type: 'command',
+        title: 'Check Only',
+        preview: '# Free disk space cannot be automatically remediated.',
+      };
+    }
+    default:
+      return {
+        type: 'command',
+        title: 'Unknown',
+        preview: '# No preview available for this kind.',
+      };
+  }
+}
+
+export function RemediationPreviewBox({ kind, params, osFilter }: { kind: BaselineKind; params: BaselineParams; osFilter?: string }) {
+  const preview = useMemo(() => generateRemediationPreview(kind, params, osFilter), [kind, params, osFilter]);
+  const [copied, setCopied] = useState(false);
+
+  const copy = () => {
+    navigator.clipboard.writeText(preview.preview);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div style={{ borderRadius: 6, overflow: 'hidden', border: '1px solid var(--border)', background: 'var(--bg-code, #141820)' }}>
+      <div className="row" style={{ justifyContent: 'space-between', padding: '6px 12px', background: 'var(--bg-card-head, #1a202c)', borderBottom: '1px solid var(--border)' }}>
+        <div className="row" style={{ gap: 8, alignItems: 'center' }}>
+          <span style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--fg)' }}>⚡ Live Remediation Action Preview</span>
+          <Chip tone={preview.type === 'interactive' ? 'warn' : preview.type === 'script' ? 'purple' : 'info'}>
+            {preview.title}
+          </Chip>
+        </div>
+        <Button size="xs" variant="ghost" onClick={copy}>
+          {copied ? 'Copied' : 'Copy'}
+        </Button>
+      </div>
+      <div style={{ padding: '10px 14px', maxHeight: 220, overflowY: 'auto' }}>
+        <pre className="mono small" style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: '#cbd5e1' }}>
+          {preview.preview}
+        </pre>
+      </div>
+    </div>
+  );
+}
+
+export function CheckDialog({ check, onSave, onClose, isAdmin, osFilter }: Props) {
   const [form, setForm] = useState<BaselineCheck>({ ...check, params: { ...check.params } });
   const [rawMode, setRawMode] = useState(false);
   const [rawText, setRawText] = useState(() => JSON.stringify(check.params ?? {}, null, 2));
   const [rawErr, setRawErr] = useState<string | null>(null);
   const [rebootTyped, setRebootTyped] = useState('');
+
+  const availableKinds = useMemo(() => {
+    if (!osFilter) return KINDS;
+    return KINDS.filter((k) => k.os.includes(osFilter as 'windows' | 'linux'));
+  }, [osFilter]);
 
   const def = kindDef(form.kind);
   const isNew = check.id === 0 && !check.name;
@@ -153,7 +395,7 @@ export function CheckDialog({ check, onSave, onClose, isAdmin }: Props) {
         </Field>
         <Field label="Kind" htmlFor="chk-kind">
           <select id="chk-kind" value={form.kind} onChange={(e) => changeKind(e.target.value as BaselineKind)}>
-            {KINDS.map((k) => (
+            {availableKinds.map((k) => (
               <option key={k.id} value={k.id}>
                 {k.label} ({k.os.join(' + ')})
               </option>
@@ -208,7 +450,7 @@ export function CheckDialog({ check, onSave, onClose, isAdmin }: Props) {
               <textarea id="chk-raw" className="mono" rows={12} spellCheck={false} value={rawText} onChange={(e) => applyRaw(e.target.value)} />
             </Field>
           ) : (
-            <KindForm kind={form.kind} params={form.params} setP={setP} />
+            <KindForm kind={form.kind} params={form.params} setP={setP} osFilter={form.os_filter || osFilter} />
           )}
         </div>
       </div>
@@ -252,21 +494,40 @@ export function CheckDialog({ check, onSave, onClose, isAdmin }: Props) {
         </Field>
       </div>
 
-      <Field label="Remediation" hint={def?.fixNote}>
-        <span data-testid="chk-remediate">
-          <Switch
-            checked={form.remediate}
-            disabled={!def?.fixable}
-            onChange={(remediate) => upd({ remediate })}
-            label={def?.fixable ? 'Let the agent fix this check (only when the baseline is enforced)' : 'This kind is check only'}
-          />
-        </span>
-      </Field>
-      {form.remediate && !fixable && (
-        <p className="small" style={{ color: 'var(--warn)' }}>
-          These parameters have nothing to fix, so the check stays read-only whatever this toggle says. {def?.fixNote}
-        </p>
-      )}
+      <div className="card" style={{ marginTop: 12, marginBottom: 12, border: form.remediate ? '1px solid var(--accent)' : undefined }}>
+        <div className="card-head" style={{ justifyContent: 'space-between' }}>
+          <span>Remediation on Drift</span>
+          {def?.fixable ? (
+            <Chip tone={form.remediate ? 'purple' : ''} outline={!form.remediate}>
+              {form.remediate ? 'Auto-Remediate Enabled' : 'Audit Only'}
+            </Chip>
+          ) : (
+            <Chip outline>Check Only</Chip>
+          )}
+        </div>
+        <div className="card-body stack" style={{ gap: 12 }}>
+          <Field label="Enforcement Action" hint={def?.fixNote}>
+            <span data-testid="chk-remediate">
+              <Switch
+                checked={form.remediate}
+                disabled={!def?.fixable}
+                onChange={(remediate) => upd({ remediate })}
+                label={def?.fixable ? 'Automatically remediate drift when baseline is enforced' : 'This kind does not support automated remediation'}
+              />
+            </span>
+          </Field>
+          {form.remediate && !fixable && (
+            <p className="small" style={{ color: 'var(--warn)' }}>
+              These parameters have nothing to fix, so the check stays read-only whatever this toggle says. {def?.fixNote}
+            </p>
+          )}
+          {form.remediate && fixable && (
+            <div className="stack" style={{ gap: 8, marginTop: 4 }}>
+              <RemediationPreviewBox kind={form.kind} params={form.params} osFilter={form.os_filter || osFilter} />
+            </div>
+          )}
+        </div>
+      </div>
 
       <p className="muted small">
         Parameters are stored in the clear and are readable by every signed-in user, including viewers. Put no passwords, tokens or keys in them.
@@ -282,62 +543,174 @@ export function CheckDialog({ check, onSave, onClose, isAdmin }: Props) {
 
 // ---------- the typed forms ----------
 
-function KindForm({ kind, params, setP }: { kind: BaselineKind; params: BaselineParams; setP: (p: BaselineParams) => void }) {
+function KindForm({ kind, params, setP, osFilter }: { kind: BaselineKind; params: BaselineParams; setP: (p: BaselineParams) => void; osFilter?: string }) {
   switch (kind) {
-    case 'service':
+    case 'service': {
+      const hasScript = Boolean(str(params, 'fix_script'));
       return (
-        <div className="form-row">
-          <Field label="Service or unit name" htmlFor="p-name" hint="Spooler on Windows, ssh or sshd.service on Linux.">
-            <input id="p-name" value={str(params, 'name')} onChange={(e) => setP({ name: e.target.value })} />
-          </Field>
-          <Field label="State" htmlFor="p-state">
-            <select id="p-state" value={str(params, 'state')} onChange={(e) => setP({ state: e.target.value })}>
-              <option value="running">running</option>
-              <option value="stopped">stopped</option>
-            </select>
-          </Field>
-          <Field
-            label="Start type"
-            htmlFor="p-start-type"
-            hint="auto also matches Windows' automatic (delayed start). On Linux there is no manual to set: that value is check only."
-          >
-            <select id="p-start-type" value={str(params, 'start_type') || 'any'} onChange={(e) => setP({ start_type: e.target.value })}>
-              <option value="any">any</option>
-              <option value="auto">auto</option>
-              <option value="manual">manual</option>
-              <option value="disabled">disabled</option>
-            </select>
-          </Field>
-        </div>
+        <>
+          <div className="form-row">
+            <Field label="Service or unit name" htmlFor="p-name" hint="Spooler on Windows, ssh or sshd.service on Linux.">
+              <input id="p-name" value={str(params, 'name')} onChange={(e) => setP({ name: e.target.value })} />
+            </Field>
+            <Field label="Status / Presence" htmlFor="p-state">
+              <select id="p-state" value={str(params, 'state')} onChange={(e) => setP({ state: e.target.value })}>
+                <option value="running">Installed & Running</option>
+                <option value="stopped">Installed & Stopped</option>
+                <option value="installed">Installed (Any State)</option>
+                <option value="not_installed">Not Installed (Prohibited / Absent)</option>
+              </select>
+            </Field>
+            <Field
+              label="Start type"
+              htmlFor="p-start-type"
+              hint="auto matches delayed start as well. Linux has no manual state."
+            >
+              <select id="p-start-type" value={str(params, 'start_type') || 'any'} onChange={(e) => setP({ start_type: e.target.value })}>
+                <option value="any">any</option>
+                <option value="auto">auto</option>
+                <option value="manual">manual</option>
+                <option value="disabled">disabled</option>
+              </select>
+            </Field>
+          </div>
+          <div style={{ marginTop: 8 }}>
+            <Switch
+              checked={hasScript}
+              onChange={(checked) => {
+                if (checked) {
+                  setP({
+                    fix_script: osFilter === 'windows' ? '# PowerShell service remediation script\nStart-Service -Name $ServiceName' : '#!/bin/bash\nsystemctl restart $ServiceName',
+                    fix_lang: osFilter === 'windows' ? 'powershell' : 'bash',
+                  });
+                } else {
+                  setP({ fix_script: undefined, fix_lang: undefined });
+                }
+              }}
+              label="Use custom remediation script instead of default service manager"
+            />
+          </div>
+          {hasScript && (
+            <div className="stack" style={{ gap: 8, marginTop: 10 }}>
+              <div className="form-row">
+                <Field label="Script Language" htmlFor="p-fix-lang">
+                  <select id="p-fix-lang" value={str(params, 'fix_lang') || (osFilter === 'windows' ? 'powershell' : 'bash')} onChange={(e) => setP({ fix_lang: e.target.value })}>
+                    <option value="powershell">powershell</option>
+                    <option value="cmd">cmd</option>
+                    <option value="bash">bash</option>
+                    <option value="sh">sh</option>
+                    <option value="python">python</option>
+                  </select>
+                </Field>
+              </div>
+              <Field label="Custom Remediation Script" hint="Runs as SYSTEM or root when service state drifts. Overrides built-in sc.exe / systemctl.">
+                <CodeEditor
+                  id="p-fix-script"
+                  value={str(params, 'fix_script')}
+                  onChange={(v) => setP({ fix_script: v })}
+                  minHeight={120}
+                  placeholder="#!/usr/bin/env bash or powershell"
+                />
+              </Field>
+            </div>
+          )}
+        </>
       );
-    case 'package':
+    }
+    case 'package': {
+      const hasScript = Boolean(str(params, 'fix_script'));
       return (
         <>
           <div className="form-row">
             <Field
               label="Package name, winget id or program name"
               htmlFor="p-name"
-              hint="On Windows the name Add/Remove Programs shows works too: GitHub CLI, 7-Zip 26.03 (x64)."
+              hint="Windows: Uninstall DisplayName (e.g. 7-Zip, CrowdStrike) or winget ID. Linux: package name (e.g. curl)."
             >
               <input id="p-name" value={str(params, 'name')} onChange={(e) => setP({ name: e.target.value })} />
             </Field>
-            <Field label="State" htmlFor="p-state">
+            <Field label="Status" htmlFor="p-state">
               <select id="p-state" value={str(params, 'state')} onChange={(e) => setP({ state: e.target.value })}>
-                <option value="present">present</option>
-                <option value="absent">absent</option>
+                <option value="installed">Installed</option>
+                <option value="present">Installed (present)</option>
+                <option value="not_installed">Not Installed (Prohibited)</option>
+                <option value="absent">Not Installed (absent)</option>
               </select>
             </Field>
-            <Field label="Minimum version" htmlFor="p-min-version" hint="Optional, present only. Epoch and Debian/RPM revision are ignored.">
-              <input id="p-min-version" value={str(params, 'min_version')} onChange={(e) => setP({ min_version: e.target.value })} />
-            </Field>
           </div>
-          <Switch
-            checked={bool(params, 'allow_winget')}
-            onChange={(v) => setP({ allow_winget: v })}
-            label="Windows: allow winget to install this (usually unavailable to the agent service account)"
-          />
+          {(str(params, 'state') === 'installed' || str(params, 'state') === 'present') && (
+            <div className="form-row">
+              <Field label="Version rule" htmlFor="p-ver-op">
+                <select id="p-ver-op" value={str(params, 'version_op') || '>='} onChange={(e) => setP({ version_op: e.target.value })}>
+                  <option value=">=">At least (≥)</option>
+                  <option value="==">Exact match (==)</option>
+                  <option value="<=">At most (≤)</option>
+                  <option value="<">Below (&lt;)</option>
+                  <option value=">">Above (&gt;)</option>
+                </select>
+              </Field>
+              <Field label="Version target" htmlFor="p-ver" hint="e.g. 8.5.0, 24.0.1. Empty means any version.">
+                <input
+                  id="p-ver"
+                  placeholder="e.g. 1.2.3"
+                  value={str(params, 'version') || str(params, 'min_version')}
+                  onChange={(e) => setP({ version: e.target.value, min_version: undefined })}
+                />
+              </Field>
+            </div>
+          )}
+          <div style={{ marginTop: 8 }}>
+            <Switch
+              checked={hasScript}
+              onChange={(checked) => {
+                if (checked) {
+                  setP({
+                    fix_script: osFilter === 'windows' ? '# Install or uninstall via PowerShell (e.g. msiexec, choco)\nmsiexec.exe /i "installer.msi" /qn /norestart' : '#!/bin/bash\napt-get update && apt-get install -y mypkg',
+                    fix_lang: osFilter === 'windows' ? 'powershell' : 'bash',
+                    allow_winget: false,
+                  });
+                } else {
+                  setP({ fix_script: undefined, fix_lang: undefined });
+                }
+              }}
+              label="Use custom remediation script (recommended for Windows SYSTEM silent installs)"
+            />
+          </div>
+          {hasScript ? (
+            <div className="stack" style={{ gap: 8, marginTop: 10 }}>
+              <div className="form-row">
+                <Field label="Script Language" htmlFor="p-fix-lang">
+                  <select id="p-fix-lang" value={str(params, 'fix_lang') || (osFilter === 'windows' ? 'powershell' : 'bash')} onChange={(e) => setP({ fix_lang: e.target.value })}>
+                    <option value="powershell">powershell</option>
+                    <option value="cmd">cmd</option>
+                    <option value="bash">bash</option>
+                    <option value="sh">sh</option>
+                    <option value="python">python</option>
+                  </select>
+                </Field>
+              </div>
+              <Field label="Custom Remediation Script" hint="Runs as SYSTEM or root when package state or version drifts. Guarantees clean execution without winget interactive session blocks.">
+                <CodeEditor
+                  id="p-fix-script"
+                  value={str(params, 'fix_script')}
+                  onChange={(v) => setP({ fix_script: v })}
+                  minHeight={120}
+                  placeholder="#!/usr/bin/env bash or powershell"
+                />
+              </Field>
+            </div>
+          ) : (
+            <div style={{ marginTop: 6 }}>
+              <Switch
+                checked={bool(params, 'allow_winget')}
+                onChange={(v) => setP({ allow_winget: v })}
+                label="Windows: allow winget to install this (usually unavailable to the agent service account)"
+              />
+            </div>
+          )}
         </>
       );
+    }
     case 'registry':
       return (
         <>
@@ -506,15 +879,110 @@ function KindForm({ kind, params, setP }: { kind: BaselineKind; params: Baseline
           </Field>
         </div>
       );
-    case 'reboot_pending':
+    case 'reboot_pending': {
+      const warnUser = params.warn_user !== false;
       return (
         <>
           <Field label="Maximum hours pending" htmlFor="p-max-hours" hint="The check fails once a device has been waiting to reboot for longer than this.">
             <input id="p-max-hours" type="number" min={1} max={8760} value={numOr(params, 'max_hours', 72)} onChange={(e) => setP({ max_hours: Math.max(1, Math.floor(+e.target.value || 1)) })} style={{ maxWidth: 160 }} />
           </Field>
           <Switch checked={bool(params, 'allow_reboot')} onChange={(v) => setP({ allow_reboot: v })} label="Allow the agent to reboot the device to clear it" />
+
+          {bool(params, 'allow_reboot') && (
+            <div className="card" style={{ marginTop: 12, padding: 12, background: 'rgba(255, 255, 255, 0.02)' }}>
+              <div style={{ marginBottom: 10 }}>
+                <Switch
+                  checked={warnUser}
+                  onChange={(v) => setP({ warn_user: v })}
+                  label="Show interactive warning notice to logged-in desktop user"
+                />
+              </div>
+
+              {warnUser ? (
+                <div className="stack" style={{ gap: 10 }}>
+                  <Field
+                    label="Reboot reason description"
+                    htmlFor="p-reboot-reason"
+                    hint="Shown to user: 'Your device needs to reboot to <reason>.'"
+                  >
+                    <input
+                      id="p-reboot-reason"
+                      placeholder="complete critical system updates"
+                      value={str(params, 'reason')}
+                      onChange={(e) => setP({ reason: e.target.value })}
+                    />
+                  </Field>
+
+                  <div className="form-row">
+                    <Field
+                      label="Notice display duration (seconds)"
+                      htmlFor="p-disp-time"
+                      hint="How long the notification modal stays open before auto-postponing."
+                    >
+                      <input
+                        id="p-disp-time"
+                        type="number"
+                        min={15}
+                        max={3600}
+                        value={numOr(params, 'display_time_sec', 120)}
+                        onChange={(e) => setP({ display_time_sec: Math.max(15, Math.floor(+e.target.value || 120)) })}
+                      />
+                    </Field>
+                    <Field
+                      label="Max postpones allowed"
+                      htmlFor="p-max-postpones"
+                      hint="User may postpone up to this many times (e.g. 3) before reboot is enforced."
+                    >
+                      <input
+                        id="p-max-postpones"
+                        type="number"
+                        min={0}
+                        max={20}
+                        value={numOr(params, 'max_postpones', 3)}
+                        onChange={(e) => setP({ max_postpones: Math.max(0, Math.floor(+e.target.value || 0)) })}
+                      />
+                    </Field>
+                  </div>
+
+                  <div className="form-row">
+                    <Field
+                      label="Postpone delay duration (minutes)"
+                      htmlFor="p-postpone-delay"
+                      hint="Interval between notices when user clicks Postpone."
+                    >
+                      <input
+                        id="p-postpone-delay"
+                        type="number"
+                        min={5}
+                        max={1440}
+                        value={numOr(params, 'postpone_delay_min', 60)}
+                        onChange={(e) => setP({ postpone_delay_min: Math.max(5, Math.floor(+e.target.value || 60)) })}
+                      />
+                    </Field>
+                    <Field
+                      label="Scheduled forced reboot time (HH:MM)"
+                      htmlFor="p-enforce-time"
+                      hint="24h time window (e.g. 23:00) when device reboots once max postpones are reached."
+                    >
+                      <input
+                        id="p-enforce-time"
+                        placeholder="23:00"
+                        value={str(params, 'enforce_time')}
+                        onChange={(e) => setP({ enforce_time: e.target.value })}
+                      />
+                    </Field>
+                  </div>
+                </div>
+              ) : (
+                <p className="small muted" style={{ margin: 0 }}>
+                  Unattended reboot: The agent will restart the device directly with a 60-second system warning banner without prompting the desktop user.
+                </p>
+              )}
+            </div>
+          )}
         </>
       );
+    }
     case 'disk_free':
       return (
         <div className="form-row">

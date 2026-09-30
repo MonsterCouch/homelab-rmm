@@ -1,12 +1,15 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
 )
@@ -367,8 +370,35 @@ func (t *runTracker) finish(id, agentID, status string, res protocol.ScriptResul
 		slog.Warn("finish run", "id", id, "err", err)
 	}
 	t.s.hub.broadcast(hubEvent{Kind: "run", AgentID: agentID, Data: map[string]any{"run_id": id, "status": status, "exit_code": res.ExitCode}})
+	var scriptName, trigger, runBy string
+	_ = t.s.db.QueryRow(`SELECT script_name, trigger, run_by FROM script_runs WHERE id = ?`, id).Scan(&scriptName, &trigger, &runBy)
+	runMsg := fmt.Sprintf("Script %q finished (%s, exit %d)", scriptName, status, res.ExitCode)
+	fieldsJSON := jsonText(map[string]any{
+		"run_id":      id,
+		"script_name": scriptName,
+		"status":      status,
+		"exit_code":   fmt.Sprint(res.ExitCode),
+		"trigger":     trigger,
+		"run_by":      runBy,
+	})
+	evKind := "run"
+	if strings.HasPrefix(trigger, "software-") {
+		evKind = "software"
+	}
+	t.s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,?)`, agentID, now(), evKind, runMsg, fieldsJSON)
+	t.s.hub.broadcast(hubEvent{Kind: "event", AgentID: agentID, Data: map[string]any{
+		"ts": now(), "kind": evKind, "message": runMsg, "fields": map[string]any{"run_id": id, "status": status},
+	}})
 	if status == "failed" || status == "timeout" {
 		t.s.alerts.scriptFailed(agentID, id, status)
+	}
+	if trigger == "client-portal" || strings.HasPrefix(trigger, "software") {
+		go func() {
+			time.Sleep(1500 * time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_ = t.s.hub.Request(ctx, agentID, protocol.ReqInventoryRefresh, nil, nil)
+		}()
 	}
 }
 

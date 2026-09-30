@@ -35,17 +35,15 @@ type Server struct {
 	mail        *mailer
 	runs        *runTracker
 	desktops    *desktopBroker
+	portal      *portalAuth
 	desktopCap  *desktopCount
 	fingerprint string
 	// pubkeyPin is base64(sha256(SPKI)) of the same certificate, which is what
 	// the Linux install script gives curl --pinnedpubkey.
 	pubkeyPin string
-	// setupCode is the one-time code required to create the first
-	// administrator. It is minted at startup when the user table is empty and
-	// cleared the moment an account exists; setupMu also makes the
-	// "no users yet?" check and the insert in handleSetup one step.
-	setupMu   sync.Mutex
-	setupCode string
+	// setupMu makes the "no users yet?" check and the insert in handleSetup
+	// atomic so concurrent requests cannot both create an administrator.
+	setupMu sync.Mutex
 	// trustedProxies are the peers whose X-Forwarded-For header is believed.
 	trustedProxies []*net.IPNet
 	httpSrv        *http.Server
@@ -131,9 +129,6 @@ func New(cfg Config) (*Server, error) {
 	}
 	s := &Server{cfg: cfg, db: db, startedAt: time.Now(), patchJobs: map[string]bool{}}
 	s.jobCtx, s.jobCancel = context.WithCancel(context.Background())
-	if db.UserCount() == 0 {
-		s.setupCode = randomHex(4)
-	}
 	s.trustedProxies = parseTrustedProxies(cfg.TrustedProxies)
 	s.hub = newHub(s)
 	s.mail = newMailer(db)
@@ -141,6 +136,7 @@ func New(cfg Config) (*Server, error) {
 	s.baselines = newBaselineEngine(s)
 	s.runs = newRunTracker(s)
 	s.desktops = newDesktopBroker()
+	s.portal = newPortalAuth()
 	s.desktopCap = newDesktopCount()
 	s.sched = newScheduler(s)
 	db.markAllOffline()
@@ -321,9 +317,8 @@ func (s *Server) Run(ctx context.Context) error {
 	if w := s.CertWarning(); w != "" {
 		slog.Warn("certificate name mismatch", "detail", w)
 	}
-	if code := s.SetupCode(); code != "" {
-		slog.Warn("FIRST RUN: no users yet. Open the console and create the administrator. The setup form asks for this one-time code", "setup_code", code)
-		fmt.Fprintf(os.Stderr, "\n==== FIRST-RUN SETUP CODE: %s ====\n\n", code)
+	if s.db.UserCount() == 0 {
+		slog.Info("FIRST RUN: no users yet. Open the console to create the administrator")
 	}
 
 	s.sched.start(ctx)

@@ -17,12 +17,15 @@ import {
   IconAutomation,
   IconBaseline,
   IconBell,
+  IconBuilding,
   IconDashboard,
   IconDevices,
   IconKeyboard,
   IconLogout,
   IconMenu,
   IconMoon,
+  IconNetwork,
+  IconPackage,
   IconPatch,
   IconRuns,
   IconScript,
@@ -30,29 +33,41 @@ import {
   IconSettings,
   IconSun,
   IconTasks,
+  IconTicket,
+  IconUpload,
   IconUser,
   IconUsers,
+  LogoMark,
 } from './Icons';
 import { Button, Dropdown, ErrorBoundary, OnlineDot } from './ui';
+import { ServerUpdateModal } from './ServerUpdateModal';
 import '../styles/shell.css';
 
-const NAV = [
+const NAV_FLEET = [
   { to: '/', label: 'Dashboard', icon: IconDashboard, end: true },
   { to: '/devices', label: 'Devices', icon: IconDevices },
+  { to: '/discovery', label: 'Discovery & SNMP', icon: IconNetwork },
+];
+const NAV_OPS = [
   { to: '/scripts', label: 'Scripts', icon: IconScript },
   { to: '/runs', label: 'Runs', icon: IconRuns },
   { to: '/tasks', label: 'Tasks', icon: IconTasks },
   { to: '/automations', label: 'Automations', icon: IconAutomation },
   { to: '/baselines', label: 'Baselines', icon: IconBaseline },
-  { to: '/alerts', label: 'Alerts', icon: IconAlert, badge: true },
   { to: '/patches', label: 'Patches', icon: IconPatch },
+  { to: '/software-catalog', label: 'Software Drawer', icon: IconPackage },
+];
+const NAV_MONITOR = [
+  { to: '/alerts', label: 'Alerts', icon: IconAlert, badge: true },
+  { to: '/tickets', label: 'Tickets', icon: IconTicket },
 ];
 const ADMIN_NAV = [
+  { to: '/organizations', label: 'Organizations', icon: IconBuilding },
   { to: '/settings', label: 'Settings', icon: IconSettings },
   { to: '/users', label: 'Users', icon: IconUsers },
+  { to: '/audit', label: 'Audit', icon: IconAudit },
 ];
 const TAIL_NAV = [
-  { to: '/audit', label: 'Audit', icon: IconAudit },
   { to: '/account', label: 'Account', icon: IconUser },
 ];
 
@@ -64,6 +79,7 @@ export function Layout() {
   // Below 700px the rail is an off-canvas drawer; above it the class does nothing.
   const [navOpen, setNavOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [updateOpen, setUpdateOpen] = useState(false);
   // C16: while the phone search has the keyboard it takes the whole topbar row.
   const [searchOpen, setSearchOpen] = useState(false);
   useShortcuts(() => setHelpOpen((o) => !o));
@@ -133,29 +149,58 @@ export function Layout() {
       {navOpen && <div className="nav-scrim" onClick={() => setNavOpen(false)} />}
       <nav className={`nav ${navOpen ? 'open' : ''}`} aria-label="Main">
         <div className="nav-brand">
-          <span className="logo">R</span>
-          <span>Homelab RMM</span>
+          <LogoMark size={22} className="brand-logo" />
+          <span className="brand-name">Homelab RMM</span>
         </div>
-        <div className="nav-section">Manage</div>
-        {NAV.map((n) => (
+
+        <div className="nav-section">Fleet</div>
+        {NAV_FLEET.map((n) => (
           <NavLink
             key={n.to}
             to={n.to}
             end={n.end}
             className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
             title={n.label}
-            // aria-label REPLACES the link's text for a screen reader, so the
-            // open-alert badge beside it was announced as nothing at all.
+            aria-label={n.label}
+          >
+            <n.icon />
+            <span>{n.label}</span>
+          </NavLink>
+        ))}
+
+        <div className="nav-section">Operations</div>
+        {NAV_OPS.map((n) => (
+          <NavLink
+            key={n.to}
+            to={n.to}
+            className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
+            title={n.label}
+            aria-label={n.label}
+          >
+            <n.icon />
+            <span>{n.label}</span>
+          </NavLink>
+        ))}
+
+        <div className="nav-section">Monitoring</div>
+        {NAV_MONITOR.map((n) => (
+          <NavLink
+            key={n.to}
+            to={n.to}
+            className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}
+            title={n.label}
             aria-label={n.badge && openAlerts > 0 ? `${n.label} (${openAlerts} open)` : n.label}
           >
             <n.icon />
             <span>{n.label}</span>
+            {/* the open-alert count belongs to Alerts alone */}
             {n.badge && openAlerts > 0 && <span className="badge">{openAlerts}</span>}
           </NavLink>
         ))}
+
         {isAdmin && (
           <>
-            <div className="nav-section">Admin</div>
+            <div className="nav-section">Administration</div>
             {ADMIN_NAV.map((n) => (
               <NavLink key={n.to} to={n.to} className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`} title={n.label} aria-label={n.label}>
                 <n.icon />
@@ -164,7 +209,7 @@ export function Layout() {
             ))}
           </>
         )}
-        <div className="nav-section">You</div>
+        <div className="nav-section">Preferences</div>
         {TAIL_NAV.map((n) => (
           <NavLink key={n.to} to={n.to} className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`} title={n.label} aria-label={n.label}>
             <n.icon />
@@ -173,7 +218,18 @@ export function Layout() {
         ))}
         <div className="nav-foot">
           <ConnState />
-          <div>v{version || 'dev'}</div>
+          {isAdmin ? (
+            <button
+              type="button"
+              onClick={() => setUpdateOpen(true)}
+              style={{ background: 'none', border: 'none', padding: 0, color: 'inherit', cursor: 'pointer', font: 'inherit', textDecoration: 'underline' }}
+              title="Check updates"
+            >
+              v{version || 'dev'}
+            </button>
+          ) : (
+            <div>v{version || 'dev'}</div>
+          )}
         </div>
       </nav>
       <header className={`topbar ${searchOpen ? 'search-open' : ''}`}>
@@ -183,6 +239,11 @@ export function Layout() {
         <GlobalSearch onFocusChange={setSearchOpen} />
         <span className="spacer" />
         <ActivityMenu />
+        {isAdmin && (
+          <Button variant="ghost" icon onClick={() => setUpdateOpen(true)} title="Server & Fleet Updates" aria-label="Server & Fleet Updates">
+            <IconUpload />
+          </Button>
+        )}
         <Button variant="ghost" icon onClick={() => setHelpOpen(true)} title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">
           <IconKeyboard />
         </Button>
@@ -201,6 +262,11 @@ export function Layout() {
           <button onClick={() => navigate('/account')}>
             <IconUser /> Account
           </button>
+          {isAdmin && (
+            <button onClick={() => setUpdateOpen(true)}>
+              <IconUpload /> System Updates…
+            </button>
+          )}
           {/* The topbar toggle is hidden below 700px (C16), so the theme has to
               stay reachable from somewhere a thumb can find. */}
           <button onClick={toggleTheme}>
@@ -226,6 +292,7 @@ export function Layout() {
         </ErrorBoundary>
       </main>
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
+      {updateOpen && <ServerUpdateModal onClose={() => setUpdateOpen(false)} />}
     </div>
   );
 }
@@ -297,10 +364,10 @@ function GlobalSearch({ onFocusChange }: { onFocusChange: (focused: boolean) => 
       if (!ref.current?.contains(e.target as Node)) setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
-      // "/" focuses the search unless typing in a field (or driving the remote desktop)
+      // "/" or Ctrl+K / Cmd+K focuses the search unless typing in a field
       const t = e.target as HTMLElement | null;
       const editing = t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t instanceof HTMLSelectElement || !!t?.isContentEditable;
-      if (e.key === '/' && !editing && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      if (((e.key === '/' && !editing) || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k')) && !e.altKey) {
         e.preventDefault();
         inputRef.current?.focus();
       }
@@ -337,13 +404,9 @@ function GlobalSearch({ onFocusChange }: { onFocusChange: (focused: boolean) => 
       <input
         ref={inputRef}
         type="search"
-        // The "( / )" hint is dead weight on a phone, where the placeholder
-        // truncates to "Search (" in a 103px box (C16).
-        placeholder={phone ? 'Search devices…' : 'Search devices by name, IP or tag…  ( / )'}
+        placeholder={phone ? 'Search devices…' : 'Search devices by name, IP, group or tag…'}
         value={q}
         aria-label="Search devices"
-        // Android capitalises and autocorrects a hostname into something that
-        // matches nothing.
         autoCapitalize="none"
         autoCorrect="off"
         spellCheck={false}
@@ -373,6 +436,11 @@ function GlobalSearch({ onFocusChange }: { onFocusChange: (focused: boolean) => 
           }
         }}
       />
+      {!phone && (
+        <span className="search-shortcut" onClick={() => inputRef.current?.focus()}>
+          <kbd>/</kbd>
+        </span>
+      )}
       {open && q.trim() && (
         <div className="search-results" role="listbox">
           {results.map((a, i) => (

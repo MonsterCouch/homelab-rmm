@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -438,6 +439,162 @@ DROP TABLE patches;
 ALTER TABLE patches_v5 RENAME TO patches;
 CREATE INDEX IF NOT EXISTS idx_patches_agent_status ON patches(agent_id, status);
 `,
+	// 6: 3-tier organization hierarchy (MSP / Client / Site)
+	`
+CREATE TABLE IF NOT EXISTS organizations (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+	created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sites (
+	id TEXT PRIMARY KEY,
+	org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+	name TEXT NOT NULL COLLATE NOCASE,
+	created_at INTEGER NOT NULL,
+	UNIQUE(org_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_sites_org ON sites(org_id);
+
+INSERT OR IGNORE INTO organizations(id, name, created_at) VALUES('org_default', 'Default Organization', CAST(strftime('%s', 'now') AS INTEGER));
+INSERT OR IGNORE INTO sites(id, org_id, name, created_at) VALUES('site_default', 'org_default', 'Main Site', CAST(strftime('%s', 'now') AS INTEGER));
+
+ALTER TABLE agents ADD COLUMN org_id TEXT NOT NULL DEFAULT 'org_default';
+ALTER TABLE agents ADD COLUMN site_id TEXT NOT NULL DEFAULT 'site_default';
+CREATE INDEX IF NOT EXISTS idx_agents_org_site ON agents(org_id, site_id);
+
+ALTER TABLE enroll_tokens ADD COLUMN org_id TEXT NOT NULL DEFAULT 'org_default';
+ALTER TABLE enroll_tokens ADD COLUMN site_id TEXT NOT NULL DEFAULT 'site_default';
+
+ALTER TABLE users ADD COLUMN org_scope TEXT NOT NULL DEFAULT '[]';
+`,
+	// 7: device isolation (containment firewall rules)
+	`
+ALTER TABLE agents ADD COLUMN isolated INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agents ADD COLUMN isolated_at INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agents ADD COLUMN isolated_by TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_agents_isolated ON agents(isolated);
+`,
+	// 8: self-service software catalog
+	`
+CREATE TABLE IF NOT EXISTS software_catalog (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	description TEXT NOT NULL DEFAULT '',
+	publisher TEXT NOT NULL DEFAULT '',
+	version TEXT NOT NULL DEFAULT '',
+	category TEXT NOT NULL DEFAULT '',
+	icon TEXT NOT NULL DEFAULT '',
+	install_cmd TEXT NOT NULL,
+	uninstall_cmd TEXT NOT NULL DEFAULT '',
+	os TEXT NOT NULL DEFAULT 'all',
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_software_catalog_os ON software_catalog(os);
+
+INSERT OR IGNORE INTO software_catalog (id, name, description, publisher, version, category, icon, install_cmd, uninstall_cmd, os, created_at, updated_at) VALUES
+('sw_chrome', 'Google Chrome', 'Fast and secure web browser from Google.', 'Google LLC', 'Latest', 'Browsers', 'globe', 'winget install --id Google.Chrome -e --silent --accept-source-agreements --accept-package-agreements', 'winget uninstall --id Google.Chrome -e --silent', 'windows', 1700000000, 1700000000),
+('sw_firefox', 'Mozilla Firefox', 'Free and open-source web browser backed by Mozilla.', 'Mozilla', 'Latest', 'Browsers', 'globe', 'winget install --id Mozilla.Firefox -e --silent --accept-source-agreements --accept-package-agreements', 'winget uninstall --id Mozilla.Firefox -e --silent', 'windows', 1700000000, 1700000000),
+('sw_7zip_win', '7-Zip', 'High compression ratio file archiver utility.', 'Igor Pavlov', 'Latest', 'Utilities', 'archive', 'winget install --id 7zip.7zip -e --silent --accept-source-agreements --accept-package-agreements', 'winget uninstall --id 7zip.7zip -e --silent', 'windows', 1700000000, 1700000000),
+('sw_7zip_linux', 'p7zip', '7-Zip compression utility port for Linux.', 'Igor Pavlov', 'Latest', 'Utilities', 'archive', 'apt-get update && apt-get install -y p7zip-full', 'apt-get remove -y p7zip-full', 'linux', 1700000000, 1700000000),
+('sw_vscode', 'Visual Studio Code', 'Code editing redefined. Powerful lightweight code editor.', 'Microsoft Corporation', 'Latest', 'Developer Tools', 'code', 'winget install --id Microsoft.VisualStudioCode -e --silent --accept-source-agreements --accept-package-agreements', 'winget uninstall --id Microsoft.VisualStudioCode -e --silent', 'windows', 1700000000, 1700000000),
+('sw_notepadpp', 'Notepad++', 'Lightweight, fast source code and text editor.', 'Don Ho', 'Latest', 'Utilities', 'file-text', 'winget install --id Notepad++.Notepad++ -e --silent --accept-source-agreements --accept-package-agreements', 'winget uninstall --id Notepad++.Notepad++ -e --silent', 'windows', 1700000000, 1700000000),
+('sw_vlc_win', 'VLC Media Player', 'Universal multi-format multimedia player.', 'VideoLAN', 'Latest', 'Media', 'play', 'winget install --id VideoLAN.VLC -e --silent --accept-source-agreements --accept-package-agreements', 'winget uninstall --id VideoLAN.VLC -e --silent', 'windows', 1700000000, 1700000000),
+('sw_vlc_linux', 'VLC Media Player', 'Universal multi-format multimedia player.', 'VideoLAN', 'Latest', 'Media', 'play', 'apt-get update && apt-get install -y vlc', 'apt-get remove -y vlc', 'linux', 1700000000, 1700000000),
+('sw_git_win', 'Git for Windows', 'Fast, scalable, distributed revision control system.', 'Git Authors', 'Latest', 'Developer Tools', 'git-branch', 'winget install --id Git.Git -e --silent --accept-source-agreements --accept-package-agreements', 'winget uninstall --id Git.Git -e --silent', 'windows', 1700000000, 1700000000),
+('sw_git_linux', 'Git', 'Fast, scalable, distributed revision control system.', 'Git Authors', 'Latest', 'Developer Tools', 'git-branch', 'apt-get update && apt-get install -y git', 'apt-get remove -y git', 'linux', 1700000000, 1700000000),
+('sw_sysinternals', 'Sysinternals Suite', 'Advanced troubleshooting utilities for Windows.', 'Microsoft Corporation', 'Latest', 'Utilities', 'cpu', 'winget install --id Microsoft.SysinternalsSuite -e --silent --accept-source-agreements --accept-package-agreements', 'winget uninstall --id Microsoft.SysinternalsSuite -e --silent', 'windows', 1700000000, 1700000000),
+('sw_wireshark', 'Wireshark', 'World foremost network protocol analyzer.', 'The Wireshark Team', 'Latest', 'Utilities', 'network', 'winget install --id WiresharkFoundation.Wireshark -e --silent --accept-source-agreements --accept-package-agreements', 'winget uninstall --id WiresharkFoundation.Wireshark -e --silent', 'windows', 1700000000, 1700000000),
+('sw_htop_linux', 'htop', 'Interactive process viewer for Linux.', 'Hisham Muhammad', 'Latest', 'Utilities', 'cpu', 'apt-get update && apt-get install -y htop', 'apt-get remove -y htop', 'linux', 1700000000, 1700000000);
+`,
+	// 9: network discovery & SNMP polling
+	`
+CREATE TABLE IF NOT EXISTS discovered_devices (
+	id TEXT PRIMARY KEY,
+	ip TEXT NOT NULL,
+	mac TEXT NOT NULL DEFAULT '',
+	hostname TEXT NOT NULL DEFAULT '',
+	vendor TEXT NOT NULL DEFAULT '',
+	os TEXT NOT NULL DEFAULT '',
+	device_type TEXT NOT NULL DEFAULT 'unknown',
+	open_ports TEXT NOT NULL DEFAULT '[]',
+	snmp_enabled INTEGER NOT NULL DEFAULT 0,
+	snmp_sys_name TEXT NOT NULL DEFAULT '',
+	snmp_sys_descr TEXT NOT NULL DEFAULT '',
+	snmp_sys_uptime INTEGER NOT NULL DEFAULT 0,
+	snmp_interfaces TEXT NOT NULL DEFAULT '[]',
+	discovered_by TEXT NOT NULL DEFAULT '',
+	org_id TEXT NOT NULL DEFAULT 'org_default',
+	site_id TEXT NOT NULL DEFAULT 'site_default',
+	status TEXT NOT NULL DEFAULT 'discovered',
+	first_seen INTEGER NOT NULL,
+	last_seen INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_discovered_devices_ip ON discovered_devices(ip);
+CREATE INDEX IF NOT EXISTS idx_discovered_devices_org_site ON discovered_devices(org_id, site_id);
+
+CREATE TABLE IF NOT EXISTS network_scans (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	subnet TEXT NOT NULL,
+	agent_id TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL DEFAULT 'pending',
+	devices_found INTEGER NOT NULL DEFAULT 0,
+	started_at INTEGER NOT NULL,
+	completed_at INTEGER NOT NULL DEFAULT 0,
+	error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_network_scans_started ON network_scans(started_at DESC);
+`,
+	// 10: integrated helpdesk ticketing system
+	`
+CREATE TABLE IF NOT EXISTS tickets (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	agent_id TEXT NOT NULL DEFAULT '',
+	org_id TEXT NOT NULL DEFAULT 'org_default',
+	site_id TEXT NOT NULL DEFAULT 'site_default',
+	subject TEXT NOT NULL,
+	description TEXT NOT NULL,
+	requester_name TEXT NOT NULL,
+	requester_email TEXT NOT NULL,
+	requester_phone TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL DEFAULT 'open',
+	priority TEXT NOT NULL DEFAULT 'normal',
+	assigned_to TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL,
+	resolved_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tickets_agent ON tickets(agent_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tickets_org_site ON tickets(org_id, site_id);
+
+CREATE TABLE IF NOT EXISTS ticket_comments (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	ticket_id INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+	author TEXT NOT NULL,
+	is_internal INTEGER NOT NULL DEFAULT 0,
+	body TEXT NOT NULL,
+	created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ticket_comments_ticket ON ticket_comments(ticket_id, created_at ASC);
+`,
+	// 11: client portal & authorized business POC ticket permissions
+	`
+ALTER TABLE tickets ADD COLUMN is_internal INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tickets ADD COLUMN source TEXT NOT NULL DEFAULT 'user';
+ALTER TABLE tickets ADD COLUMN requester_domain_user TEXT NOT NULL DEFAULT '';
+ALTER TABLE users ADD COLUMN ticket_role TEXT NOT NULL DEFAULT '';
+ALTER TABLE software_catalog ADD COLUMN update_cmd TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_tickets_internal ON tickets(is_internal);
+`,
+	// 12: a client's point of contact is its own role, not a flag on a
+	// technician or viewer account (which left the contact with that
+	// account's console powers). ticket_role is no longer read.
+	`
+UPDATE users SET role = 'poc' WHERE ticket_role = 'poc' AND role != 'admin';
+UPDATE users SET ticket_role = '';
+`,
 }
 
 // Close checkpoints the write-ahead log before closing, so a short-lived
@@ -447,6 +604,58 @@ CREATE INDEX IF NOT EXISTS idx_patches_agent_status ON patches(agent_id, status)
 func (d *DB) Close() error {
 	d.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
 	return d.DB.Close()
+}
+
+var alterAddColRe = regexp.MustCompile(`(?i)^\s*ALTER\s+TABLE\s+([a-zA-Z0-9_]+)\s+ADD\s+(?:COLUMN\s+)?([a-zA-Z0-9_]+)`)
+
+func hasColumn(tx *sql.Tx, table, col string) bool {
+	rows, err := tx.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dfltValue any
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err == nil {
+			if strings.EqualFold(name, col) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func execMigration(tx *sql.Tx, sqlScript string) error {
+	// Fast path: SQLite executes full multi-statement scripts directly.
+	_, err := tx.Exec(sqlScript)
+	if err == nil {
+		return nil
+	}
+	// If it fails with "duplicate column name", this is a migration replay on a database
+	// whose user_version was rewound. Execute statement-by-statement, skipping existing columns.
+	if strings.Contains(err.Error(), "duplicate column name") {
+		stmts := strings.Split(sqlScript, ";")
+		for _, raw := range stmts {
+			stmt := strings.TrimSpace(raw)
+			if stmt == "" {
+				continue
+			}
+			if m := alterAddColRe.FindStringSubmatch(stmt); len(m) == 3 {
+				table, col := m[1], m[2]
+				if hasColumn(tx, table, col) {
+					continue
+				}
+			}
+			if _, execErr := tx.Exec(stmt + ";"); execErr != nil {
+				return execErr
+			}
+		}
+		return nil
+	}
+	return err
 }
 
 func (d *DB) migrate() error {
@@ -459,7 +668,7 @@ func (d *DB) migrate() error {
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(migrations[i]); err != nil {
+		if err := execMigration(tx, migrations[i]); err != nil {
 			tx.Rollback()
 			return fmt.Errorf("migration %d: %w", i+1, err)
 		}

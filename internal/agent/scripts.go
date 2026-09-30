@@ -113,7 +113,7 @@ func (r *scriptRunner) run(parent context.Context, req protocol.ScriptRun, emit 
 		return res
 	}
 	cmd.Dir = dir
-	cmd.Env = os.Environ()
+	cmd.Env = withScriptEnv(os.Environ())
 	if req.Language == "python" {
 		// A redirected python writes its stdout in the locale encoding, which
 		// on Windows is the ANSI code page. Ask for UTF-8 instead, before

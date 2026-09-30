@@ -193,6 +193,8 @@ type baselineEngine struct {
 	reason  map[int64]string // why the next pass was scheduled: config or startup
 	last    map[int64]*protocol.BaselineReport
 	holdoff map[int64]int64 // check id -> unix seconds until a fix may run again
+	postpones     map[int64]int   // check id -> number of postpones used
+	postponeUntil map[int64]int64 // check id -> unix seconds until postponed reboot may prompt again
 
 	lastReboot  int64 // unix; the last reboot this engine triggered
 	rebootSince int64 // unix; when a pending reboot was first observed
@@ -227,17 +229,19 @@ type baselineReq struct {
 
 func newBaselineEngine(a *Agent) *baselineEngine {
 	e := &baselineEngine{
-		a:       a,
-		specs:   map[int64]protocol.BaselineSpec{},
-		due:     map[int64]time.Time{},
-		reason:  map[int64]string{},
-		last:    map[int64]*protocol.BaselineReport{},
-		holdoff: map[int64]int64{},
-		reqs:    make(chan *baselineReq, 8),
-		wake:    make(chan struct{}, 1),
-		now:     time.Now,
-		jitter:  func(d time.Duration) time.Duration { return time.Duration(rand.Int63n(int64(d) + 1)) },
-		kinds:   defaultKindImpl,
+		a:             a,
+		specs:         map[int64]protocol.BaselineSpec{},
+		due:           map[int64]time.Time{},
+		reason:        map[int64]string{},
+		last:          map[int64]*protocol.BaselineReport{},
+		holdoff:       map[int64]int64{},
+		postpones:     map[int64]int{},
+		postponeUntil: map[int64]int64{},
+		reqs:          make(chan *baselineReq, 8),
+		wake:          make(chan struct{}, 1),
+		now:           time.Now,
+		jitter:        func(d time.Duration) time.Duration { return time.Duration(rand.Int63n(int64(d) + 1)) },
+		kinds:         defaultKindImpl,
 	}
 	return e
 }
@@ -965,15 +969,42 @@ func reportSize(rep *protocol.BaselineReport) int {
 // baselineStateFile is baselines.json: everything the engine needs to keep
 // working with no server, written with the same tmp+rename Config.Save uses.
 type baselineStateFile struct {
-	SavedAt     int64                               `json:"saved_at"`
-	Specs       []protocol.BaselineSpec             `json:"specs"`
-	LastReports map[string]*protocol.BaselineReport `json:"last_reports,omitempty"`
-	Holdoff     map[string]int64                    `json:"holdoff,omitempty"`
-	LastReboot  int64                               `json:"last_reboot,omitempty"`
-	RebootSince int64                               `json:"reboot_pending_since,omitempty"`
+	SavedAt       int64                               `json:"saved_at"`
+	Specs         []protocol.BaselineSpec             `json:"specs"`
+	LastReports   map[string]*protocol.BaselineReport `json:"last_reports,omitempty"`
+	Holdoff       map[string]int64                    `json:"holdoff,omitempty"`
+	LastReboot    int64                               `json:"last_reboot,omitempty"`
+	RebootSince   int64                               `json:"reboot_pending_since,omitempty"`
+	Postpones     map[string]int                      `json:"postpones,omitempty"`
+	PostponeUntil map[string]int64                    `json:"postpone_until,omitempty"`
 }
 
 func baselineStatePath() string { return filepath.Join(ConfigDir(), "baselines.json") }
+
+func (e *baselineEngine) getPostpones(checkID int64) (count int, until int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.postpones[checkID], e.postponeUntil[checkID]
+}
+
+func (e *baselineEngine) addPostpone(checkID int64, delayMin int) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.postpones[checkID]++
+	count := e.postpones[checkID]
+	if delayMin <= 0 {
+		delayMin = 60
+	}
+	e.postponeUntil[checkID] = e.now().Add(time.Duration(delayMin) * time.Minute).Unix()
+	return count
+}
+
+func (e *baselineEngine) clearPostpones(checkID int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.postpones, checkID)
+	delete(e.postponeUntil, checkID)
+}
 
 // load reads baselines.json. A file that will not parse is a warning and an
 // empty set, never a failure to start: an agent that refuses to run because
@@ -1020,6 +1051,18 @@ func (e *baselineEngine) load() {
 		}
 		e.holdoff[id] = until
 	}
+	for k, count := range f.Postpones {
+		id, err := strconv.ParseInt(k, 10, 64)
+		if err == nil {
+			e.postpones[id] = count
+		}
+	}
+	for k, until := range f.PostponeUntil {
+		id, err := strconv.ParseInt(k, 10, 64)
+		if err == nil && until > now.Unix() {
+			e.postponeUntil[id] = until
+		}
+	}
 	e.lastReboot, e.rebootSince = f.LastReboot, f.RebootSince
 }
 
@@ -1028,12 +1071,14 @@ func (e *baselineEngine) load() {
 func (e *baselineEngine) save() {
 	e.mu.Lock()
 	f := baselineStateFile{
-		SavedAt:     e.now().Unix(),
-		Specs:       make([]protocol.BaselineSpec, 0, len(e.specs)),
-		LastReports: map[string]*protocol.BaselineReport{},
-		Holdoff:     map[string]int64{},
-		LastReboot:  e.lastReboot,
-		RebootSince: e.rebootSince,
+		SavedAt:       e.now().Unix(),
+		Specs:         make([]protocol.BaselineSpec, 0, len(e.specs)),
+		LastReports:   map[string]*protocol.BaselineReport{},
+		Holdoff:       map[string]int64{},
+		LastReboot:    e.lastReboot,
+		RebootSince:   e.rebootSince,
+		Postpones:     map[string]int{},
+		PostponeUntil: map[string]int64{},
 	}
 	ids := make([]int64, 0, len(e.specs))
 	for id := range e.specs {
@@ -1050,6 +1095,16 @@ func (e *baselineEngine) save() {
 	for id, until := range e.holdoff {
 		if until > now {
 			f.Holdoff[strconv.FormatInt(id, 10)] = until
+		}
+	}
+	for id, count := range e.postpones {
+		if count > 0 {
+			f.Postpones[strconv.FormatInt(id, 10)] = count
+		}
+	}
+	for id, until := range e.postponeUntil {
+		if until > now {
+			f.PostponeUntil[strconv.FormatInt(id, 10)] = until
 		}
 	}
 	e.mu.Unlock()

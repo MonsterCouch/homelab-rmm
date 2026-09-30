@@ -34,7 +34,6 @@ Usage:
   rmm-server user add --username U [--role admin|tech|viewer]   (prompts for password)
   rmm-server user passwd --username U
   rmm-server user list
-  rmm-server setup-code             print the one-time first-run setup code the console asks for
   rmm-server version
 
 Flags for run/install:
@@ -54,11 +53,8 @@ in the service definition, because the service manager runs from a different dir
 Environment: RMM_DATA_DIR, RMM_LISTEN, RMM_PUBLIC_URL, RMM_CERT_FILE, RMM_KEY_FILE, RMM_INSECURE,
              RMM_TRUSTED_PROXIES, RMM_DEV_WEB_DIR, RMM_DEBUG
 
-First run: with no users yet the server prints a one-time SETUP CODE to the console and to
-server.log in the data directory. The setup form asks for it unless you open the console from
-a browser on the server itself. "rmm-server setup-code" reads it back out of the log, which is
-the only place it lands when the service runs it and stderr goes nowhere. Lost it? Restart the
-server before creating a user: a new code is minted on every start that finds no users.
+First run: with no users yet, navigate to the web console in your browser (e.g.
+https://localhost:8443) to create the first administrator account.
 `, server.Version, server.DefaultDataDir())
 }
 

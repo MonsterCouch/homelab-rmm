@@ -7,16 +7,52 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
 )
+
+var (
+	cachedSelfSHA string
+	cachedSHAMu   sync.Mutex
+)
+
+// currentBinarySHA256 calculates and caches the SHA256 of the running agent executable
+func currentBinarySHA256() string {
+	cachedSHAMu.Lock()
+	defer cachedSHAMu.Unlock()
+	if cachedSelfSHA != "" {
+		return cachedSelfSHA
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	f, err := os.Open(exe)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	cachedSelfSHA = hex.EncodeToString(h.Sum(nil))
+	return cachedSelfSHA
+}
 
 // sha256HexRE is a whole SHA-256 in hex and nothing else.
 var sha256HexRE = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
@@ -99,9 +135,13 @@ func doSelfUpdate(ctx context.Context, cfg *Config, binURL, sum string) error {
 		os.Remove(tmp)
 		return err
 	}
+	slog.Info("agent update applied successfully, restarting service", "exe", exe)
 	go func() {
-		time.Sleep(2 * time.Second)
-		os.Exit(0) // the service manager restarts us on the new binary
+		time.Sleep(1 * time.Second)
+		if runtime.GOOS == "windows" {
+			_ = exec.Command("cmd.exe", "/c", "timeout /t 2 /nobreak >nul & net start "+ServiceName).Start()
+		}
+		os.Exit(1)
 	}()
 	return nil
 }

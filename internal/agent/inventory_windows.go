@@ -321,17 +321,11 @@ func platformInventory(inv *protocol.Inventory) {
 	}
 	inv.LastUser = lastUser
 
-	if v := regString(registry.LOCAL_MACHINE, regCurrentVersion, "ProductName"); v != "" {
-		inv.Extra["windows_product"] = v
-	}
 	if v := regString(registry.LOCAL_MACHINE, regCurrentVersion, "DisplayVersion"); v != "" {
 		inv.Extra["windows_display_version"] = v
 	}
 	if v := regString(registry.LOCAL_MACHINE, regCurrentVersion, "EditionID"); v != "" {
 		inv.Extra["windows_edition"] = v
-	}
-	if v := regString(registry.LOCAL_MACHINE, regCurrentVersion, "InstallationType"); v != "" {
-		inv.Extra["windows_installation_type"] = v
 	}
 	if build := regString(registry.LOCAL_MACHINE, regCurrentVersion, "CurrentBuild"); build != "" {
 		if ubr, ok := regUint(registry.LOCAL_MACHINE, regCurrentVersion, "UBR"); ok {
@@ -440,6 +434,7 @@ var (
 	procWTSQuerySessionInformationW = modWtsapi32.NewProc("WTSQuerySessionInformationW")
 	procWTSDisconnectSession        = modWtsapi32.NewProc("WTSDisconnectSession")
 	procWTSLogoffSession            = modWtsapi32.NewProc("WTSLogoffSession")
+	procWTSSendMessageW             = modWtsapi32.NewProc("WTSSendMessageW")
 )
 
 const (

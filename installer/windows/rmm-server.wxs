@@ -65,6 +65,10 @@
       <Directory Id="INSTALLFOLDER" Name="HomelabRMM Server">
         <Component Id="ServerExe" Guid="B4D9F1C7-2E6A-4F3B-8D5C-1A7E9B2C4D60" Bitness="always64">
           <File Id="rmm_server.exe" Name="rmm-server.exe" Source="$(var.ServerExe)" KeyPath="yes" />
+          <ServiceControl Id="ControlServerService" Name="HomelabRMMServer" Stop="both" Remove="uninstall" Wait="yes" />
+        </Component>
+        <Component Id="DesktopExe" Guid="95E8F3C1-4D2A-4B6E-9F1C-8A3B5D7E2F10" Bitness="always64">
+          <File Id="homelab_rmm.exe" Name="Homelab-RMM.exe" Source="$(var.DesktopExe)" KeyPath="yes" />
         </Component>
         <!-- The permissive licences of the components compiled into
              rmm-server.exe require their notices to travel with any copy of
@@ -74,6 +78,13 @@
           <File Id="server_license.txt" Name="LICENSE.txt" Source="$(var.LicenseFile)" KeyPath="yes" />
           <File Id="server_notices.md" Name="THIRD-PARTY-NOTICES.md" Source="$(var.NoticesFile)" />
         </Component>
+        <Directory Id="AgentsFolder" Name="agents">
+          <Component Id="ServerAgentPayloads" Guid="5E8F7A1B-2C3D-4E5F-8A9B-0C1D2E3F4A5B" Bitness="always64">
+            <File Id="agent_msi" Name="rmm-agent.msi" Source="$(var.AgentMsi)" KeyPath="yes" />
+            <File Id="agent_win_amd64" Name="rmm-agent-windows-amd64.exe" Source="$(var.AgentWinExe)" />
+            <File Id="agent_linux_amd64" Name="rmm-agent-linux-amd64" Source="$(var.AgentLinuxAmd64)" />
+          </Component>
+        </Directory>
       </Directory>
     </StandardDirectory>
 
@@ -82,26 +93,21 @@
     </StandardDirectory>
     <StandardDirectory Id="DesktopFolder" />
 
-    <!-- CONSOLEURL is PUBLICURL when it was given, and the loopback address
-         the server listens on otherwise, so the shortcut always points
-         somewhere real. A shortcut to the binary would be useless: it is a
-         service, and the thing to open is the console. -->
-    <Property Id="CONSOLEURL" Value="https://localhost:8443" />
-    <SetProperty Id="CONSOLEURL" Value="[PUBLICURL]" Before="CostFinalize" Sequence="both" Condition="PUBLICURL" />
-
     <Component Id="ServerMenuShortcut" Guid="C51D8F73-6B2A-4E19-8D47-3F9E0A1C62B8" Directory="ServerMenuFolder">
-      <util:InternetShortcut Id="ServerMenuUrl" Name="Homelab RMM Console" Target="[CONSOLEURL]" IconFile="[INSTALLFOLDER]rmm-server.exe" />
+      <Shortcut Id="ServerMenuApp" Name="Homelab RMM" Target="[INSTALLFOLDER]Homelab-RMM.exe" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
       <RemoveFolder Id="RemoveServerMenuFolder" Directory="ServerMenuFolder" On="uninstall" />
       <RegistryValue Root="HKCU" Key="Software\HomelabRMM\Server" Name="menu" Type="integer" Value="1" KeyPath="yes" />
     </Component>
     <Component Id="ServerDesktopShortcut" Guid="9B6E2C48-1D7F-4A53-B82C-5E0D3A7F91C6" Directory="DesktopFolder">
-      <util:InternetShortcut Id="ServerDesktopUrl" Name="Homelab RMM Console" Target="[CONSOLEURL]" IconFile="[INSTALLFOLDER]rmm-server.exe" />
+      <Shortcut Id="ServerDesktopApp" Name="Homelab RMM" Target="[INSTALLFOLDER]Homelab-RMM.exe" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon" />
       <RegistryValue Root="HKCU" Key="Software\HomelabRMM\Server" Name="desktop" Type="integer" Value="1" KeyPath="yes" />
     </Component>
 
     <Feature Id="Main" Title="Homelab RMM Server" Level="1">
       <ComponentRef Id="ServerExe" />
+      <ComponentRef Id="DesktopExe" />
       <ComponentRef Id="ServerDocs" />
+      <ComponentRef Id="ServerAgentPayloads" />
       <ComponentRef Id="ServerMenuShortcut" />
       <ComponentRef Id="ServerDesktopShortcut" />
     </Feature>

@@ -107,6 +107,16 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "cross-origin websocket refused")
 		return
 	}
+	a, err := s.db.GetAgent(agentID)
+	if err != nil {
+		writeErr(w, 404, "agent not found")
+		return
+	}
+	u := userFrom(r.Context())
+	if !s.canAccessAgent(u, a.OrgID) {
+		writeErr(w, 404, "agent not found")
+		return
+	}
 	if !s.hub.IsOnline(agentID) {
 		writeErr(w, 409, "agent is offline")
 		return
@@ -124,6 +134,12 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 	defer keepViewerAlive(ws)()
 	sw := &wsWriter{c: ws}
 	send := func(v any) { sw.json(v) }
+	uName := "technician"
+	if u != nil && u.Username != "" {
+		uName = u.Username
+	}
+	s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,?)`, agentID, now(), "remote", fmt.Sprintf("Terminal session started by %s", uName), jsonText(map[string]any{"user": uName, "type": "terminal"}))
+	s.hub.broadcast(hubEvent{Kind: "event", AgentID: agentID, Data: map[string]any{"ts": now(), "kind": "remote", "message": fmt.Sprintf("Terminal session started by %s", uName)}})
 
 	// Same as the desktop viewer: the terminal used to end by dropping the
 	// socket, so every ending - a closed tab, an agent that went away, a shell
@@ -439,6 +455,16 @@ func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 403, "cross-origin websocket refused")
 		return
 	}
+	a, err := s.db.GetAgent(agentID)
+	if err != nil {
+		writeErr(w, 404, "agent not found")
+		return
+	}
+	u := userFrom(r.Context())
+	if !s.canAccessAgent(u, a.OrgID) {
+		writeErr(w, 404, "agent not found")
+		return
+	}
 	if !s.hub.IsOnline(agentID) {
 		writeErr(w, 409, "agent is offline")
 		return
@@ -552,6 +578,13 @@ func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 	defer helper.Close()
 	vw.json(map[string]string{"t": "connected"})
 	bridged = true // bridge() writes the close frame from here on
+	uName := "technician"
+	if u != nil && u.Username != "" {
+		uName = u.Username
+	}
+	s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,?)`, agentID, now(), "remote", fmt.Sprintf("Remote desktop session started by %s", uName), jsonText(map[string]any{"user": uName, "type": "desktop"}))
+	s.hub.broadcast(hubEvent{Kind: "event", AgentID: agentID, Data: map[string]any{"ts": now(), "kind": "remote", "message": fmt.Sprintf("Remote desktop session started by %s", uName), "fields": map[string]any{"user": uName, "type": "desktop"}}})
+
 	bridge(vp, viewer, vw, helper, &wsWriter{c: helper})
 }
 

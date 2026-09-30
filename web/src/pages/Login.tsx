@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { api, ApiError } from '../api/client';
+import { LogoMark } from '../components/Icons';
 import { Button, Field } from '../components/ui';
 import { useAuth } from '../state/auth';
 import { errMsg } from '../state/toast';
@@ -48,7 +49,8 @@ export function Login() {
     <div className="auth">
       <form className="card" onSubmit={submit}>
         <div className="brand">
-          <span className="logo">R</span> Homelab RMM
+          <LogoMark size={28} className="brand-logo" />
+          <span className="brand-name">Homelab RMM</span>
         </div>
         <h1 style={{ marginBottom: 16 }}>{needsTotp ? 'Two-factor code' : 'Sign in'}</h1>
         {error && <div className="form-error" role="alert">{error}</div>}

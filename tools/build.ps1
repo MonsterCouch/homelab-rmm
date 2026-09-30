@@ -33,7 +33,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('web', 'server', 'agents', 'all', 'test', 'package', 'msi', 'checksums', 'clean')]
+    [ValidateSet('web', 'server', 'agents', 'desktop', 'all', 'test', 'package', 'msi', 'checksums', 'clean')]
     [string[]]$Target = @('all'),
     [string]$Version = '',
     [string]$Dist = 'dist',
@@ -146,6 +146,24 @@ function Assert-WebBuilt {
 
 function Build-Server { Assert-WebBuilt; foreach ($p in $serverPlatforms) { Invoke-GoBuild 'rmm-server' $p } }
 function Build-Agents { foreach ($p in $agentPlatforms) { Invoke-GoBuild 'rmm-agent' $p } }
+function Build-Desktop {
+    Assert-WebBuilt
+    New-Item -ItemType Directory -Force -Path $Dist | Out-Null
+    $env:CGO_ENABLED = '0'
+    $env:GOOS = 'windows'
+    $env:GOARCH = 'amd64'
+    try {
+        $serverTray = Join-Path $Dist "Homelab-RMM.exe"
+        Write-Host "  build $serverTray ($Version)"
+        Invoke-Native 'go' @('build', '-trimpath', '-ldflags', "$ldflags -H windowsgui", '-o', $serverTray, './cmd/rmm-desktop')
+
+        $agentTray = Join-Path $Dist "Homelab-RMM-Agent.exe"
+        Write-Host "  build $agentTray ($Version)"
+        Invoke-Native 'go' @('build', '-trimpath', '-ldflags', "$ldflags -H windowsgui", '-o', $agentTray, './cmd/rmm-desktop')
+    } finally {
+        Remove-Item Env:\CGO_ENABLED, Env:\GOOS, Env:\GOARCH -ErrorAction SilentlyContinue
+    }
+}
 
 function Invoke-Tests {
     Invoke-Native 'go' @('vet', './...')
@@ -265,6 +283,13 @@ function New-Packages {
         Assert-Fresh $srv 'server'
         $srvName = if ($os -eq 'windows') { 'rmm-server.exe' } else { 'rmm-server' }
         Copy-Item -LiteralPath $srv -Destination (Join-Path $stage $srvName)
+        if ($os -eq 'windows' -and $arch -eq 'amd64') {
+            $dt = Join-Path $Dist "Homelab-RMM.exe"
+            if (Test-Path -LiteralPath $dt) {
+                Assert-Fresh $dt 'desktop'
+                Copy-Item -LiteralPath $dt -Destination (Join-Path $stage 'Homelab-RMM.exe')
+            }
+        }
         foreach ($ap in $agentPlatforms) {
             $aparts = $ap.Split('/')
             $a = Get-BinName 'rmm-agent' $aparts[0] $aparts[1]
@@ -320,30 +345,44 @@ function Remove-BuildOutput {
 #
 # WiX is not a build dependency for anything else, so this target is deliberately
 # not part of -Target all: a machine without it can still build and package.
-function New-Msi {
+function Get-WixCommand {
     $wix = Get-Command wix -ErrorAction SilentlyContinue
     if (-not $wix) {
         $candidate = Join-Path $env:ProgramFiles 'WiX Toolset v7.0\bin\wix.exe'
-        if (Test-Path $candidate) { $wix = $candidate } else {
-            throw "wix.exe not found. Install it with: winget install --id WiXToolset.WiXCLI, then accept the EULA with: wix eula accept wix7"
-        }
-    } else { $wix = $wix.Source }
+        if (Test-Path $candidate) { return $candidate }
+        return $null
+    }
+    return $wix.Source
+}
 
-    $agentExe  = Join-Path $Dist "rmm-agent-windows-amd64.exe"
-    $serverExe = Join-Path $Dist "rmm-server-windows-amd64.exe"
-    foreach ($exe in @($agentExe, $serverExe)) {
+function New-Msi {
+    $wix = Get-WixCommand
+    if (-not $wix) {
+        throw "wix.exe not found. Install it with: winget install --id WiXToolset.WiXCLI, then accept the EULA with: wix eula accept wix7"
+    }
+
+    $agentExe   = Join-Path $Dist "rmm-agent-windows-amd64.exe"
+    $serverExe  = Join-Path $Dist "rmm-server-windows-amd64.exe"
+    $desktopExe = Join-Path $Dist "Homelab-RMM.exe"
+    if (-not (Test-Path $desktopExe)) {
+        Build-Desktop
+    }
+    foreach ($exe in @($agentExe, $serverExe, $desktopExe)) {
         if (-not (Test-Path $exe)) { throw "$exe is missing; run -Target all first" }
     }
-    Assert-Fresh $agentExe  "agents"
-    Assert-Fresh $serverExe "server"
+    Assert-Fresh $agentExe   "agents"
+    Assert-Fresh $serverExe  "server"
+    Assert-Fresh $desktopExe "desktop"
 
     # An MSI ProductVersion must be numeric (a.b.c.d), so a describe like
     # v0.2.0-43-g1e3fc5d becomes 0.2.0.43. The full version still goes into the
     # binaries themselves via -ldflags.
     $msiVersion = Get-MsiVersion $Version
     $src = Join-Path $Root "installer\windows"
-    $icon = Join-Path $src "homelab-rmm.ico"
-    if (-not (Test-Path $icon)) { throw "$icon is missing; generate it with installer\windows\make-icon.ps1" }
+    $serverIcon = Join-Path $src "homelab-rmm.ico"
+    $agentIcon = Join-Path $src "homelab-rmm-agent.ico"
+    if (-not (Test-Path $serverIcon)) { throw "$serverIcon is missing; generate it with installer\windows\make-icon.ps1" }
+    if (-not (Test-Path $agentIcon)) { $agentIcon = $serverIcon }
 
     # The licence and the third-party attributions are installed beside the
     # executable, not merely kept in the repository: the permissive licences
@@ -354,29 +393,53 @@ function New-Msi {
     foreach ($doc in @($license, $notices)) {
         if (-not (Test-Path $doc)) { throw "$doc is missing; the installers must carry it" }
     }
-    foreach ($part in @(
-        @{ Name = "rmm-agent";  Wxs = "rmm-agent.wxs";  VarName = "AgentExe";  Exe = $agentExe },
-        @{ Name = "rmm-server"; Wxs = "rmm-server.wxs"; VarName = "ServerExe"; Exe = $serverExe }
-    )) {
-        $out = Join-Path $Dist ($part.Name + "-" + $Version + "-x64.msi")
-        & $wix build (Join-Path $src $part.Wxs) `
-            "-d" "Version=$msiVersion" `
-            "-d" ($part.VarName + "=" + $part.Exe) `
-            "-d" ("IconFile=" + $icon) `
-            "-d" ("LicenseFile=" + $license) `
-            "-d" ("NoticesFile=" + $notices) `
-            "-ext" "WixToolset.Util.wixext" "-arch" "x64" `
-            "-pdbtype" "none" `
-            "-o" $out
-        if ($LASTEXITCODE -ne 0) { throw "wix build failed for $($part.Wxs)" }
-        Write-Host "  msi $out"
+    $agentLinuxAmd64 = Join-Path $Dist "rmm-agent-linux-amd64"
+    if (-not (Test-Path $agentLinuxAmd64)) {
+        Invoke-GoBuild 'rmm-agent' 'linux/amd64'
     }
+
+    # 1. Build rmm-agent MSI
+    $agentMsi = Join-Path $Dist ("rmm-agent-" + $Version + "-x64.msi")
+    $agentDesktopExe = Join-Path $Dist "Homelab-RMM-Agent.exe"
+    $agentWixArgs = @(
+        (Join-Path $src "rmm-agent.wxs"),
+        "-d", "Version=$msiVersion",
+        "-d", "AgentExe=$agentExe",
+        "-d", ("IconFile=" + $agentIcon),
+        "-d", ("LicenseFile=" + $license),
+        "-d", ("NoticesFile=" + $notices)
+    )
+    if (Test-Path $agentDesktopExe) {
+        $agentWixArgs += @("-d", ("AgentDesktopExe=" + $agentDesktopExe))
+    }
+    $agentWixArgs += @("-ext", "WixToolset.Util.wixext", "-arch", "x64", "-pdbtype", "none", "-o", $agentMsi)
+    & $wix build @agentWixArgs
+    if ($LASTEXITCODE -ne 0) { throw "wix build failed for rmm-agent.wxs" }
+    Write-Host "  msi $agentMsi"
+
+    # 2. Build rmm-server MSI with bundled agent payloads
+    $serverMsi = Join-Path $Dist ("rmm-server-" + $Version + "-x64.msi")
+    & $wix build (Join-Path $src "rmm-server.wxs") `
+        "-d" "Version=$msiVersion" `
+        "-d" "ServerExe=$serverExe" `
+        "-d" "DesktopExe=$desktopExe" `
+        "-d" "AgentMsi=$agentMsi" `
+        "-d" "AgentWinExe=$agentExe" `
+        "-d" "AgentLinuxAmd64=$agentLinuxAmd64" `
+        "-d" ("IconFile=" + $serverIcon) `
+        "-d" ("LicenseFile=" + $license) `
+        "-d" ("NoticesFile=" + $notices) `
+        "-ext" "WixToolset.Util.wixext" "-arch" "x64" `
+        "-pdbtype" "none" `
+        "-o" $serverMsi
+    if ($LASTEXITCODE -ne 0) { throw "wix build failed for rmm-server.wxs" }
+    Write-Host "  msi $serverMsi"
 }
 
 # Get-MsiVersion reduces a git describe to the numeric form Windows Installer
 # accepts. v0.2.0-43-g1e3fc5d -> 0.2.0.43; a plain tag v0.2.0 -> 0.2.0.
 function Get-MsiVersion([string]$v) {
-    $m = [regex]::Match($v, "^v?(d+).(d+).(d+)(?:-(d+))?")
+    $m = [regex]::Match($v, '^v?(\d+)\.(\d+)\.(\d+)(?:-(\d+))?')
     if (-not $m.Success) { return "0.0.0.0" }
     $rev = if ($m.Groups[4].Success) { $m.Groups[4].Value } else { "0" }
     return "$($m.Groups[1].Value).$($m.Groups[2].Value).$($m.Groups[3].Value).$rev"
@@ -387,7 +450,18 @@ foreach ($t in $Target) {
         'web'       { Build-Web }
         'server'    { Build-Server }
         'agents'    { Build-Agents }
-        'all'       { Build-Web; Build-Server; Build-Agents }
+        'desktop'   { Build-Desktop }
+        'all'       {
+            Build-Web
+            Build-Server
+            Build-Agents
+            Build-Desktop
+            if (Get-WixCommand) {
+                New-Msi
+            } else {
+                Write-Host "  WiX CLI not found; skipping MSI installer generation (install WiX to auto-build MSIs)"
+            }
+        }
         'test'      { Invoke-Tests }
         'package'   { New-Packages }
         'msi'       { New-Msi }

@@ -168,7 +168,11 @@ func (c *Config) Save() error {
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, ConfigPath())
+	if err := os.Rename(tmp, ConfigPath()); err != nil {
+		return err
+	}
+	saveRegistryClientInfo(c.ServerURL, c.AgentID)
+	return nil
 }
 
 // Plaintext reports whether the agent will reach the server over an

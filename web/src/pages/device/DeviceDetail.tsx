@@ -47,7 +47,7 @@ const TABS: readonly { id: string; label: string; needsOnline?: boolean }[] = [
   // answering is exactly what this tab is for.
   { id: 'compliance', label: 'Compliance' },
   { id: 'runs', label: 'Runs' },
-  { id: 'events', label: 'Events' },
+  { id: 'events', label: 'Activity' },
 ];
 
 type TabId = 'overview' | 'terminal' | 'desktop' | 'processes' | 'services' | 'software' | 'files' | 'eventlog' | 'patches' | 'compliance' | 'runs' | 'events';
@@ -143,6 +143,25 @@ export function DeviceDetail() {
     }
   };
 
+  const doIsolate = async (isolate: boolean) => {
+    const ok = await confirm({
+      title: isolate ? `Isolate ${a.display_name} from network` : `Release ${a.display_name} from isolation`,
+      message: isolate
+        ? `Isolating "${a.display_name}" cuts off all inbound and outbound LAN and Internet communication to contain threats. Communication with this RMM server remains active for remote remediation.`
+        : `Release "${a.display_name}"? Normal firewall rules and network connectivity will be restored.`,
+      danger: isolate,
+      confirmLabel: isolate ? 'Isolate device' : 'Release device',
+    });
+    if (!ok) return;
+    try {
+      await api.isolateAgent(a.id, isolate);
+      toast.success(isolate ? 'Device isolated from network' : 'Device released from isolation');
+      void agent.reload();
+    } catch (err) {
+      toast.error(isolate ? 'Isolation failed' : 'Release failed', errMsg(err));
+    }
+  };
+
   const tabProps: TabProps = { agent: a, reload: agent.reload, canWrite };
 
   return (
@@ -164,6 +183,7 @@ export function DeviceDetail() {
           </span>
           <span className="muted mono small dev-ip">{a.last_ip}</span>
           {a.group_name && <Chip outline>{a.group_name}</Chip>}
+          {a.isolated && <Chip tone="danger">ISOLATED</Chip>}
           {a.pending_reboot && <Chip tone="warn">reboot required</Chip>}
           {a.maintenance_until > Date.now() / 1000 && <Chip tone="purple">maintenance until {relTime(a.maintenance_until)}</Chip>}
           {!a.online && <span className="muted small">last seen {relTime(a.last_seen)}</span>}
@@ -214,6 +234,14 @@ export function DeviceDetail() {
               <hr className="phone-only" />
               <button onClick={doWol}>Wake-on-LAN</button>
               <hr />
+              {a.isolated ? (
+                <button onClick={() => doIsolate(false)}>Release from isolation</button>
+              ) : (
+                <button className="danger" onClick={() => doIsolate(true)}>
+                  Isolate device…
+                </button>
+              )}
+              <hr />
               <button className="danger" onClick={doDelete}>
                 Delete device
               </button>
@@ -221,6 +249,18 @@ export function DeviceDetail() {
           </>
         )}
       </div>
+      {a.isolated && (
+        <div className="banner danger" style={{ marginBottom: 12 }}>
+          <span>
+            <strong>Device Isolated:</strong> All network traffic to and from this machine is blocked except for communication with this RMM server.
+          </span>
+          {canWrite && (
+            <Button size="sm" variant="ghost" onClick={() => doIsolate(false)} style={{ marginLeft: 'auto' }}>
+              Release device
+            </Button>
+          )}
+        </div>
+      )}
       <div className="tabs" ref={tabsRef}>
         {TABS.map((t) => (
           <NavLink key={t.id} to={`/devices/${a.id}${t.id === 'overview' ? '' : `/${t.id}`}`} end className={({ isActive }) => (isActive ? 'active' : '')}>

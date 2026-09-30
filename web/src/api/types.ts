@@ -2,7 +2,8 @@
 // internal/protocol/protocol.go; field names are the JSON tags (snake_case).
 // Keep them in sync by hand: the Go side is the source of truth.
 
-export type Role = 'admin' | 'tech' | 'viewer';
+// 'poc' is a client contact: support tickets for one organization, no console.
+export type Role = 'admin' | 'tech' | 'viewer' | 'poc';
 
 export interface User {
   id: number;
@@ -12,6 +13,7 @@ export interface User {
   totp_enabled: boolean;
   created_at: number;
   last_login: number;
+  org_scope?: string[];
 }
 
 export interface AuthState {
@@ -173,6 +175,22 @@ export interface FsListResult {
 
 export type PowerAction = 'reboot' | 'shutdown' | 'lock' | 'logoff';
 
+export interface Organization {
+  id: string;
+  name: string;
+  device_count: number;
+  site_count: number;
+  created_at: number;
+}
+
+export interface Site {
+  id: string;
+  org_id: string;
+  name: string;
+  device_count: number;
+  created_at: number;
+}
+
 // ---- server ----
 
 export interface Agent {
@@ -183,6 +201,10 @@ export interface Agent {
   platform: string;
   arch: string;
   version: string;
+  org_id?: string;
+  org_name?: string;
+  site_id?: string;
+  site_name?: string;
   group_id: number | null;
   group_name?: string;
   tags: string[];
@@ -199,10 +221,15 @@ export interface Agent {
   inventory?: Inventory;
   open_alerts: number;
   patches_available: number;
+  isolated?: boolean;
+  isolated_at?: number;
+  isolated_by?: string;
 }
 
 export interface AgentUpdate {
   display_name?: string;
+  org_id?: string;
+  site_id?: string;
   group_id?: number | null;
   clear_group?: boolean;
   tags?: string[];
@@ -226,6 +253,8 @@ export interface Targets {
   groups?: number[];
   tags?: string[];
   os?: string;
+  organizations?: string[];
+  sites?: string[];
 }
 
 export interface Group {
@@ -240,6 +269,8 @@ export interface EnrollToken {
   id: number;
   token: string;
   name: string;
+  org_id?: string;
+  site_id?: string;
   group_id: number | null;
   uses_left: number;
   expires_at: number;
@@ -255,6 +286,8 @@ export interface EnrollList {
 
 export interface EnrollCreate {
   name: string;
+  org_id?: string;
+  site_id?: string;
   group_id?: number | null;
   uses: number;
   ttl_hours: number;
@@ -922,4 +955,140 @@ export interface HubEvent<T = unknown> {
   kind: EventKind;
   agent_id?: string;
   data?: T;
+}
+
+export interface SoftwareCatalogItem {
+  id: string;
+  name: string;
+  description: string;
+  publisher: string;
+  version: string;
+  category: string;
+  icon: string;
+  install_cmd: string;
+  uninstall_cmd: string;
+  os: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface DiscoveredDevice {
+  id: string;
+  ip: string;
+  mac: string;
+  hostname: string;
+  vendor: string;
+  os: string;
+  device_type: string;
+  open_ports: number[];
+  snmp_enabled: boolean;
+  snmp_sys_name: string;
+  snmp_sys_descr: string;
+  snmp_sys_uptime: number;
+  snmp_interfaces: any[];
+  discovered_by: string;
+  org_id: string;
+  site_id: string;
+  status: string;
+  first_seen: number;
+  last_seen: number;
+}
+
+export interface NetworkScan {
+  id: number;
+  subnet: string;
+  agent_id: string;
+  status: string;
+  devices_found: number;
+  started_at: number;
+  completed_at: number;
+  error: string;
+}
+
+export interface Ticket {
+  id: number;
+  agent_id: string;
+  org_id: string;
+  site_id: string;
+  subject: string;
+  description: string;
+  requester_name: string;
+  requester_email: string;
+  requester_phone: string;
+  status: 'open' | 'in_progress' | 'waiting' | 'resolved' | 'closed';
+  priority: 'low' | 'normal' | 'high' | 'urgent';
+  assigned_to: string;
+  agent_name?: string;
+  is_internal?: boolean;
+  source?: string;
+  requester_domain_user?: string;
+  comments_count?: number;
+  created_at: number;
+  updated_at: number;
+  resolved_at: number;
+}
+
+export interface TicketComment {
+  id: number;
+  ticket_id: number;
+  author: string;
+  is_internal: boolean;
+  body: string;
+  created_at: number;
+}
+
+export interface TicketWithComments extends Ticket {
+  comments: TicketComment[];
+}
+
+export interface PortalConfig {
+  agent_id: string;
+  agent_name: string;
+  computer_name: string;
+  domain_user: string;
+  is_workgroup: boolean;
+  org_id: string;
+  org_name: string;
+  site_id: string;
+  site_name: string;
+  os: string;
+  is_poc: boolean;
+  user?: User;
+}
+
+export interface PortalSoftwareItem {
+  id: string;
+  name: string;
+  description: string;
+  publisher: string;
+  version: string;
+  category: string;
+  icon: string;
+  installed: boolean;
+  installed_version: string;
+  has_update: boolean;
+}
+
+export interface PortalSoftwareActionReq {
+  agent_id?: string;
+  software_id: string;
+  action: 'install' | 'uninstall' | 'update';
+}
+
+export interface StagedUpdate {
+  available: boolean;
+  path: string;
+  size: number;
+  mod_time: number;
+  sha256: string;
+  differs: boolean;
+}
+
+export interface ServerVersionInfo {
+  version: string;
+  os: string;
+  arch: string;
+  pid: number;
+  exe_path: string;
+  staged_update?: StagedUpdate;
 }

@@ -38,7 +38,7 @@ func TestLoggingReachesTheFileOverABrokenStderr(t *testing.T) {
 	// let the temporary directory go.
 	t.Cleanup(func() { slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil))) })
 
-	slog.Warn("FIRST RUN: no users yet. Open the console and create the administrator. The setup form asks for this one-time code", "setup_code", "3f9a1c07")
+	slog.Info("FIRST RUN: no users yet. Open the console to create the administrator")
 	slog.Info("listening", "addr", "[::]:8443", "tls", true)
 	f.Close()
 
@@ -46,7 +46,7 @@ func TestLoggingReachesTheFileOverABrokenStderr(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"setup_code=3f9a1c07", "msg=listening"} {
+	for _, want := range []string{"FIRST RUN", "msg=listening"} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("server.log is missing %q; it has:\n%s", want, b)
 		}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -138,6 +139,19 @@ func (d *DB) ListPatchPolicies() ([]PatchPolicy, error) {
 	return out, rows.Err()
 }
 
+func (d *DB) GetPatchPolicy(id int64) (*PatchPolicy, error) {
+	policies, err := d.ListPatchPolicies()
+	if err != nil {
+		return nil, err
+	}
+	for i := range policies {
+		if policies[i].ID == id {
+			return &policies[i], nil
+		}
+	}
+	return nil, errNotFound
+}
+
 // errPatchBusy is returned when a device already has a patch job running.
 // Patch work is serialised per device: two overlapping installs used to mark
 // each other's in-flight patches failed, and a scan that overlapped an install
@@ -238,6 +252,15 @@ func (s *Server) patchScanLocked(agentID string) error {
 	}
 	s.db.Exec(`UPDATE agents SET pending_reboot = ? WHERE id = ?`, res.RebootPending, agentID)
 	s.db.SetSetting("last_patch_scan:"+agentID, strconv.FormatInt(ts, 10))
+	missingCount := 0
+	for _, u := range res.Updates {
+		if !u.Installed {
+			missingCount++
+		}
+	}
+	scanMsg := fmt.Sprintf("Patch scan completed: %d missing updates detected", missingCount)
+	s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,?)`, agentID, ts, "patch", scanMsg, jsonText(map[string]any{"updates_found": missingCount}))
+	s.hub.broadcast(hubEvent{Kind: "event", AgentID: agentID, Data: map[string]any{"ts": ts, "kind": "patch", "message": scanMsg}})
 	s.hub.broadcast(hubEvent{Kind: "patches", AgentID: agentID})
 	return nil
 }
@@ -311,6 +334,13 @@ func (s *Server) patchInstallLocked(agentID string, ids []string, reboot bool, b
 	s.db.Exec(`UPDATE patches SET status='failed', error='no result reported' WHERE agent_id=? AND status='installing' AND patch_id IN (`+placeholders(len(ids))+`)`, sweep...)
 	s.db.Exec(`UPDATE agents SET pending_reboot = ? WHERE id = ?`, res.RebootReq, agentID)
 	s.db.Audit(by, "", "patch.install", agentID, map[string]any{"installed": res.Installed, "failed": res.Failed})
+	installMsg := fmt.Sprintf("Patch installation completed: %d installed, %d failed", len(res.Installed), len(res.Failed))
+	s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,?)`, agentID, ts, "patch", installMsg, jsonText(map[string]any{
+		"installed_count": len(res.Installed),
+		"failed_count":    len(res.Failed),
+		"reboot_required": res.RebootReq,
+	}))
+	s.hub.broadcast(hubEvent{Kind: "event", AgentID: agentID, Data: map[string]any{"ts": ts, "kind": "patch", "message": installMsg}})
 	s.hub.broadcast(hubEvent{Kind: "patches", AgentID: agentID})
 	return &res, nil
 }
@@ -346,32 +376,55 @@ func (s *Server) patchInstallPolicy(agentID string, p *PatchPolicy) {
 // ---- handlers ----
 
 func (s *Server) handleListPatches(w http.ResponseWriter, r *http.Request) {
-	p, err := s.db.ListPatches(r.URL.Query().Get("agent"), r.URL.Query().Get("status"), queryInt(r, "limit", 2000))
+	agentQuery := r.URL.Query().Get("agent")
+	if agentQuery != "" {
+		if _, ok := s.getScopedAgent(w, r, agentQuery); !ok {
+			return
+		}
+	}
+	p, err := s.db.ListPatches(agentQuery, r.URL.Query().Get("status"), queryInt(r, "limit", 2000))
 	if err != nil {
 		fail(w, err)
 		return
+	}
+	me := userFrom(r.Context())
+	if me != nil && !me.IsAdmin() && len(me.OrgScope) > 0 {
+		filtered := make([]Patch, 0, len(p))
+		for _, item := range p {
+			if a, err := s.db.GetAgent(item.AgentID); err == nil && s.canAccessAgent(me, a.OrgID) {
+				filtered = append(filtered, item)
+			}
+		}
+		p = filtered
 	}
 	writeJSON(w, 200, p)
 }
 
 func (s *Server) handleAgentPatches(w http.ResponseWriter, r *http.Request) {
-	p, err := s.db.ListPatches(r.PathValue("id"), r.URL.Query().Get("status"), 2000)
+	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
+	p, err := s.db.ListPatches(id, r.URL.Query().Get("status"), 2000)
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	last, _ := strconv.ParseInt(s.db.Setting("last_patch_scan:"+r.PathValue("id"), "0"), 10, 64)
+	last, _ := strconv.ParseInt(s.db.Setting("last_patch_scan:"+id, "0"), 10, 64)
 	writeJSON(w, 200, map[string]any{
 		"patches": p, "last_scan": last,
 		// What the agent said went wrong during the scan ("" when it was
 		// clean): an unreachable repository leaves a fresh timestamp beside a
 		// stale list, and this is the only place that says so.
-		"scan_error": s.db.Setting("last_patch_scan_error:"+r.PathValue("id"), ""),
+		"scan_error": s.db.Setting("last_patch_scan_error:"+id, ""),
 	})
 }
 
 func (s *Server) handlePatchScan(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	if !s.hub.IsOnline(id) {
 		fail(w, ErrAgentOffline)
 		return
@@ -390,6 +443,9 @@ func (s *Server) handlePatchScan(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePatchInstall(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	var in struct {
 		IDs    []string `json:"ids"`
 		All    bool     `json:"all"`
@@ -468,10 +524,14 @@ func (s *Server) handlePatchStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "items required")
 		return
 	}
+	me := userFrom(r.Context())
 	var changed int64
 	for _, it := range in.Items {
 		agentID, patchID := it.agent(), it.patch()
 		if agentID == "" || patchID == "" {
+			continue
+		}
+		if a, err := s.db.GetAgent(agentID); err != nil || !s.canAccessAgent(me, a.OrgID) {
 			continue
 		}
 		res, err := s.db.Exec(`UPDATE patches SET status=? WHERE agent_id=? AND patch_id=? AND status IN ('available','approved','ignored','failed')`, in.Status, agentID, patchID)
@@ -500,6 +560,16 @@ func (s *Server) handleListPatchPolicies(w http.ResponseWriter, r *http.Request)
 		fail(w, err)
 		return
 	}
+	me := userFrom(r.Context())
+	if me != nil && !me.IsAdmin() && len(me.OrgScope) > 0 {
+		filtered := make([]PatchPolicy, 0, len(p))
+		for _, item := range p {
+			if s.canAccessTargets(me, item.Targets) {
+				filtered = append(filtered, item)
+			}
+		}
+		p = filtered
+	}
 	writeJSON(w, 200, p)
 }
 
@@ -508,6 +578,18 @@ func (s *Server) savePatchPolicy(w http.ResponseWriter, r *http.Request, id int6
 	if err := readJSON(r, &p); err != nil {
 		fail(w, err)
 		return
+	}
+	me := userFrom(r.Context())
+	if id != 0 {
+		existing, err := s.db.GetPatchPolicy(id)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		if !s.canAccessTargets(me, existing.Targets) {
+			writeErr(w, http.StatusForbidden, "access denied: patch policy outside organization scope")
+			return
+		}
 	}
 	if strings.TrimSpace(p.Name) == "" {
 		writeErr(w, 400, "name required")
@@ -520,6 +602,10 @@ func (s *Server) savePatchPolicy(w http.ResponseWriter, r *http.Request, id int6
 				return
 			}
 		}
+	}
+	if err := s.validateTargetsScope(me, p.Targets); err != nil {
+		writeErr(w, http.StatusForbidden, err.Error())
+		return
 	}
 	if p.Mode == "" {
 		p.Mode = "approved"
@@ -558,6 +644,16 @@ func (s *Server) handleUpdatePatchPolicy(w http.ResponseWriter, r *http.Request)
 }
 func (s *Server) handleDeletePatchPolicy(w http.ResponseWriter, r *http.Request) {
 	id, _ := pathInt(r, "id")
+	existing, err := s.db.GetPatchPolicy(id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	me := userFrom(r.Context())
+	if !s.canAccessTargets(me, existing.Targets) {
+		writeErr(w, http.StatusForbidden, "access denied: patch policy outside organization scope")
+		return
+	}
 	s.db.Exec(`DELETE FROM patch_policies WHERE id = ?`, id)
 	s.sched.reload()
 	s.audit(r, "patch_policy.delete", strconv.FormatInt(id, 10), nil)

@@ -119,21 +119,6 @@ _Coming soon: dashboard, device overview, remote desktop, script run with live o
    → Servers → Add Exception*).
 5. The first visit shows the setup form: create the admin account (add an email if you want
    alert mail later). Turn on two-factor under *Account*.
-
-   Because nobody is signed in yet, a server with no users mints a **one-time setup code** and
-   prints it at startup — to the console and as a `WARN` line in `server.log` in the data
-   directory:
-
-   ```
-   ==== FIRST-RUN SETUP CODE: 3f9a1c07 ====
-   ```
-
-   The form **always** asks for it, including from a browser on the server itself: that account
-   is root on every device you go on to enroll, and a connection from `127.0.0.1` could equally be
-   a reverse proxy relaying the LAN, another program on the box, or a web page you happen to have
-   open. Reading the code is the thing that proves it is you. Lost it? Restart the server before
-   anyone creates a user and it prints a new one; once the admin exists the code is neither
-   minted nor asked for again.
 6. **Devices → Enroll**: create an enrollment token (name, optional group, number of uses, expiry),
    then on each machine you want to manage:
    - Windows, elevated PowerShell — save the script, read it, run it:
@@ -492,8 +477,7 @@ stopping the service, putting the files back and starting it. More in
 - Operators sign in with bcrypt-hashed passwords, optional TOTP, `HttpOnly` + `SameSite=Strict`
   session cookies (14 days), an `X-Requested-With` header on every state-changing request
   including sign-in and first-run setup (CSRF), same-origin checks on WebSockets, login rate
-  limiting (10/min per IP) and roles. First-run setup always requires the one-time code the
-  server prints at startup.
+  limiting (10/min per IP) and roles.
 - The **console is root/SYSTEM on every enrolled device**. Keep it on the LAN or behind a VPN,
   turn on 2FA for every account and give day-to-day accounts the *tech* or *viewer* role.
 - An **enforced baseline changes devices without asking**, and its `command` kind is arbitrary

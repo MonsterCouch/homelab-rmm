@@ -469,11 +469,14 @@ func (s *Server) handleBaselineEvaluate(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, 400, fmt.Sprintf("at most %d devices may be named; leave agent_ids empty for every matched device", maxEvaluateAgents))
 		return
 	}
+	me := userFrom(r.Context())
 	matched := s.matchedAgentIDs(b.Targets)
 	ids := in.AgentIDs
 	if len(ids) == 0 {
 		for agentID := range matched {
-			ids = append(ids, agentID)
+			if a, err := s.db.GetAgent(agentID); err == nil && s.canAccessAgent(me, a.OrgID) {
+				ids = append(ids, agentID)
+			}
 		}
 		sort.Strings(ids)
 	}
@@ -492,8 +495,9 @@ func (s *Server) handleBaselineEvaluate(w http.ResponseWriter, r *http.Request) 
 	}
 	for _, agentID := range ids {
 		agentID := agentID
+		a, err := s.db.GetAgent(agentID)
 		switch {
-		case !matched[agentID]:
+		case err != nil || !s.canAccessAgent(me, a.OrgID) || !matched[agentID]:
 			add(agentActionOut{AgentID: agentID, Status: "error", Error: "device is not matched by this baseline"})
 			continue
 		case !s.hub.IsOnline(agentID):
@@ -564,9 +568,8 @@ func (s *Server) handleBaselineRemediate(w http.ResponseWriter, r *http.Request)
 		fail(w, err)
 		return
 	}
-	a, err := s.db.GetAgent(in.AgentID)
-	if err != nil {
-		fail(w, err)
+	a, ok := s.getScopedAgent(w, r, in.AgentID)
+	if !ok {
 		return
 	}
 	if !b.Targets.Matches(a) {
@@ -734,7 +737,7 @@ func (s *Server) handleBaselinePreview(w http.ResponseWriter, r *http.Request) {
 		i, agentID := i, agentID
 		d := previewDeviceOut{AgentID: agentID, Results: []previewResultOut{}}
 		a, err := s.db.GetAgent(agentID)
-		if err != nil {
+		if err != nil || !s.canAccessAgent(userFrom(r.Context()), a.OrgID) {
 			d.Status, d.Error = "error", "unknown device"
 			devices[i] = d
 			continue
@@ -800,9 +803,8 @@ type deviceBaselineCheckOut struct {
 
 func (s *Server) handleAgentBaselines(w http.ResponseWriter, r *http.Request) {
 	agentID := r.PathValue("id")
-	a, err := s.db.GetAgent(agentID)
-	if err != nil {
-		fail(w, err)
+	a, ok := s.getScopedAgent(w, r, agentID)
+	if !ok {
 		return
 	}
 	a.Online = s.hub.IsOnline(a.ID)
@@ -860,6 +862,9 @@ func (s *Server) handleAgentBaselines(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAgentBaselineHistory(w http.ResponseWriter, r *http.Request) {
 	agentID := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, agentID); !ok {
+		return
+	}
 	limit := queryInt(r, "limit", 100)
 	if limit <= 0 {
 		limit = 100

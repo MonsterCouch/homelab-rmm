@@ -110,10 +110,6 @@ export function Overview({ agent, reload, canWrite }: TabProps) {
                 )}
                 <dt>Reboot</dt>
                 <dd>{agent.pending_reboot ? <Chip tone="warn">pending</Chip> : <span className="muted">not required</span>}</dd>
-                <dt>Agent</dt>
-                <dd>
-                  v{inv.agent_version || agent.version} <span className="muted mono small">{inv.agent_path}</span>
-                </dd>
                 <dt>Collected</dt>
                 <dd>{relTime(inv.collected_at)}</dd>
                 {inv.extra &&
@@ -490,7 +486,10 @@ function IdentityCard({ agent, reload, canWrite }: TabProps) {
           <dt>Enrolled</dt>
           <dd>{dateTime(agent.enrolled_at)}</dd>
           <dt>Agent version</dt>
-          <dd>{agent.version || '—'}</dd>
+          <dd>
+            {agent.version || '—'}
+            {agent.inventory?.agent_path && <span className="muted mono small" style={{ marginLeft: 6 }}>({agent.inventory.agent_path})</span>}
+          </dd>
         </dl>
       </div>
     </div>

@@ -15,6 +15,8 @@ func TestValidateCheckTable(t *testing.T) {
 	}{
 		// service
 		{"service ok", "service", `{"name":"Spooler","state":"running","start_type":"auto"}`, ""},
+		{"service installed", "service", `{"name":"Spooler","state":"installed"}`, ""},
+		{"service not installed", "service", `{"name":"Telnet","state":"not_installed"}`, ""},
 		{"service default start type", "service", `{"name":"sshd","state":"running"}`, ""},
 		{"service bad state", "service", `{"name":"Spooler","state":"paused"}`, "state"},
 		{"service no name", "service", `{"state":"running"}`, "name"},
@@ -23,6 +25,11 @@ func TestValidateCheckTable(t *testing.T) {
 		{"service unknown key", "service", `{"name":"a","state":"running","enable":true}`, "enable"},
 		// package
 		{"package ok", "package", `{"name":"unattended-upgrades","state":"present"}`, ""},
+		{"package installed", "package", `{"name":"7-Zip","state":"installed"}`, ""},
+		{"package not installed", "package", `{"name":"utorrent","state":"not_installed"}`, ""},
+		{"package version exact", "package", `{"name":"curl","state":"installed","version":"8.5.0","version_op":"=="}`, ""},
+		{"package version op bad", "package", `{"name":"curl","state":"installed","version":"8.5.0","version_op":"~="}`, "version_op"},
+		{"package version on not installed", "package", `{"name":"curl","state":"not_installed","version":"8.5.0"}`, "version"},
 		{"package min version", "package", `{"name":"curl","state":"present","min_version":"8.5.0"}`, ""},
 		{"package min version on absent", "package", `{"name":"curl","state":"absent","min_version":"8"}`, "min_version"},
 		{"package unparsable min version", "package", `{"name":"curl","state":"present","min_version":"latest"}`, "min_version"},
@@ -347,3 +354,32 @@ func TestRegistryPathCharactersAndReasons(t *testing.T) {
 		t.Fatalf(`HKLM\SAM stays denied: %v`, err)
 	}
 }
+
+func TestCheckVersion(t *testing.T) {
+	cases := []struct {
+		got, want, op string
+		expected      bool
+	}{
+		{"1.2.3", "1.2.3", "==", true},
+		{"1.2.4", "1.2.3", "==", false},
+		{"1.2.4", "1.2.3", ">=", true},
+		{"1.2.3", "1.2.3", ">=", true},
+		{"1.2.2", "1.2.3", ">=", false},
+		{"1.2.2", "1.2.3", "<=", true},
+		{"1.2.3", "1.2.3", "<=", true},
+		{"1.2.4", "1.2.3", "<=", false},
+		{"2.0.0", "1.9.9", ">", true},
+		{"1.9.9", "2.0.0", "<", true},
+		{"1.2.3", "1.2.4", "!=", true},
+	}
+	for _, tc := range cases {
+		ok, err := CheckVersion(tc.got, tc.want, tc.op)
+		if err != nil {
+			t.Fatalf("CheckVersion(%q, %q, %q): %v", tc.got, tc.want, tc.op, err)
+		}
+		if ok != tc.expected {
+			t.Errorf("CheckVersion(%q, %q, %q) = %v, want %v", tc.got, tc.want, tc.op, ok, tc.expected)
+		}
+	}
+}
+

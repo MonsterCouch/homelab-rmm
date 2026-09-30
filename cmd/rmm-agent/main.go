@@ -348,12 +348,43 @@ func main() {
 		server := fs.String("server", "", "server URL, e.g. https://rmm.lan:8443")
 		token := fs.String("token", "", "enrollment token from the console")
 		fp := fs.String("fingerprint", "", "server certificate SHA-256 fingerprint (omit when the certificate is publicly trusted)")
+		fromMSI := fs.String("from-msi", "", "path to MSI containing embedded [HOMELAB_RMM_CONFIG] tag")
 		noService := fs.Bool("no-service", false, "write the config only; do not register a service")
 		dir := configDirFlag(fs)
 		fs.Parse(os.Args[2:])
 		applyConfigDir(*dir)
 		if *server == "" || *token == "" {
-			fmt.Fprintln(os.Stderr, "--server and --token are required")
+			if *fromMSI != "" {
+				if tag, err := readTaggedConfig(*fromMSI); err == nil {
+					if *server == "" {
+						*server = tag.Server
+					}
+					if *token == "" {
+						*token = tag.Token
+					}
+					if *fp == "" {
+						*fp = tag.Fingerprint
+					}
+				}
+			}
+			if *server == "" || *token == "" {
+				if exe, err := os.Executable(); err == nil {
+					if tag, err := readTaggedConfig(exe); err == nil {
+						if *server == "" {
+							*server = tag.Server
+						}
+						if *token == "" {
+							*token = tag.Token
+						}
+						if *fp == "" {
+							*fp = tag.Fingerprint
+						}
+					}
+				}
+			}
+		}
+		if *server == "" || *token == "" {
+			fmt.Fprintln(os.Stderr, "--server and --token are required (or a tagged MSI/installer)")
 			os.Exit(2)
 		}
 		cfg := &agent.Config{ServerURL: strings.TrimRight(*server, "/"), EnrollToken: *token, Fingerprint: strings.ToLower(strings.ReplaceAll(*fp, ":", ""))}

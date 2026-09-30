@@ -22,8 +22,8 @@ param(
     # Defaults to homelab-rmm.ico beside this script. Resolved in the body
     # because $PSScriptRoot is not populated during parameter binding.
     [string]$Out = '',
-    # The console's own accent blue, so the installed app matches the web UI.
-    [string]$Accent = '#2563EB'
+    # Dark obsidian tile background, matching the modern web console.
+    [string]$Accent = '#111216'
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
@@ -89,7 +89,7 @@ function New-Glyph([int]$px) {
     # Pulse line inside the screen. Dropped below 20 px, where it turns to mud
     # and the monitor silhouette alone reads better.
     if ($px -ge 20) {
-        $pp = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(255, 255, 255, 255), [float][Math]::Max(1.0, 1.8 * $u))
+        $pp = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(255, 16, 185, 129), [float][Math]::Max(1.0, 1.8 * $u))
         $pp.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
         $pp.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
         $pp.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round

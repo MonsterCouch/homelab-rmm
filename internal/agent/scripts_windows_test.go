@@ -51,6 +51,8 @@ func TestScriptInterpretersAreAbsolute(t *testing.T) {
 	}
 }
 
+
+
 // TestScriptDecodeOutputKeepsNonUTF8Text: a Windows interpreter answers in
 // the console code page when its stdout is a pipe, and reading that as UTF-8
 // turned every accented character in an event-log message, a path or a user
@@ -92,5 +94,25 @@ func TestCmdScriptCommandRefusesReparsedArguments(t *testing.T) {
 	}
 	if !strings.HasSuffix(line, ` "a & echo MARKER"`) {
 		t.Fatalf("the argument must reach the script as one quoted value: %q", line)
+	}
+}
+
+func TestWithScriptEnvAddsWinGet(t *testing.T) {
+	env := []string{`PATH=C:\Windows\System32;C:\Windows`, "FOO=BAR"}
+	augmented := withScriptEnv(env)
+	dir, ok := wingetInstallDir()
+	if !ok {
+		t.Skip("winget not present on this machine")
+	}
+	found := false
+	for _, e := range augmented {
+		if strings.HasPrefix(strings.ToUpper(e), "PATH=") {
+			if strings.Contains(strings.ToLower(e), strings.ToLower(dir)) {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected PATH in augmented env to contain wingetDir %q, got: %v", dir, augmented)
 	}
 }

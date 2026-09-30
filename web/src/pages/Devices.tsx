@@ -5,7 +5,7 @@ import type { Agent, Group, Metrics, PowerAction } from '../api/types';
 import { DataTable, textMatch, type Column } from '../components/DataTable';
 import { EnrollDrawer } from '../components/EnrollDrawer';
 import { GroupsDialog } from '../components/GroupsDialog';
-import { IconChevronDown, IconLinux, IconPlus, IconRefresh, IconTable, IconWindows } from '../components/Icons';
+import { IconChevronDown, IconLinux, IconPlus, IconRefresh, IconTable, IconUpload, IconWindows } from '../components/Icons';
 import { Modal, PromptDialog, useConfirm } from '../components/Modal';
 import { PowerDialog } from '../components/PowerDialog';
 import { RunDialog } from '../components/RunDialog';
@@ -41,6 +41,7 @@ export function Devices() {
   const [params, setParams] = useSearchParams();
   const agents = useAsync(() => api.agents(), []);
   const groups = useAsync(() => api.groups(), []);
+  const orgs = useAsync(() => api.organizations(), []);
   useLiveReload(['agent_online', 'agent_offline', 'inventory', 'alert', 'patches', 'hello'], agents.reload, { debounceMs: 800 });
 
   // Metrics arrive per agent a few times a minute; patch the row in place
@@ -57,10 +58,26 @@ export function Devices() {
   const fOS = params.get('os') ?? '';
   const fOnline = params.get('online') ?? '';
   const fTag = params.get('tag') ?? '';
+  const fOrg = params.get('org') ?? '';
+  const fSite = params.get('site') ?? '';
+
+  const sites = useAsync(async () => {
+    if (!fOrg) return [];
+    return api.sites(fOrg);
+  }, [fOrg]);
+
   const setParam = (k: string, v: string) => {
     const next = new URLSearchParams(params);
     if (v) next.set(k, v);
     else next.delete(k);
+    setParams(next, { replace: true });
+  };
+
+  const setOrg = (orgId: string) => {
+    const next = new URLSearchParams(params);
+    if (orgId) next.set('org', orgId);
+    else next.delete('org');
+    next.delete('site');
     setParams(next, { replace: true });
   };
 
@@ -98,9 +115,11 @@ export function Devices() {
     if (fOS) list = list.filter((a) => a.os === fOS);
     if (fOnline) list = list.filter((a) => (fOnline === '1' ? a.online : !a.online));
     if (fTag) list = list.filter((a) => a.tags.includes(fTag));
-    if (dq) list = list.filter((a) => textMatch(dq, a.display_name, a.hostname, a.last_ip, a.platform, a.group_name, ...a.tags));
+    if (fOrg) list = list.filter((a) => a.org_id === fOrg);
+    if (fSite) list = list.filter((a) => a.site_id === fSite);
+    if (dq) list = list.filter((a) => textMatch(dq, a.display_name, a.hostname, a.last_ip, a.platform, a.group_name, a.org_name, a.site_name, ...a.tags));
     return list;
-  }, [agents.data, fGroup, fOS, fOnline, fTag, dq]);
+  }, [agents.data, fGroup, fOS, fOnline, fTag, fOrg, fSite, dq]);
 
   // drop selections that are no longer in the list (deleted devices)
   useEffect(() => {
@@ -113,7 +132,7 @@ export function Devices() {
   }, [agents.data]);
 
   const selectedAgents = useMemo(() => (agents.data ?? []).filter((a) => selected.has(a.id)), [agents.data, selected]);
-  const filtersActive = !!(q || fGroup || fOS || fOnline || fTag);
+  const filtersActive = !!(q || fGroup || fOS || fOnline || fTag || fOrg || fSite);
 
   /**
    * Every bulk verb is the per-device endpoint applied to the selection, with
@@ -190,6 +209,19 @@ export function Devices() {
     await bulkApply(`${power} sent`, (a) => api.power(a.id, power, delay, message), { onlineOnly: true, reload: false });
   };
 
+  const bulkIsolate = async (isolate: boolean) => {
+    const ok = await confirm({
+      title: isolate ? `Isolate ${selectedAgents.length} device(s)` : `Release ${selectedAgents.length} device(s)`,
+      message: isolate
+        ? 'Cut off all inbound and outbound LAN and Internet communication to contain threats? Devices will only remain connected to this RMM server.'
+        : 'Restore normal network communication and clear isolation firewall rules for selected devices?',
+      danger: isolate,
+      confirmLabel: isolate ? 'Isolate devices' : 'Release devices',
+    });
+    if (!ok) return;
+    await bulkApply(isolate ? 'Isolated from network' : 'Released from isolation', (a) => api.isolateAgent(a.id, isolate));
+  };
+
   const columns: Column<Agent>[] = [
     {
       key: 'status',
@@ -210,6 +242,11 @@ export function Devices() {
             {a.display_name}
           </Link>
           {a.display_name !== a.hostname && <span className="muted small"> {a.hostname}</span>}
+          {a.isolated && (
+            <span style={{ marginLeft: 6 }}>
+              <Chip tone="danger">isolated</Chip>
+            </span>
+          )}
           {a.pending_reboot && (
             <span style={{ marginLeft: 6 }}>
               <Chip tone="warn">reboot</Chip>
@@ -239,6 +276,19 @@ export function Devices() {
     },
     { key: 'ip', header: 'IP', sort: (a) => a.last_ip, render: (a) => <span className="mono">{a.last_ip || '—'}</span> },
     { key: 'group', header: 'Group', sort: (a) => a.group_name ?? '', render: (a) => a.group_name || <span className="faint">—</span> },
+    {
+      key: 'org_site',
+      header: 'Client / Site',
+      sort: (a) => `${a.org_name ?? ''} ${a.site_name ?? ''}`,
+      csv: (a) => `${a.org_name || 'Default Organization'} / ${a.site_name || 'Main Site'}`,
+      render: (a) => (
+        <span className="truncate" style={{ maxWidth: 160 }} title={`${a.org_name || 'Default Organization'} · ${a.site_name || 'Main Site'}`}>
+          <span style={{ fontWeight: 500 }}>{a.org_name || 'Default Organization'}</span>
+          <br />
+          <span className="muted small">{a.site_name || 'Main Site'}</span>
+        </span>
+      ),
+    },
     {
       key: 'tags',
       header: 'Tags',
@@ -342,9 +392,33 @@ export function Devices() {
           </button>
         </Dropdown>
         {canWrite && (
-          <Button variant="primary" onClick={() => setEnroll(true)}>
-            <IconPlus /> Enroll device
-          </Button>
+          <>
+            <Button
+              onClick={async () => {
+                if (
+                  !(await confirm({
+                    title: 'Update All Online Agents',
+                    message:
+                      'Broadcast an update command to all currently online agents? Agents will download the latest matching binary from the server, install it in-place, and restart.',
+                    confirmLabel: 'Broadcast Update',
+                  }))
+                )
+                  return;
+                try {
+                  const res = await api.updateAllAgents();
+                  toast.info(res.message);
+                } catch (err) {
+                  toast.error(errMsg(err));
+                }
+              }}
+              title="Broadcast update command to all online agents"
+            >
+              <IconUpload /> Update Agents
+            </Button>
+            <Button variant="primary" onClick={() => setEnroll(true)}>
+              <IconPlus /> Enroll device
+            </Button>
+          </>
         )}
       </div>
       {agents.error && <ErrorBox error={agents.error} onRetry={agents.reload} />}
@@ -360,6 +434,24 @@ export function Devices() {
           <option value="windows">Windows</option>
           <option value="linux">Linux</option>
         </select>
+        <select value={fOrg} onChange={(e) => setOrg(e.target.value)} style={{ width: 170 }} aria-label="Organization filter">
+          <option value="">All Organizations</option>
+          {(orgs.data ?? []).map((o) => (
+            <option key={o.id} value={o.id}>
+              {o.name}
+            </option>
+          ))}
+        </select>
+        {fOrg && (
+          <select value={fSite} onChange={(e) => setParam('site', e.target.value)} style={{ width: 150 }} aria-label="Site filter">
+            <option value="">All Sites</option>
+            {(sites.data ?? []).map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.name}
+              </option>
+            ))}
+          </select>
+        )}
         <select value={fGroup} onChange={(e) => setParam('group', e.target.value)} style={{ width: 160 }} aria-label="Group filter">
           <option value="">Any group</option>
           <option value="none">No group</option>
@@ -377,7 +469,7 @@ export function Devices() {
             </option>
           ))}
         </select>
-        {(q || fGroup || fOS || fOnline || fTag) && (
+        {filtersActive && (
           <Button variant="ghost" size="sm" onClick={() => setParams({}, { replace: true })}>
             Clear filters
           </Button>
@@ -408,6 +500,9 @@ export function Devices() {
               <button onClick={() => setBulkEdit(true)}>Set group / tags…</button>
               <button onClick={() => bulkMaintenance(4)}>Maintenance for 4 hours</button>
               <button onClick={() => bulkMaintenance(0)}>Clear maintenance</button>
+              <hr />
+              <button onClick={() => bulkIsolate(true)}>Isolate from network…</button>
+              <button onClick={() => bulkIsolate(false)}>Release from isolation</button>
               <hr />
               <button className="danger" onClick={bulkDelete}>
                 Delete devices…

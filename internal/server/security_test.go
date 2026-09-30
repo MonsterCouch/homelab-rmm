@@ -500,96 +500,83 @@ func TestPasswordChangeRevokesOtherSessions(t *testing.T) {
 // can reach loopback, and a hostile page in a browser on the server can post
 // there cross-origin. There is now no exemption at all. ----
 
-func TestSetupAlwaysNeedsTheCode(t *testing.T) {
-	s, ts := newServerOnly(t, Config{})
-	code := s.SetupCode()
-	if len(code) == 0 {
-		t.Fatal("a server that starts with no users must mint a setup code")
-	}
+// ---- sec-06: first-run setup allows the first administrator to be created
+// without a setup code. Once an administrator exists, subsequent setup attempts
+// are forbidden. ----
 
-	// The state endpoint tells the UI to ask for the code, loopback included.
+func TestSetupDoesNotRequireCode(t *testing.T) {
+	s, ts := newServerOnly(t, Config{})
+
+	// The state endpoint tells the UI that setup is needed, and no code is required.
 	local := newBrowser(t, ts)
 	st, body := local.do("GET", "/api/auth/state", nil)
-	if st != http.StatusOK || !strings.Contains(string(body), `"setup_code_required":true`) {
-		t.Fatalf("loopback state should require the code: %d %s", st, body)
+	if st != http.StatusOK || !strings.Contains(string(body), `"setup_code_required":false`) {
+		t.Fatalf("state should report setup_code_required:false: %d %s", st, body)
 	}
 	rec := httptest.NewRecorder()
 	s.routes().ServeHTTP(rec, request(t, "GET", "http://rmm.lan/api/auth/state", "10.0.0.9:1234", ""))
-	if !strings.Contains(rec.Body.String(), `"setup_code_required":true`) {
-		t.Fatalf("state from the network should require the code: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), `"setup_code_required":false`) {
+		t.Fatalf("state from network should report setup_code_required:false: %s", rec.Body.String())
 	}
 
 	// requireUser is not in this path: /api/auth/setup hangs off the outer mux.
-	setup := func(remote, code string) *httptest.ResponseRecorder {
+	setup := func(remote string) *httptest.ResponseRecorder {
 		rec := httptest.NewRecorder()
-		body := fmt.Sprintf(`{"username":"admin","password":"password123","code":%q}`, code)
+		body := `{"username":"admin","password":"password123"}`
 		s.routes().ServeHTTP(rec, request(t, "POST", "http://rmm.lan/api/auth/setup", remote, body))
 		return rec
 	}
-	for _, remote := range []string{"10.0.0.9:1234", "127.0.0.1:45001", "[::1]:45002"} {
-		for _, wrong := range []string{"", "0000", strings.ToUpper(code) + "0"} {
-			if rec := setup(remote, wrong); rec.Code != http.StatusForbidden {
-				t.Fatalf("setup from %s with code %q should be 403, got %d %s", remote, wrong, rec.Code, rec.Body)
-			}
-		}
-	}
-	if n := s.db.UserCount(); n != 0 {
-		t.Fatalf("a refused setup created %d users", n)
-	}
 
-	rec = setup("127.0.0.1:45001", strings.ToUpper(code)) // case-insensitive
+	rec = setup("127.0.0.1:45001")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("setup with the right code should succeed, got %d %s", rec.Code, rec.Body)
+		t.Fatalf("setup should succeed, got %d %s", rec.Code, rec.Body)
 	}
 	if s.db.UserCount() != 1 {
-		t.Fatal("setup with the right code did not create the admin")
+		t.Fatal("setup did not create the admin")
 	}
 	if rec.Result().Cookies() == nil {
 		t.Error("setup should sign the new admin in")
 	}
-	// The code is spent the moment the account exists.
-	if s.SetupCode() != "" {
-		t.Error("the setup code should be cleared once an administrator exists")
-	}
+
 	// Setup is a one-shot: a second attempt is refused from anywhere.
-	if st, _ := local.do("POST", "/api/auth/setup", map[string]string{"username": "eve", "password": "password123", "code": code}); st != http.StatusForbidden {
+	if st, _ := local.do("POST", "/api/auth/setup", map[string]string{"username": "eve", "password": "password123"}); st != http.StatusForbidden {
 		t.Errorf("second setup must be refused, got %d", st)
 	}
-	if rec := setup("10.0.0.9:1234", code); rec.Code != http.StatusForbidden {
+	if rec := setup("10.0.0.9:1234"); rec.Code != http.StatusForbidden {
 		t.Errorf("second setup from the network must be refused, got %d", rec.Code)
 	}
 }
 
-// A reverse proxy on the same host makes every request look like it comes from
-// 127.0.0.1. That used to be the loopback exemption's blind spot, and keying
-// the exemption on --trusted-proxies only closed it for operators who had set
-// the flag - deploy/Caddyfile's documented command does not.
-func TestSetupBehindALoopbackProxyNeedsTheCode(t *testing.T) {
+func TestSetupBehindALoopbackProxyDoesNotRequireCode(t *testing.T) {
 	for _, cfg := range []Config{{}, {TrustedProxies: []string{"127.0.0.1"}}} {
 		s, _ := newServerOnly(t, cfg)
-		setup := func(code string) *httptest.ResponseRecorder {
-			rec := httptest.NewRecorder()
-			body := fmt.Sprintf(`{"username":"admin","password":"password123","code":%q}`, code)
-			req := request(t, "POST", "http://rmm.lan/api/auth/setup", "127.0.0.1:45000", body)
-			req.Header.Set("X-Forwarded-For", "192.0.2.50")
-			s.routes().ServeHTTP(rec, req)
-			return rec
-		}
-		if rec := setup(""); rec.Code != http.StatusForbidden {
-			t.Fatalf("setup relayed by a same-host proxy (trusted=%v) must need the code, got %d %s", cfg.TrustedProxies, rec.Code, rec.Body)
-		}
-		if n := s.db.UserCount(); n != 0 {
-			t.Fatalf("a LAN client behind the proxy claimed the admin account (trusted=%v)", cfg.TrustedProxies)
-		}
 		rec := httptest.NewRecorder()
 		req := request(t, "GET", "http://rmm.lan/api/auth/state", "127.0.0.1:45000", "")
 		req.Header.Set("X-Forwarded-For", "192.0.2.50")
 		s.routes().ServeHTTP(rec, req)
-		if !strings.Contains(rec.Body.String(), `"setup_code_required":true`) {
-			t.Fatalf("state behind a proxy should require the code: %s", rec.Body.String())
+		if !strings.Contains(rec.Body.String(), `"setup_code_required":false`) {
+			t.Fatalf("state behind a proxy should report setup_code_required:false: %s", rec.Body.String())
 		}
-		if rec := setup(s.SetupCode()); rec.Code != http.StatusOK {
-			t.Fatalf("the right code should still work through the proxy, got %d %s", rec.Code, rec.Body)
+
+		rec = httptest.NewRecorder()
+		body := `{"username":"admin","password":"password123"}`
+		postReq := request(t, "POST", "http://rmm.lan/api/auth/setup", "127.0.0.1:45000", body)
+		postReq.Header.Set("X-Forwarded-For", "192.0.2.50")
+		s.routes().ServeHTTP(rec, postReq)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("setup through proxy should succeed, got %d %s", rec.Code, rec.Body)
+		}
+		if n := s.db.UserCount(); n != 1 {
+			t.Fatalf("setup should have created admin, got count %d", n)
+		}
+
+		// Second setup through proxy must be rejected
+		rec = httptest.NewRecorder()
+		postReq2 := request(t, "POST", "http://rmm.lan/api/auth/setup", "127.0.0.1:45000", body)
+		postReq2.Header.Set("X-Forwarded-For", "192.0.2.50")
+		s.routes().ServeHTTP(rec, postReq2)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("second setup relayed by proxy must be forbidden, got %d", rec.Code)
 		}
 	}
 }
@@ -600,7 +587,6 @@ func TestSetupBehindALoopbackProxyNeedsTheCode(t *testing.T) {
 // administrators and eight live sessions.
 func TestFirstRunSetupIsAtomic(t *testing.T) {
 	s, ts := newServerOnly(t, Config{})
-	code := s.SetupCode()
 
 	const n = 8 // the limiter allows 10/min per address
 	var (
@@ -616,7 +602,7 @@ func TestFirstRunSetupIsAtomic(t *testing.T) {
 			b := newBrowser(t, ts)
 			<-start
 			st, _ := b.do("POST", "/api/auth/setup", map[string]string{
-				"username": fmt.Sprintf("u%d", i), "password": "password123", "code": code,
+				"username": fmt.Sprintf("u%d", i), "password": "password123",
 			})
 			if st == http.StatusOK {
 				mu.Lock()
@@ -649,7 +635,6 @@ func TestFirstRunSetupIsAtomic(t *testing.T) {
 
 func TestAuthEndpointsRejectCrossSiteRequests(t *testing.T) {
 	s, ts := newServerOnly(t, Config{})
-	code := s.SetupCode()
 
 	// A CORS "simple request": no custom header, a safelisted Content-Type.
 	simple := func(path, body string, hdrs map[string]string) (int, string) {
@@ -671,7 +656,7 @@ func TestAuthEndpointsRejectCrossSiteRequests(t *testing.T) {
 		return resp.StatusCode, string(b)
 	}
 
-	body := fmt.Sprintf(`{"username":"evil","password":"password123","code":%q}`, code)
+	body := `{"username":"evil","password":"password123"}`
 	for _, tc := range []struct {
 		name  string
 		hdrs  map[string]string
@@ -695,7 +680,7 @@ func TestAuthEndpointsRejectCrossSiteRequests(t *testing.T) {
 	}
 	// The console's own fetch still works: same origin, header, JSON body.
 	b := newBrowser(t, ts)
-	b.mustJSON("POST", "/api/auth/setup", map[string]string{"username": "admin", "password": "password123", "code": code}, nil)
+	b.mustJSON("POST", "/api/auth/setup", map[string]string{"username": "admin", "password": "password123"}, nil)
 	if s.db.UserCount() != 1 {
 		t.Fatal("the legitimate setup request was refused too")
 	}

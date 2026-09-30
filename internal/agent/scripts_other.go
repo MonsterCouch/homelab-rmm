@@ -41,3 +41,6 @@ func pythonScriptExe() (string, error) {
 func cmdScriptCommand(context.Context, string, []string) (*exec.Cmd, error) {
 	return nil, errors.New("cmd scripts only run on Windows")
 }
+
+// withScriptEnv is a no-op on non-Windows platforms.
+func withScriptEnv(env []string) []string { return env }

@@ -72,6 +72,8 @@ func Serve(ctx context.Context, serverURL, token, fingerprint string, quality in
 		return perr
 	}
 	defer inj.close()
+	hideBanner := showBanner()
+	defer hideBanner()
 	slog.Info("desktop helper connected", "server", serverURL, "quality", quality)
 	s := newSession(ws, cap, inj, quality)
 	err = s.run(ctx)

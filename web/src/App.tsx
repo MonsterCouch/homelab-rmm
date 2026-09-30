@@ -1,5 +1,5 @@
 import { lazy, Suspense, type ReactNode } from 'react';
-import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
+import { Link, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { Layout } from './components/Layout';
 import { Loading } from './components/ui';
 import { useAuth } from './state/auth';
@@ -19,8 +19,14 @@ import { Alerts } from './pages/Alerts';
 import { Patches } from './pages/Patches';
 import { Settings } from './pages/Settings';
 import { Users } from './pages/Users';
+import { Organizations } from './pages/Organizations';
+import { SoftwareCatalog } from './pages/SoftwareCatalog';
+import { Discovery } from './pages/Discovery';
+import { Tickets } from './pages/Tickets';
+import { TicketDetail } from './pages/TicketDetail';
 import { Audit } from './pages/Audit';
 import { Account } from './pages/Account';
+import { ClientPortal } from './pages/portal/ClientPortal';
 
 // The device detail pulls in xterm and the desktop viewer; keep it off the
 // initial bundle.
@@ -32,6 +38,21 @@ function Guard({ children }: { children: ReactNode }) {
   if (user === undefined) return <FullLoading />;
   if (needsSetup) return <Navigate to="/setup" replace />;
   if (!user) return <Navigate to="/login" replace state={{ from: loc.pathname + loc.search }} />;
+  // A client contact has the support portal and their own account page
+  // (password, two-step sign-in), never the console. The server refuses them
+  // everything else anyway; this keeps them from landing on empty pages.
+  if (user.role === 'poc') {
+    return loc.pathname === '/account' ? (
+      <div className="content" style={{ maxWidth: 720, margin: '0 auto', padding: 24 }}>
+        <p>
+          <Link to="/portal/tickets?tab=tickets">← Back to support tickets</Link>
+        </p>
+        <Account />
+      </div>
+    ) : (
+      <Navigate to="/portal/tickets?tab=tickets" replace />
+    );
+  }
   return <>{children}</>;
 }
 
@@ -55,6 +76,7 @@ export function App() {
     <Routes>
       <Route path="/setup" element={user === undefined ? <FullLoading /> : needsSetup ? <Setup /> : <Navigate to="/" replace />} />
       <Route path="/login" element={user === undefined ? <FullLoading /> : needsSetup ? <Navigate to="/setup" replace /> : user ? <Navigate to="/" replace /> : <Login />} />
+      <Route path="/portal/*" element={<ClientPortal />} />
       <Route
         path="/"
         element={
@@ -86,6 +108,18 @@ export function App() {
         <Route path="baselines/:id/edit" element={<BaselineEditor />} />
         <Route path="alerts" element={<Alerts />} />
         <Route path="patches" element={<Patches />} />
+        <Route path="software-catalog" element={<SoftwareCatalog />} />
+        <Route path="discovery" element={<Discovery />} />
+        <Route path="tickets" element={<Tickets />} />
+        <Route path="tickets/:id" element={<TicketDetail />} />
+        <Route
+          path="organizations"
+          element={
+            <AdminOnly>
+              <Organizations />
+            </AdminOnly>
+          }
+        />
         <Route
           path="settings"
           element={
@@ -102,7 +136,14 @@ export function App() {
             </AdminOnly>
           }
         />
-        <Route path="audit" element={<Audit />} />
+        <Route
+          path="audit"
+          element={
+            <AdminOnly>
+              <Audit />
+            </AdminOnly>
+          }
+        />
         <Route path="account" element={<Account />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

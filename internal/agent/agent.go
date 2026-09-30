@@ -8,16 +8,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"github.com/MonsterCouch/homelab-rmm/internal/netscan"
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
 )
 
@@ -72,6 +75,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	// evaluates the baselines it was last told about, and reports them when
 	// the socket comes back.
 	a.baselines.start(ctx)
+	a.startPortalPipe(ctx)
 	backoff := 2 * time.Second
 	for {
 		err := a.session(ctx)
@@ -221,6 +225,7 @@ func (a *Agent) config() protocol.AgentConfig {
 func (a *Agent) pushLoop(ctx context.Context) {
 	a.sendInventory()
 	a.sendMetrics()
+	go a.autoUpdateLoop(ctx)
 	for {
 		cfg := a.config()
 		mt := time.NewTicker(time.Duration(cfg.MetricsIntervalSec) * time.Second)
@@ -242,6 +247,80 @@ func (a *Agent) pushLoop(ctx context.Context) {
 		}
 		mt.Stop()
 		it.Stop()
+	}
+}
+
+type agentUpdateCheckResp struct {
+	UpdateAvailable bool   `json:"update_available"`
+	Version         string `json:"version"`
+	SHA256          string `json:"sha256"`
+	URL             string `json:"url"`
+}
+
+func (a *Agent) autoUpdateLoop(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(8 * time.Second):
+		a.checkAutoUpdate(ctx)
+	}
+
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.checkAutoUpdate(ctx)
+		}
+	}
+}
+
+func (a *Agent) checkAutoUpdate(ctx context.Context) {
+	if a.cfg == nil || a.cfg.ServerURL == "" || a.cfg.Key == "" {
+		return
+	}
+	curSHA := currentBinarySHA256()
+	checkURL := fmt.Sprintf("%s/api/agent/update-check?os=%s&arch=%s&version=%s&sha256=%s",
+		a.cfg.ServerURL, runtime.GOOS, runtime.GOARCH, Version, curSHA)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checkURL, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+a.cfg.Key)
+
+	client := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: TLSConfig(a.cfg.Fingerprint)},
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return
+	}
+
+	var res agentUpdateCheckResp
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return
+	}
+
+	if res.UpdateAvailable && res.URL != "" && res.SHA256 != "" {
+		slog.Info("agent auto-update: new binary available on server, updating...", "target_version", res.Version)
+		uReq := protocol.AgentUpdate{
+			URL:     res.URL,
+			SHA256:  res.SHA256,
+			Version: res.Version,
+		}
+		if err := selfUpdate(ctx, a.cfg, uReq); err != nil {
+			slog.Warn("agent auto-update failed", "err", err)
+		}
 	}
 }
 
@@ -341,6 +420,12 @@ func (a *Agent) handle(ctx context.Context, env protocol.Envelope) {
 		if err = json.Unmarshal(env.D, &in); err == nil {
 			res := a.runs.run(ctx, in, func(chunk protocol.ScriptChunk) { c.stream(env.ID, chunk) })
 			out = res
+			if in.Env != nil && (in.Env["RMM_TRIGGER"] == "client-portal" || strings.HasPrefix(in.Env["RMM_TRIGGER"], "software")) {
+				go func() {
+					time.Sleep(1 * time.Second)
+					a.sendInventory()
+				}()
+			}
 		}
 	case protocol.ReqProcList:
 		out, err = listProcesses()
@@ -437,6 +522,49 @@ func (a *Agent) handle(ctx context.Context, env protocol.Envelope) {
 		var in protocol.AgentUpdate
 		if err = json.Unmarshal(env.D, &in); err == nil {
 			err = selfUpdate(ctx, a.cfg, in)
+		}
+	case protocol.ReqDeviceIsolate:
+		var in protocol.DeviceIsolate
+		if err = json.Unmarshal(env.D, &in); err == nil {
+			out, err = a.handleIsolate(in)
+		}
+	case protocol.ReqNetworkScan:
+		var in protocol.NetworkScanReq
+		if err = json.Unmarshal(env.D, &in); err == nil {
+			var hosts []netscan.HostResult
+			hosts, err = netscan.ScanSubnet(ctx, in.Subnet, 32)
+			if err == nil {
+				protoHosts := make([]protocol.DiscoveredHost, 0, len(hosts))
+				for _, h := range hosts {
+					protoHosts = append(protoHosts, protocol.DiscoveredHost{
+						IP:            h.IP,
+						MAC:           h.MAC,
+						Hostname:      h.Hostname,
+						Vendor:        h.Vendor,
+						OS:            h.OS,
+						DeviceType:    h.DeviceType,
+						OpenPorts:     h.OpenPorts,
+						SNMPEnabled:   h.SNMPEnabled,
+						SNMPSysName:   h.SNMPSysName,
+						SNMPSysDescr:  h.SNMPSysDescr,
+						SNMPSysUpTime: h.SNMPSysUpTime,
+					})
+				}
+				out = protocol.NetworkScanResp{Hosts: protoHosts}
+			}
+		}
+	case protocol.ReqSNMPPoll:
+		var in protocol.SNMPPollReq
+		if err = json.Unmarshal(env.D, &in); err == nil {
+			var snmpRes *netscan.SNMPResult
+			snmpRes, err = netscan.QuerySNMP(in.IP, in.Community, 1500*time.Millisecond)
+			if err == nil && snmpRes != nil {
+				out = protocol.SNMPPollResp{
+					SysName:   snmpRes.SysName,
+					SysDescr:  snmpRes.SysDescr,
+					SysUpTime: snmpRes.SysUpTime,
+				}
+			}
 		}
 	default:
 		err = errors.New("unknown request " + env.T)

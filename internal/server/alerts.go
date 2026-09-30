@@ -72,6 +72,19 @@ func (d *DB) ListAlertRules() ([]AlertRule, error) {
 	return out, rows.Err()
 }
 
+func (d *DB) GetAlertRule(id int64) (*AlertRule, error) {
+	rules, err := d.ListAlertRules()
+	if err != nil {
+		return nil, err
+	}
+	for i := range rules {
+		if rules[i].ID == id {
+			return &rules[i], nil
+		}
+	}
+	return nil, errNotFound
+}
+
 func (d *DB) ListAlerts(status, agentID string, limit int64) ([]Alert, error) {
 	q := `SELECT al.id, al.rule_id, al.rule_kind, COALESCE(al.agent_id,''), COALESCE(NULLIF(a.display_name,''), a.hostname, ''), al.severity, al.title, al.message, al.status, al.opened_at, al.acked_at, al.acked_by, al.resolved_at
 		FROM alerts al LEFT JOIN agents a ON a.id = al.agent_id WHERE 1=1`

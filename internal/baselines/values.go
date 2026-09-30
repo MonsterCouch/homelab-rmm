@@ -468,3 +468,32 @@ func anyNumeric(f []string) bool {
 	}
 	return false
 }
+
+// CheckVersion reports whether got matches want under op (e.g. ">=", "==", "<=", "<", ">", "!=").
+// An empty op defaults to ">=".
+func CheckVersion(got, want, op string) (bool, error) {
+	if op == "" {
+		op = ">="
+	}
+	cmp, err := CompareVersions(got, want)
+	if err != nil {
+		return false, err
+	}
+	switch op {
+	case "==":
+		return cmp == 0, nil
+	case "!=":
+		return cmp != 0, nil
+	case ">=":
+		return cmp >= 0, nil
+	case "<=":
+		return cmp <= 0, nil
+	case ">":
+		return cmp > 0, nil
+	case "<":
+		return cmp < 0, nil
+	default:
+		return false, fmt.Errorf("unknown version operator %q", op)
+	}
+}
+

@@ -194,7 +194,13 @@ func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Username, Password, Role, Email string }
+	var in struct {
+		Username string   `json:"username"`
+		Password string   `json:"password"`
+		Role     string   `json:"role"`
+		Email    string   `json:"email"`
+		OrgScope []string `json:"org_scope"`
+	}
 	if err := readJSON(r, &in); err != nil {
 		fail(w, err)
 		return
@@ -202,30 +208,39 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	if in.Role == "" {
 		in.Role = RoleTech
 	}
-	id, err := s.db.CreateUser(in.Username, in.Password, in.Role, in.Email)
+	id, err := s.db.CreateUserWithScope(in.Username, in.Password, in.Role, in.Email, in.OrgScope)
 	if err != nil {
-		fail(w, err)
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.audit(r, "user.create", in.Username, map[string]string{"role": in.Role})
+	s.audit(r, "user.create", in.Username, map[string]any{"role": in.Role, "org_scope": in.OrgScope})
 	writeJSON(w, 201, map[string]any{"id": id})
 }
 
 func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	id, _ := pathInt(r, "id")
 	var in struct {
-		Role      string  `json:"role"`
-		Email     *string `json:"email"`
-		Password  string  `json:"password"`
-		ResetTOTP bool    `json:"reset_totp"`
+		Role      string    `json:"role"`
+		Email     *string   `json:"email"`
+		OrgScope  *[]string `json:"org_scope"`
+		Password  string    `json:"password"`
+		ResetTOTP bool      `json:"reset_totp"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		fail(w, err)
 		return
 	}
+	var curRole, curScope string
+	if err := s.db.QueryRow(`SELECT role, org_scope FROM users WHERE id = ?`, id).Scan(&curRole, &curScope); err != nil {
+		writeErr(w, http.StatusNotFound, "user not found")
+		return
+	}
+	// Check everything before writing anything, against the role and
+	// organizations the account will have once this lands.
+	role, scope := curRole, parseOrgScope(curScope)
 	me := userFrom(r.Context())
 	if in.Role != "" {
-		if in.Role != RoleAdmin && in.Role != RoleTech && in.Role != RoleViewer {
+		if !validRole(in.Role) {
 			writeErr(w, 400, "invalid role")
 			return
 		}
@@ -233,16 +248,31 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 400, "you cannot demote yourself")
 			return
 		}
+		role = in.Role
+	}
+	if in.OrgScope != nil {
+		scope = *in.OrgScope
+	}
+	if err := s.db.checkRoleScope(role, scope); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	if in.Password != "" && len(in.Password) < 8 {
+		writeErr(w, 400, "password must be at least 8 characters")
+		return
+	}
+
+	if in.Role != "" {
 		s.db.Exec(`UPDATE users SET role = ? WHERE id = ?`, in.Role, id)
 	}
 	if in.Email != nil {
 		s.db.Exec(`UPDATE users SET email = ? WHERE id = ?`, *in.Email, id)
 	}
+	if in.OrgScope != nil {
+		b, _ := json.Marshal(*in.OrgScope)
+		s.db.Exec(`UPDATE users SET org_scope = ? WHERE id = ?`, string(b), id)
+	}
 	if in.Password != "" {
-		if len(in.Password) < 8 {
-			writeErr(w, 400, "password must be at least 8 characters")
-			return
-		}
 		h, err := hashPassword(in.Password)
 		if err != nil {
 			fail(w, err)
@@ -254,7 +284,12 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	if in.ResetTOTP {
 		s.db.disableTOTP(id)
 	}
-	s.audit(r, "user.update", strconv.FormatInt(id, 10), map[string]any{"role": in.Role, "password_reset": in.Password != "", "reset_totp": in.ResetTOTP})
+	s.audit(r, "user.update", strconv.FormatInt(id, 10), map[string]any{
+		"role":           in.Role,
+		"org_scope":      in.OrgScope,
+		"password_reset": in.Password != "",
+		"reset_totp":     in.ResetTOTP,
+	})
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 

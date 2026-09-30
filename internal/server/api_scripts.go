@@ -89,10 +89,20 @@ func (s *Server) startRuns(r *http.Request, in runScriptInput, agentIDs []string
 		}
 		req.Script = sc
 	}
+	me := userFrom(r.Context())
 	out := map[string]string{}
 	for _, id := range agentIDs {
+		a, err := s.db.GetAgent(id)
+		if err != nil {
+			out[id] = "error: agent not found"
+			continue
+		}
+		if !s.canAccessAgent(me, a.OrgID) {
+			out[id] = "error: agent not found"
+			continue
+		}
 		if req.Script != nil && req.Script.OSFilter != "" {
-			if a, err := s.db.GetAgent(id); err == nil && a.OS != req.Script.OSFilter {
+			if a.OS != req.Script.OSFilter {
 				out[id] = "skipped: os mismatch"
 				continue
 			}
@@ -139,12 +149,15 @@ func (s *Server) handleRunScript(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRunScriptOnAgent(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.getScopedAgent(w, r, id); !ok {
+		return
+	}
 	var in runScriptInput
 	if err := readJSON(r, &in); err != nil {
 		fail(w, err)
 		return
 	}
-	id := r.PathValue("id")
 	out, err := s.startRuns(r, in, []string{id})
 	if err != nil {
 		fail(w, err)
@@ -169,10 +182,26 @@ func (s *Server) handleRunScriptOnAgent(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
-	runs, err := s.db.ListRuns(r.URL.Query().Get("agent"), queryInt(r, "limit", 100))
+	targetAgent := r.URL.Query().Get("agent")
+	if targetAgent != "" {
+		if _, ok := s.getScopedAgent(w, r, targetAgent); !ok {
+			return
+		}
+	}
+	runs, err := s.db.ListRuns(targetAgent, queryInt(r, "limit", 100))
 	if err != nil {
 		fail(w, err)
 		return
+	}
+	me := userFrom(r.Context())
+	if me != nil && !me.IsAdmin() && len(me.OrgScope) > 0 {
+		filtered := make([]Run, 0, len(runs))
+		for _, rn := range runs {
+			if a, err := s.db.GetAgent(rn.AgentID); err == nil && s.canAccessAgent(me, a.OrgID) {
+				filtered = append(filtered, rn)
+			}
+		}
+		runs = filtered
 	}
 	writeJSON(w, 200, runs)
 }
@@ -183,6 +212,12 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	if a, err := s.db.GetAgent(run.AgentID); err == nil {
+		if !s.canAccessAgent(userFrom(r.Context()), a.OrgID) {
+			writeErr(w, http.StatusNotFound, "run not found")
+			return
+		}
+	}
 	if so, se, ok := s.runs.Live(run.ID); ok {
 		run.Stdout, run.Stderr = so, se
 	}
@@ -190,11 +225,22 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
-	if err := s.runs.Cancel(r.PathValue("id")); err != nil {
+	run, err := s.db.GetRun(r.PathValue("id"))
+	if err != nil {
 		fail(w, err)
 		return
 	}
-	s.audit(r, "run.cancel", r.PathValue("id"), nil)
+	if a, err := s.db.GetAgent(run.AgentID); err == nil {
+		if !s.canAccessAgent(userFrom(r.Context()), a.OrgID) {
+			writeErr(w, http.StatusNotFound, "run not found")
+			return
+		}
+	}
+	if err := s.runs.Cancel(run.ID); err != nil {
+		fail(w, err)
+		return
+	}
+	s.audit(r, "run.cancel", run.ID, nil)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -266,6 +312,18 @@ func (s *Server) saveTask(w http.ResponseWriter, r *http.Request, id int64) {
 		fail(w, err)
 		return
 	}
+	me := userFrom(r.Context())
+	if id != 0 {
+		existing, err := s.db.GetTask(id)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		if !s.canAccessTargets(me, existing.Targets) {
+			writeErr(w, http.StatusForbidden, "access denied: task outside organization scope")
+			return
+		}
+	}
 	if strings.TrimSpace(t.Name) == "" {
 		writeErr(w, 400, "name required")
 		return
@@ -296,6 +354,10 @@ func (s *Server) saveTask(w http.ResponseWriter, r *http.Request, id int64) {
 	if t.TimeoutSec <= 0 {
 		t.TimeoutSec = 300
 	}
+	if err := s.validateTargetsScope(me, t.Targets); err != nil {
+		writeErr(w, http.StatusForbidden, err.Error())
+		return
+	}
 	tsNow := now()
 	var err error
 	if id == 0 {
@@ -325,6 +387,16 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	me := userFrom(r.Context())
+	if me != nil && !me.IsAdmin() && len(me.OrgScope) > 0 {
+		filtered := make([]Task, 0, len(t))
+		for _, item := range t {
+			if s.canAccessTargets(me, item.Targets) {
+				filtered = append(filtered, item)
+			}
+		}
+		t = filtered
+	}
 	writeJSON(w, 200, t)
 }
 
@@ -341,6 +413,16 @@ func (s *Server) handleUpdateTask(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 	id, _ := pathInt(r, "id")
+	t, err := s.db.GetTask(id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	me := userFrom(r.Context())
+	if !s.canAccessTargets(me, t.Targets) {
+		writeErr(w, http.StatusForbidden, "access denied: task outside organization scope")
+		return
+	}
 	s.db.Exec(`DELETE FROM tasks WHERE id = ?`, id)
 	s.sched.reload()
 	s.audit(r, "task.delete", strconv.FormatInt(id, 10), nil)
@@ -352,6 +434,11 @@ func (s *Server) handleRunTask(w http.ResponseWriter, r *http.Request) {
 	t, err := s.db.GetTask(id)
 	if err != nil {
 		fail(w, err)
+		return
+	}
+	me := userFrom(r.Context())
+	if !s.canAccessTargets(me, t.Targets) {
+		writeErr(w, http.StatusForbidden, "access denied: task outside organization scope")
 		return
 	}
 	n := s.sched.runTask(t, actor(r))
