@@ -530,12 +530,29 @@ func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 	s.audit(r, "desktop.open", agentID, nil)
 
 	quality := int(queryInt(r, "quality", 60))
+	// The viewer asks for WebRTC with ?webrtc=1 and the backstage
+	// (administrative, hidden-from-user) desktop with ?mode=backstage. Both
+	// default off, so an old viewer keeps the plain tile stream on the
+	// console desktop.
+	enableWebRTC := r.URL.Query().Get("webrtc") == "1" || r.URL.Query().Get("webrtc") == "true"
+	mode := protocol.DesktopModeConsole
+	if r.URL.Query().Get("mode") == string(protocol.DesktopModeBackstage) {
+		mode = protocol.DesktopModeBackstage
+	}
+	// Hand the viewer its ICE servers up front: webrtc.ts waits for this
+	// before building its offer. Sent before the helper is even launched so
+	// the browser can set up its RTCPeerConnection in parallel with the
+	// device spawning its helper. Harmless to a non-WebRTC viewer, which
+	// ignores unknown message types, but only sent when WebRTC was asked for.
+	if enableWebRTC {
+		vw.json(map[string]any{"t": "webrtc_config", "ice_servers": s.cfg.iceServersJSON()})
+	}
 	startErr := make(chan error, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		var res protocol.DesktopStartResult
-		err := s.hub.Request(ctx, agentID, protocol.ReqDesktopStart, protocol.DesktopStart{Token: token, Quality: quality}, &res)
+		err := s.hub.Request(ctx, agentID, protocol.ReqDesktopStart, protocol.DesktopStart{Token: token, Quality: quality, Mode: mode, EnableWebRTC: enableWebRTC}, &res)
 		if err != nil {
 			vw.json(map[string]string{"t": "error", "message": err.Error()})
 			startErr <- err

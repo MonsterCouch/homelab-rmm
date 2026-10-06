@@ -20,11 +20,47 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// Config carries everything the helper needs for one session. It is built by
+// the server's desktop.start RPC on the agent side and passed to Launch; the
+// launcher forwards the non-secret fields to the helper on its command line
+// (helperArgs) and the token in the environment (TokenEnv).
+type Config struct {
+	ServerURL   string
+	Token       string
+	Fingerprint string
+	Quality     int
+	// Mode is "console" (the interactive user's screen, the default) or
+	// "backstage" (an isolated administrative desktop the user never sees).
+	Mode string
+	// WebRTC is set when the viewer offered a WebRTC transport: the helper
+	// negotiates a peer connection for low-latency video and input while the
+	// JPEG tile stream stays up as the fast-start and firewall fallback.
+	WebRTC bool
+}
+
+// modeOrDefault maps an empty or unknown mode to console.
+func modeOrDefault(mode string) string {
+	if mode == string(modeBackstage) {
+		return string(modeBackstage)
+	}
+	return string(modeConsole)
+}
+
+// Desktop modes, kept as a package-local type so this package need not import
+// internal/protocol (the agent translates protocol.DesktopMode to these).
+type desktopMode string
+
+const (
+	modeConsole   desktopMode = "console"
+	modeBackstage desktopMode = "backstage"
+)
+
 // Serve runs inside the helper process (or in-process when the agent already
-// runs in the user's session). It connects to serverURL's
+// runs in the user's session). It connects to cfg.ServerURL's
 // /ws/desktop-agent?token=<token> endpoint, pinning the certificate by
 // fingerprint, and streams until the socket closes or ctx ends.
-func Serve(ctx context.Context, serverURL, token, fingerprint string, quality int) error {
+func Serve(ctx context.Context, cfg Config) error {
+	serverURL, token, fingerprint, quality := cfg.ServerURL, cfg.Token, cfg.Fingerprint, cfg.Quality
 	if serverURL == "" || token == "" {
 		return errors.New("desktop helper needs --server and --token")
 	}
@@ -43,10 +79,20 @@ func Serve(ctx context.Context, serverURL, token, fingerprint string, quality in
 		inj  injector
 		perr error
 	)
+	backstage := modeOrDefault(cfg.Mode) == string(modeBackstage)
 	if perr = platformInit(); perr == nil {
-		if inj, perr = newInjector(); perr == nil {
-			cap = screenCapturer{}
+		if backstage {
+			// An isolated administrative desktop the logged-in user never
+			// sees. Its capturer composites the virtual desktop's windows
+			// off-screen and its injector posts messages to them, so the
+			// physical screen and cursor are never touched.
+			cap, inj, perr = newBackstage()
+		} else if inj, perr = newInjector(); perr == nil {
+			cap = newCapturer()
 			if _, perr = cap.monitors(); perr != nil {
+				if c, ok := cap.(interface{ Close() error }); ok {
+					c.Close()
+				}
 				inj.close()
 				inj = nil
 			}
@@ -72,10 +118,15 @@ func Serve(ctx context.Context, serverURL, token, fingerprint string, quality in
 		return perr
 	}
 	defer inj.close()
+	if c, ok := cap.(interface{ Close() error }); ok {
+		defer c.Close()
+	}
 	hideBanner := showBanner()
 	defer hideBanner()
-	slog.Info("desktop helper connected", "server", serverURL, "quality", quality)
+	slog.Info("desktop helper connected", "server", serverURL, "quality", quality, "mode", modeOrDefault(cfg.Mode), "webrtc", cfg.WebRTC)
 	s := newSession(ws, cap, inj, quality)
+	s.webrtcOffered = cfg.WebRTC
+	s.noFollow = backstage
 	err = s.run(ctx)
 	slog.Info("desktop helper finished", "err", err)
 	return err
@@ -86,17 +137,18 @@ func Serve(ctx context.Context, serverURL, token, fingerprint string, quality in
 // It returns a note for the operator ("attached to console session of user
 // X", "no user logged in, showing the logon screen") and an error when no
 // interactive session can be reached.
-func Launch(exe, serverURL, token, fingerprint string, quality int) (note string, err error) {
+func Launch(exe string, cfg Config) (note string, err error) {
 	if exe == "" {
 		return "", errors.New("agent executable path is empty")
 	}
-	if serverURL == "" || token == "" {
+	if cfg.ServerURL == "" || cfg.Token == "" {
 		return "", errors.New("desktop start needs a server URL and a token")
 	}
-	if quality < minQuality || quality > maxQuality {
-		quality = 60
+	if cfg.Quality < minQuality || cfg.Quality > maxQuality {
+		cfg.Quality = 60
 	}
-	return launch(exe, serverURL, token, fingerprint, quality)
+	cfg.Mode = modeOrDefault(cfg.Mode)
+	return launch(exe, cfg)
 }
 
 // TokenEnv carries the one-time bridge token to the helper. It is never a
@@ -134,15 +186,22 @@ func envWithToken(entries []string, token string) []string {
 // helperArgs is the command line every launcher builds; keeping it in one
 // place means main.go's flag set and the launchers cannot drift apart. The
 // token is passed in the environment (TokenEnv), not here.
-func helperArgs(serverURL, fingerprint string, quality int) []string {
-	return []string{"desktop-helper", "--server", serverURL, "--fingerprint", fingerprint, "--quality", fmt.Sprint(quality)}
+func helperArgs(cfg Config) []string {
+	args := []string{"desktop-helper", "--server", cfg.ServerURL, "--fingerprint", cfg.Fingerprint, "--quality", fmt.Sprint(cfg.Quality)}
+	if m := modeOrDefault(cfg.Mode); m != string(modeConsole) {
+		args = append(args, "--mode", m)
+	}
+	if cfg.WebRTC {
+		args = append(args, "--webrtc")
+	}
+	return args
 }
 
 // serveInProcess is the developer-mode path: the agent itself has a
 // display, so the helper runs as a goroutine of this process.
-func serveInProcess(serverURL, token, fingerprint string, quality int) {
+func serveInProcess(cfg Config) {
 	go func() {
-		if err := Serve(context.Background(), serverURL, token, fingerprint, quality); err != nil {
+		if err := Serve(context.Background(), cfg); err != nil {
 			slog.Error("in-process desktop helper ended", "err", err)
 		}
 	}()

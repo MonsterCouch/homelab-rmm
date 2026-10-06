@@ -2,6 +2,6 @@
 
 package desktop
 
-func launch(exe, serverURL, token, fingerprint string, quality int) (string, error) {
+func launch(exe string, cfg Config) (string, error) {
 	return "", errUnsupported
 }

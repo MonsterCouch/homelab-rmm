@@ -12,9 +12,24 @@ func (a *Agent) startDesktop(req protocol.DesktopStart) (*protocol.DesktopStartR
 	if err != nil {
 		return nil, err
 	}
-	note, err := desktop.Launch(exe, a.cfg.ServerURL, req.Token, a.cfg.Fingerprint, req.Quality)
+	note, err := desktop.Launch(exe, desktop.Config{
+		ServerURL:   a.cfg.ServerURL,
+		Token:       req.Token,
+		Fingerprint: a.cfg.Fingerprint,
+		Quality:     req.Quality,
+		Mode:        string(req.Mode),
+		WebRTC:      req.EnableWebRTC,
+	})
 	if err != nil {
 		return nil, err
 	}
-	return &protocol.DesktopStartResult{Started: true, Note: note}, nil
+	mode := req.Mode
+	if mode == "" {
+		mode = protocol.DesktopModeConsole
+	}
+	// WebRTCAvail reports whether this build can negotiate WebRTC at all. The
+	// Pion stack is pure Go and compiled into every platform, so availability
+	// tracks what the viewer asked for; the helper still falls back to tiles
+	// if ICE cannot connect.
+	return &protocol.DesktopStartResult{Started: true, Note: note, Mode: mode, WebRTCAvail: req.EnableWebRTC}, nil
 }

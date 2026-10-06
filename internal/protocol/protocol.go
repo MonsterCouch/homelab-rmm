@@ -406,17 +406,39 @@ type Power struct {
 
 // ---- Desktop ----
 
+// DesktopMode defines the operational target desktop.
+type DesktopMode string
+
+const (
+	DesktopModeConsole   DesktopMode = "console"   // Interactive user screen (winsta0\default)
+	DesktopModeBackstage DesktopMode = "backstage" // Isolated administrative desktop (winsta0\HomelabRMM_Backstage)
+)
+
 // DesktopStart asks the agent to spawn its desktop helper in the interactive
 // session. The helper connects back to the server on its own WebSocket using
 // Token, and the server bridges it to the operator's browser.
 type DesktopStart struct {
-	Token   string `json:"token"`
-	Quality int    `json:"quality"` // JPEG quality 1-100
+	Token        string      `json:"token"`
+	Quality      int         `json:"quality"`                 // JPEG quality 1-100
+	Mode         DesktopMode `json:"mode,omitempty"`          // console (default) or backstage
+	EnableWebRTC bool        `json:"enable_webrtc,omitempty"` // true if viewer supports WebRTC
 }
 
 type DesktopStartResult struct {
-	Started bool   `json:"started"`
-	Note    string `json:"note,omitempty"`
+	Started     bool        `json:"started"`
+	Note        string      `json:"note,omitempty"`
+	Mode        DesktopMode `json:"mode,omitempty"`
+	WebRTCAvail bool        `json:"webrtc_avail,omitempty"`
+}
+
+// WebRTCSignalingMessage encapsulates JSON signaling messages exchanged between
+// the browser viewer and the agent desktop helper via the server WebSocket bridge.
+type WebRTCSignalingMessage struct {
+	Type       string          `json:"t"`                  // "webrtc_offer", "webrtc_answer", "webrtc_candidate", "webrtc_config", "webrtc_active", "fallback_tiles"
+	SDP        string          `json:"sdp,omitempty"`       // For offer and answer
+	Candidate  json.RawMessage `json:"candidate,omitempty"` // For trickle ICE candidate
+	Reason     string          `json:"reason,omitempty"`    // For fallback notification
+	ICEServers json.RawMessage `json:"ice_servers,omitempty"` // For webrtc_config
 }
 
 // ---- Device Isolation ----

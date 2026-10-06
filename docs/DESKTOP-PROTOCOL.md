@@ -55,6 +55,64 @@ scales from its canvas size to `screen.w`/`screen.h`).
 | `{"t":"ack","frame":123}` | flow control acknowledgement. |
 | `{"t":"ctrlaltdel"}` | best effort Secure Attention Sequence (Windows: `SendSAS`, needs the *SoftwareSASGeneration* policy; otherwise ignored). |
 
+## Connection query parameters
+
+The viewer opens `wss://server/ws/desktop/{agentId}` with:
+
+| param | meaning |
+|---|---|
+| `quality` | JPEG quality 1–100 for the tile stream (default 60). |
+| `webrtc=1` | the viewer supports WebRTC; the server replies with `webrtc_config` and the helper negotiates a peer connection (see below). Omitted = tiles only, exactly as before. |
+| `mode=backstage` | attach to the isolated administrative desktop instead of the console (Windows only; see Backstage mode). Default `console`. |
+
+## WebRTC transport (optional, with automatic fallback)
+
+When the viewer asks for it (`?webrtc=1`), video and input can travel peer-to-peer over WebRTC
+(UDP/SRTP) instead of through the server relay, cutting latency and server bandwidth. The JPEG
+tile stream stays up as both the **fast-start** (the first picture shows in <100 ms over the
+WebSocket while ICE negotiates) and the **firewall fallback** (if UDP is blocked). The server only
+relays the signaling text frames verbatim and delivers STUN/TURN config; it never decodes media.
+
+Signaling messages (JSON text frames, bridged viewer ⇄ helper; the browser is the **offerer**):
+
+| message | direction | meaning |
+|---|---|---|
+| `{"t":"webrtc_config","ice_servers":[{"urls":[...],"username":"","credential":""}]}` | server → viewer | STUN/TURN servers for `RTCConfiguration` (configure with `RMM_ICE_SERVERS`; defaults to a public STUN server). Sent once, before the helper connects. |
+| `{"t":"webrtc_offer","sdp":"..."}` | viewer → helper | SDP offer: a recvonly H.264 video transceiver plus two data channels. |
+| `{"t":"webrtc_answer","sdp":"..."}` | helper → viewer | SDP answer with the sendonly H.264 track. |
+| `{"t":"webrtc_candidate","candidate":{...}}` | both ways | trickle ICE candidate (`RTCIceCandidateInit`). |
+| `{"t":"webrtc_active"}` | viewer → helper | the `<video>` is decoding WebRTC frames (`onplaying`): the helper stops sending JPEG tiles. |
+| `{"t":"fallback_tiles"}` | viewer → helper | WebRTC failed to connect within the viewer's 4 s watchdog, or dropped after connecting: the helper resumes the JPEG tile stream. |
+
+Video: the helper encodes H.264 (Windows Media Foundation MFT, hardware when available) and writes
+Annex-B access units to a Pion `TrackLocalStaticSample`. A background RTCP reader on the sender
+forces an IDR keyframe on `PictureLossIndication`/`FullIntraRequest`, so a dropped UDP packet
+recovers instead of freezing the browser's decoder.
+
+Input over WebRTC uses two SCTP data channels, created by the viewer:
+
+| channel | reliability | carries |
+|---|---|---|
+| `input-unreliable` | unordered, `maxRetransmits: 0` | `mousemove` (a later move supersedes a lost one) |
+| `input-reliable` | ordered, reliable | `mousedown`/`mouseup`, `wheel`, `keydown`/`keyup`, `paste`, `ctrlaltdel` |
+
+Data-channel messages use the **same JSON schema** as the viewer→helper table above, so one code
+path injects input whichever transport delivered it.
+
+## Backstage mode (Windows)
+
+`?mode=backstage` streams an isolated virtual desktop (`winsta0\HomelabRMM_Backstage`, created with
+`CreateDesktopW` and a DACL admitting only SYSTEM and Administrators) that the logged-in user never
+sees, for administrative work that must not disturb them. The helper launches admin tools
+(`cmd.exe`, `taskmgr.exe`) onto that desktop; any PowerShell is started `-WindowStyle Hidden`.
+
+Capture and input never touch the physical screen: the compositor enumerates the backstage
+desktop's windows (`EnumDesktopWindows`) and draws each with `PrintWindow(…, PW_RENDERFULLCONTENT)`
+into an off-screen DIB — **never** `GetDC(NULL)` — and input is hit-tested against the backstage
+window tree and delivered with `PostMessageW` — **never** `SendInput`. The physical cursor does not
+move and the user's screen is never captured. A static test (`TestBackstageNoForbiddenAPIs`)
+enforces that the forbidden APIs appear nowhere in the backstage source.
+
 ## Helper launch
 
 - **Windows**: the agent runs as a service in session 0, which cannot see the user's desktop. It

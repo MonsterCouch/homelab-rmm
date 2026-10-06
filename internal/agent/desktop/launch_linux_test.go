@@ -71,7 +71,7 @@ func TestHelperEnvIsMinimalAndCarriesTheToken(t *testing.T) {
 // The token must never be an argument: /proc/<pid>/cmdline is world
 // readable, so an argument would hand the bridge token to every local user.
 func TestHelperArgsCarryNoToken(t *testing.T) {
-	args := strings.Join(helperArgs("https://rmm.example:8443", "abcd", 60), " ")
+	args := strings.Join(helperArgs(Config{ServerURL: "https://rmm.example:8443", Fingerprint: "abcd", Quality: 60}), " ")
 	if strings.Contains(args, "--token") || strings.Contains(args, "s3cret") {
 		t.Fatalf("token on the command line: %s", args)
 	}
@@ -181,7 +181,7 @@ func TestLaunchWithoutASessionNamesTheConfigKeys(t *testing.T) {
 	if s, err := findSession(); err == nil {
 		t.Skipf("this machine has a usable graphical session (%s); nothing to assert", s.display)
 	}
-	_, err := launch("/nonexistent/rmm-agent", "https://rmm.example:8443", "tok", "fp", 60)
+	_, err := launch("/nonexistent/rmm-agent", Config{ServerURL: "https://rmm.example:8443", Token: "tok", Fingerprint: "fp", Quality: 60})
 	if err == nil {
 		t.Fatal("launch succeeded without a session")
 	}

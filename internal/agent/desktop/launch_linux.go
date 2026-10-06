@@ -34,6 +34,12 @@ type x11Session struct {
 	// keys rather than from logind; those values win over whatever the
 	// agent's own environment happens to say.
 	configured bool
+
+	// Wayland sessions only (see launch_wayland): the compositor socket and
+	// the session bus the ScreenCast portal is reached through. display and
+	// xauth then describe the optional Xwayland server, not the session.
+	wayland string
+	dbus    string
 }
 
 // greeterClass is logind's class for the display manager's own session (the
@@ -55,18 +61,30 @@ var (
 // helper is a child with that user's credentials and the X authority it
 // needs; in developer mode (same user, or no logind but a DISPLAY of our
 // own) the helper runs inside this process.
-func launch(exe, serverURL, token, fingerprint string, quality int) (string, error) {
+func launch(exe string, cfg Config) (string, error) {
+	token := cfg.Token
 	sess, err := findSession()
 	if err != nil {
 		if errors.Is(err, errWayland) {
+			// A user's Wayland session is served through uinput plus the
+			// portal; the display manager's greeter has no user session to
+			// attach to, so that case stays an error.
+			if !errors.Is(err, errWaylandGreeter) {
+				return launchWayland(exe, cfg, err)
+			}
 			return "", err
 		}
 		// No usable answer: fall back to our own display when the agent is
 		// run from a terminal (development), else tell the operator which
 		// two keys would settle it.
+		if os.Getenv("XDG_SESSION_TYPE") == "wayland" && uinputSelectorWired {
+			slog.Info("desktop: no logind session, serving our own Wayland session", "reason", err)
+			serveInProcess(cfg)
+			return "running in-process on the agent's own Wayland session", nil
+		}
 		if d := os.Getenv("DISPLAY"); d != "" && os.Getenv("XDG_SESSION_TYPE") != "wayland" {
 			slog.Info("desktop: no logind X11 session, using our own DISPLAY", "display", d, "reason", err)
-			serveInProcess(serverURL, token, fingerprint, quality)
+			serveInProcess(cfg)
 			return fmt.Sprintf("running in-process on display %s", d), nil
 		}
 		slog.Warn("desktop: no graphical session found", "err", err, "config", agentConfigPath())
@@ -86,13 +104,13 @@ func launch(exe, serverURL, token, fingerprint string, quality int) (string, err
 			// veto it (platformInit refuses Wayland).
 			os.Setenv("XDG_SESSION_TYPE", "x11")
 		}
-		serveInProcess(serverURL, token, fingerprint, quality)
+		serveInProcess(cfg)
 		return fmt.Sprintf("running in-process as %s on display %s", sess.user, sess.display), nil
 	case self != 0:
 		return "", fmt.Errorf("agent runs as uid %d but the X11 session belongs to %s (uid %d); run the agent as root", self, sess.user, sess.uid)
 	}
 
-	cmd := exec.Command(exe, helperArgs(serverURL, fingerprint, quality)...)
+	cmd := exec.Command(exe, helperArgs(cfg)...)
 	cmd.Env = helperEnv(sess, token)
 	cmd.Dir = "/"
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr // the journal keeps helper logs with ours
@@ -507,4 +525,204 @@ func scanProcEnviron(uid int, wantDisplay string) (display, xauth string) {
 		}
 	}
 	return display, ""
+}
+
+// ---- Wayland ----
+
+// launchWayland serves an active user Wayland session. Input goes through
+// /dev/uinput and capture through the ScreenCast portal (with fallbacks, see
+// capture_pipewire_linux.go); both live in the helper, which is told about
+// the session through its environment (XDG_SESSION_TYPE=wayland selects them
+// in platformInit). cause is the errWayland that sent us here and is
+// returned when the Wayland path cannot be used.
+func launchWayland(exe string, cfg Config, cause error) (string, error) {
+	if !uinputSelectorWired {
+		// The injector selection that makes Wayland input work is not
+		// connected (see uinputSelectorWired); starting a helper would only
+		// give it an XTEST injector that cannot reach Wayland clients.
+		return "", cause
+	}
+	list, err := runLoginctl("list-sessions", "--no-legend")
+	if err != nil {
+		return "", fmt.Errorf("%w (%v)", cause, err)
+	}
+	sess, err := selectWaylandSession(list, showSession)
+	if err != nil {
+		return "", fmt.Errorf("%w (%v)", cause, err)
+	}
+
+	self := os.Geteuid()
+	switch {
+	case self == sess.uid:
+		os.Setenv("XDG_SESSION_TYPE", "wayland")
+		os.Setenv("WAYLAND_DISPLAY", sess.wayland)
+		os.Setenv("DBUS_SESSION_BUS_ADDRESS", sess.dbus)
+		if sess.display != "" {
+			os.Setenv("DISPLAY", sess.display)
+			if sess.xauth != "" {
+				os.Setenv("XAUTHORITY", sess.xauth)
+			}
+		}
+		serveInProcess(cfg)
+		return fmt.Sprintf("running in-process as %s on Wayland session %s", sess.user, sess.id), nil
+	case self != 0:
+		return "", fmt.Errorf("agent runs as uid %d but the Wayland session belongs to %s (uid %d); run the agent as root", self, sess.user, sess.uid)
+	}
+
+	cmd := exec.Command(exe, helperArgs(cfg)...)
+	cmd.Env = helperEnvWayland(sess, cfg.Token)
+	cmd.Dir = "/"
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		// Runs as the session's user: the session bus and the portal only
+		// answer their owner. /dev/uinput must therefore be reachable by that
+		// user (logind's uaccess ACL, or a udev rule); the helper reports a
+		// clear error to the viewer when it is not.
+		Credential: &syscall.Credential{Uid: uint32(sess.uid), Gid: uint32(sess.gid), Groups: sess.groups},
+		Setsid:     true,
+	}
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("start helper as %s: %w", sess.user, err)
+	}
+	slog.Info("desktop helper started for Wayland", "pid", cmd.Process.Pid, "user", sess.user, "wayland", sess.wayland, "xwayland", sess.display)
+	go func() {
+		err := cmd.Wait()
+		slog.Info("desktop helper exited", "pid", cmd.Process.Pid, "err", err)
+	}()
+	return fmt.Sprintf("attached to Wayland session %s of %s (input via uinput)", sess.id, sess.user), nil
+}
+
+// helperEnvWayland is helperEnv for a Wayland session: the session type
+// switches to wayland, DISPLAY/XAUTHORITY are kept only when an Xwayland
+// server exists (they serve as the capture fallback), and the compositor
+// socket and session bus are added.
+func helperEnvWayland(s *x11Session, token string) []string {
+	var env []string
+	for _, e := range helperEnv(s, token) {
+		switch {
+		case e == "XDG_SESSION_TYPE=x11":
+			e = "XDG_SESSION_TYPE=wayland"
+		case e == "DISPLAY=" || strings.HasPrefix(e, "XAUTHORITY=") && s.display == "":
+			continue
+		}
+		env = append(env, e)
+	}
+	env = append(env, "WAYLAND_DISPLAY="+s.wayland, "DBUS_SESSION_BUS_ADDRESS="+s.dbus)
+	return env
+}
+
+// selectWaylandSession picks the first active, non-greeter Wayland session;
+// it is selectSession's counterpart for the sessions that one skips.
+func selectWaylandSession(list string, show func(id string) (map[string]string, error)) (*x11Session, error) {
+	for _, line := range strings.Split(list, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		props, err := show(fields[0])
+		if err != nil {
+			slog.Debug("desktop: loginctl show-session", "id", fields[0], "err", err)
+			continue
+		}
+		if props["Type"] != "wayland" || props["Class"] == greeterClass {
+			continue
+		}
+		if props["Active"] != "yes" && props["State"] != "active" {
+			continue
+		}
+		s, err := waylandSessionFromProps(fields[0], props)
+		if err != nil {
+			slog.Debug("desktop: unusable Wayland session", "id", fields[0], "err", err)
+			continue
+		}
+		return s, nil
+	}
+	return nil, errors.New("no active Wayland user session found with loginctl")
+}
+
+func waylandSessionFromProps(id string, props map[string]string) (*x11Session, error) {
+	uid, err := strconv.Atoi(props["User"])
+	if err != nil {
+		return nil, fmt.Errorf("session %s has no numeric User (%q)", id, props["User"])
+	}
+	s := &x11Session{id: id, uid: uid, user: props["Name"], class: props["Class"]}
+	if err := fillUser(s, uid); err != nil {
+		return nil, fmt.Errorf("session %s: %w", id, err)
+	}
+	env := scanSessionEnv(uid)
+	applyWaylandEnv(s, env)
+	return s, nil
+}
+
+// applyWaylandEnv fills the Wayland fields from what the session's own
+// processes advertise, with the conventional values as defaults.
+func applyWaylandEnv(s *x11Session, env map[string]string) {
+	s.wayland = env["WAYLAND_DISPLAY"]
+	if s.wayland == "" {
+		s.wayland = "wayland-0"
+	}
+	s.dbus = env["DBUS_SESSION_BUS_ADDRESS"]
+	if s.dbus == "" {
+		s.dbus = "unix:path=/run/user/" + strconv.Itoa(s.uid) + "/bus"
+	}
+	s.display = env["DISPLAY"] // Xwayland, if the session has one; no default
+	if s.display != "" {
+		s.xauth = env["XAUTHORITY"]
+		if s.xauth == "" {
+			s.xauth = findXauthority(s.home, s.uid)
+		}
+	}
+}
+
+// sessionEnvKeys are the variables a Wayland helper needs from the session.
+var sessionEnvKeys = []string{"WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS"}
+
+// parseEnviron extracts the wanted variables from a /proc/<pid>/environ blob.
+func parseEnviron(data []byte, want []string) map[string]string {
+	out := map[string]string{}
+	for _, kv := range bytes.Split(data, []byte{0}) {
+		k, v, ok := strings.Cut(string(kv), "=")
+		if !ok {
+			continue
+		}
+		for _, w := range want {
+			if k == w && v != "" {
+				out[k] = v
+			}
+		}
+	}
+	return out
+}
+
+// scanSessionEnv returns sessionEnvKeys as set in the first process of uid
+// that has WAYLAND_DISPLAY (a process inside the graphical session).
+func scanSessionEnv(uid int) map[string]string {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || int(st.Uid) != uid {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join("/proc", e.Name(), "environ"))
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		if env := parseEnviron(data, sessionEnvKeys); env["WAYLAND_DISPLAY"] != "" {
+			return env
+		}
+	}
+	return nil
 }

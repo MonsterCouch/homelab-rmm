@@ -60,6 +60,23 @@ type desktopFollower interface {
 
 var newFollower = func() desktopFollower { return newThreadDesktop() }
 
+// noopFollower never leaves its thread's desktop. It is used in backstage mode,
+// where the capturer and injector target an isolated virtual desktop by handle
+// and must not be tied to (or ended by) the physical input desktop's state (a
+// lock screen or UAC prompt on the console must not kill a backstage session).
+type noopFollower struct{}
+
+func (noopFollower) follow() error { return nil }
+func (noopFollower) close()        {}
+
+// follower picks the desktop follower for this session's mode.
+func (s *session) follower() desktopFollower {
+	if s.noFollow {
+		return noopFollower{}
+	}
+	return newFollower()
+}
+
 // session is one helper <-> viewer stream.
 type session struct {
 	ws  *websocket.Conn
@@ -80,6 +97,32 @@ type session struct {
 
 	encoders int
 	bufPool  sync.Pool
+
+	// webrtcOffered is set when the viewer advertised WebRTC support; the
+	// session then attempts a peer connection for low-latency video/input
+	// (see webrtc_session.go) while keeping the tile stream as fast-start and
+	// firewall fallback. It is read once, before the loops start.
+	webrtcOffered bool
+	// noFollow disables input-desktop following (backstage mode); see follower().
+	noFollow bool
+	// iceServers are the STUN/TURN URLs the helper gathers candidates against;
+	// empty falls back to a public STUN server.
+	iceServers []string
+
+	// rtc is the WebRTC transport, non-nil only after the viewer's first
+	// offer. videoMode is set once the viewer confirms it is decoding the
+	// WebRTC <video> ("webrtc_active"); the capture loop then stops sending
+	// JPEG tiles and feeds the H.264 track instead, until "fallback_tiles".
+	rtc       *webRTCSession
+	videoMode atomic.Bool
+
+	// enc is the H.264 encoder for the WebRTC video track, created lazily by
+	// the capture goroutine and re-created when the frame size changes. encMu
+	// guards it because ForceKeyframe (driven by the RTCP loop) may run on
+	// another goroutine.
+	encMu      sync.Mutex
+	enc        videoEncoder
+	encW, encH int
 }
 
 func newSession(ws *websocket.Conn, cap capturer, inj injector, quality int) *session {
@@ -113,6 +156,11 @@ func (s *session) setQuality(q int) {
 func (s *session) run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	if s.webrtcOffered {
+		s.setupWebRTC(ctx)
+		defer s.teardownWebRTC()
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -261,6 +309,23 @@ func (s *session) readLoop(ctx context.Context) {
 			}
 		case msgMouseMove, msgMouseDown, msgMouseUp, msgWheel, msgKeyDown, msgKeyUp, msgPaste, msgCtrlAltDel:
 			s.queueInput(ctx, msg)
+		case msgWebRTCOffer, msgWebRTCCandidate:
+			if s.rtc != nil {
+				s.rtc.handleSignal(data)
+			}
+		case msgWebRTCActive:
+			// The viewer's <video> is decoding WebRTC frames: stop sending
+			// JPEG tiles. Only honour it once the connection is actually up,
+			// so a stray message cannot blank the fallback stream.
+			if s.rtc.videoLive() {
+				s.videoMode.Store(true)
+				slog.Info("desktop: viewer switched to WebRTC video; pausing tiles")
+			}
+		case msgFallbackTiles:
+			// WebRTC failed or the viewer asked to go back to tiles.
+			if s.videoMode.Swap(false) {
+				slog.Info("desktop: reverting to WebSocket tile stream")
+			}
 		default:
 			slog.Debug("desktop: unknown viewer message", "t", msg.T)
 		}
@@ -289,7 +354,7 @@ func (s *session) queueInput(ctx context.Context, msg viewerMsg) {
 // ---- input ----
 
 func (s *session) inputLoop(ctx context.Context) {
-	td := newFollower()
+	td := s.follower()
 	defer td.close()
 	var cur monitor // the monitor viewer coordinates refer to
 	for {
@@ -349,7 +414,7 @@ func (s *session) inject(td desktopFollower, cur monitor, msg viewerMsg) error {
 // respect the viewer's flow control. It never returns while the stream is
 // healthy.
 func (s *session) captureLoop(ctx context.Context) error {
-	td := newFollower()
+	td := s.follower()
 	defer td.close()
 
 	var (
@@ -467,8 +532,14 @@ func (s *session) captureLoop(ctx context.Context) error {
 			t.Stop()
 		}
 
-		// Frame-rate cap.
-		if d := minFrameInterval - time.Since(lastCap); d > 0 {
+		// Frame-rate cap. While the viewer is on the WebRTC video track the
+		// cadence follows the encoder's target rate; otherwise it is the
+		// tile-stream cap.
+		frameInterval := minFrameInterval
+		if s.videoMode.Load() {
+			frameInterval = time.Second / webrtcFPS
+		}
+		if d := frameInterval - time.Since(lastCap); d > 0 {
 			if !wait(d) {
 				return nil
 			}
@@ -489,6 +560,30 @@ func (s *session) captureLoop(ctx context.Context) error {
 			// session with a message the viewer can act on.
 			return err
 		}
+
+		// WebRTC committed path: the viewer confirmed it is decoding the video
+		// track, so tiles are paused and the frame goes straight to the H.264
+		// encoder from its GPU surface (no CPU readback). A capture backend
+		// without a GPU frame source falls through to the tile path below,
+		// which also feeds the track from the CPU image.
+		if fs, ok := s.cap.(frameSource); ok && s.videoMode.Load() && s.rtc.videoLive() {
+			if err := s.feedVideo(cur, fs); err != nil {
+				fails++
+				if fails > maxCaptureFails {
+					return err
+				}
+				slog.Debug("desktop: video capture failed", "err", err, "consecutive", fails)
+				mons = nil
+				if !wait(captureRetry) {
+					return nil
+				}
+				continue
+			}
+			fails = 0
+			lastCap = time.Now()
+			continue
+		}
+
 		img, err := s.cap.capture(cur)
 		lastCap = time.Now()
 		if err != nil {
@@ -508,6 +603,29 @@ func (s *session) captureLoop(ctx context.Context) error {
 			// The backend disagrees with what it enumerated a moment ago:
 			// the mode changed mid-flight. Re-enumerate before trusting it.
 			mons = nil
+			continue
+		}
+
+		// Optimistic fast-start: once the peer connection is up, feed the
+		// H.264 track from the same CPU frame the tiles use, so the viewer's
+		// <video> starts decoding and can confirm the switch (webrtc_active).
+		// This also covers the committed case on a backend with no GPU frame
+		// source. When committed with a GPU source the loop took the zero-copy
+		// path above and never reaches here.
+		if s.rtc.videoLive() {
+			vf := videoFrame{rgba: img, w: img.Rect.Dx(), h: img.Rect.Dy(), fresh: true}
+			if nal, _, err := s.encodeVideo(vf); err != nil {
+				s.videoMode.Store(false)
+				slog.Debug("desktop: fast-start video encode failed; tiles only", "err", err)
+			} else if nal != nil {
+				if werr := s.rtc.writeVideo(nal, time.Second/webrtcFPS); werr != nil {
+					slog.Debug("desktop: write video sample", "err", werr)
+				}
+			}
+		}
+		if s.videoMode.Load() {
+			// Committed to video but no GPU frame source: tiles are paused, so
+			// skip the tile encode/send below and pace to the next frame.
 			continue
 		}
 
@@ -619,4 +737,103 @@ func (s *session) encodeTile(img *image.RGBA, r image.Rectangle, quality int) (*
 		return nil, fmt.Errorf("jpeg: %w", err)
 	}
 	return buf, nil
+}
+
+// ---- WebRTC integration ----
+
+// Video encoding knobs for the WebRTC track. Kept here with the other tuning
+// constants' spirit; a future pass could make bitrate adaptive.
+const (
+	webrtcFPS        = 30
+	webrtcBitrateKbs = 2500
+)
+
+// setupWebRTC builds the peer-connection wrapper. It never fails the session:
+// if WebRTC cannot be set up the helper simply keeps streaming tiles.
+func (s *session) setupWebRTC(ctx context.Context) {
+	rtc, err := newWebRTCSession(
+		s.iceServers,
+		s.sendJSON,
+		func(msg viewerMsg) { s.queueInput(ctx, msg) },
+		s.forceKeyframe,
+	)
+	if err != nil {
+		slog.Warn("desktop: WebRTC unavailable, staying on tiles", "err", err)
+		return
+	}
+	s.rtc = rtc
+}
+
+// teardownWebRTC closes the peer connection and the encoder.
+func (s *session) teardownWebRTC() {
+	if s.rtc != nil {
+		s.rtc.close()
+	}
+	s.encMu.Lock()
+	if s.enc != nil {
+		s.enc.Close()
+		s.enc = nil
+	}
+	s.encMu.Unlock()
+}
+
+// forceKeyframe asks the encoder for an immediate IDR. Called from the RTCP
+// reader goroutine, hence the lock around the capture goroutine's encoder.
+func (s *session) forceKeyframe() {
+	s.encMu.Lock()
+	enc := s.enc
+	s.encMu.Unlock()
+	if enc != nil {
+		enc.ForceKeyframe()
+	}
+}
+
+// encodeVideo encodes one frame for the WebRTC track, creating or re-creating
+// the encoder when the frame size changes. It returns (nil, false, nil) when
+// the encoder is still buffering or no encoder is available (the caller then
+// simply sends nothing this tick). Runs on the capture goroutine only.
+func (s *session) encodeVideo(f videoFrame) (nal []byte, keyframe bool, err error) {
+	if f.w <= 0 || f.h <= 0 {
+		return nil, false, nil
+	}
+	s.encMu.Lock()
+	defer s.encMu.Unlock()
+	if s.enc != nil && (s.encW != f.w || s.encH != f.h) {
+		s.enc.Close()
+		s.enc = nil
+	}
+	if s.enc == nil {
+		enc, err := newVideoEncoder(f.w, f.h, webrtcFPS, webrtcBitrateKbs)
+		if err != nil {
+			return nil, false, err // no encoder: caller stays on tiles
+		}
+		s.enc, s.encW, s.encH = enc, f.w, f.h
+	}
+	return s.enc.Encode(f)
+}
+
+// feedVideo captures one frame for cur and writes it to the WebRTC track. It
+// prefers the zero-copy GPU surface (frameSource) and falls back to the CPU
+// RGBA image otherwise. Errors are returned so the capture loop can treat a
+// repeated failure the way it treats a capture failure.
+func (s *session) feedVideo(cur monitor, fs frameSource) error {
+	f, err := fs.captureFrame(cur)
+	if err != nil {
+		return err
+	}
+	nal, key, err := s.encodeVideo(f)
+	if err != nil {
+		// The encoder could not be created or failed: give up on video for
+		// this session and let the tiles take over by clearing videoMode.
+		s.videoMode.Store(false)
+		slog.Warn("desktop: video encode failed, reverting to tiles", "err", err)
+		return nil
+	}
+	if nal != nil {
+		if werr := s.rtc.writeVideo(nal, time.Second/webrtcFPS); werr != nil {
+			slog.Debug("desktop: write video sample", "err", werr)
+		}
+	}
+	_ = key
+	return nil
 }

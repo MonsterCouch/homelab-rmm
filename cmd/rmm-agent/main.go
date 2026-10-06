@@ -619,14 +619,23 @@ func runDesktopHelperCmd(args []string) {
 	token := fs.String("token", "", "")
 	fp := fs.String("fingerprint", "", "")
 	quality := fs.Int("quality", 60, "")
+	mode := fs.String("mode", "console", "")
+	webrtc := fs.Bool("webrtc", false, "")
 	fs.Parse(args)
 
 	if *token == "" {
 		*token = os.Getenv(desktop.TokenEnv)
 	}
 	os.Unsetenv(desktop.TokenEnv)
-	slog.Info("desktop helper starting", "server", *server, "quality", *quality, "log", logPath)
-	if err := desktop.Serve(context.Background(), *server, *token, *fp, *quality); err != nil {
+	slog.Info("desktop helper starting", "server", *server, "quality", *quality, "mode", *mode, "webrtc", *webrtc, "log", logPath)
+	if err := desktop.Serve(context.Background(), desktop.Config{
+		ServerURL:   *server,
+		Token:       *token,
+		Fingerprint: *fp,
+		Quality:     *quality,
+		Mode:        *mode,
+		WebRTC:      *webrtc,
+	}); err != nil {
 		slog.Error("desktop helper ended", "err", err)
 		os.Exit(1)
 	}

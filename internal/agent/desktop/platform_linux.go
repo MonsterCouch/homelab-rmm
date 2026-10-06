@@ -4,6 +4,7 @@ package desktop
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -14,9 +15,9 @@ import (
 
 var xgbQuietOnce sync.Once
 
-// platformInit checks that an X display is reachable. Wayland compositors
-// hide the screen and the input path behind portals the helper does not
-// speak yet, so the error is explicit rather than a mystery capture failure.
+// platformInit checks that an X display is reachable, or that a Wayland
+// session can be served through uinput (see below). Anything else fails with
+// an explicit error rather than a mystery capture failure.
 func platformInit() error {
 	// xgb logs "could not get authority info" at every connection, and
 	// kbinani opens a connection per call; route that noise away.
@@ -24,12 +25,22 @@ func platformInit() error {
 
 	// A Wayland session with DISPLAY set is XWayland: XGetImage there
 	// returns black for every native window and XTEST reaches only X11
-	// clients, so "works" would mean a black screen. Fail fast instead; the
-	// launcher never picks such a session, this guards the manual
-	// `desktop-helper` run.
+	// clients. Wayland is therefore served only through /dev/uinput (input,
+	// compositor independent) plus waylandCapturer (capture); without a
+	// writable uinput the helper still refuses, rather than "working" into
+	// a black screen. The launcher never picks such a session for the X11
+	// path; this also guards the manual `desktop-helper` run.
 	if os.Getenv("XDG_SESSION_TYPE") == "wayland" {
-		return errWayland
+		if !uinputSelectorWired {
+			return errWayland
+		}
+		if err := checkUinputWritable(); err != nil {
+			return fmt.Errorf("%w: input needs /dev/uinput: %v", errWayland, err)
+		}
+		waylandMode.Store(true)
+		return nil
 	}
+	waylandMode.Store(false)
 	if os.Getenv("DISPLAY") == "" {
 		if os.Getenv("WAYLAND_DISPLAY") != "" {
 			return errWayland
@@ -50,3 +61,14 @@ type threadDesktop struct{}
 func newThreadDesktop() *threadDesktop { return &threadDesktop{} }
 func (*threadDesktop) follow() error   { return nil }
 func (*threadDesktop) close()          {}
+
+// newCapturer returns the screen-capture backend. The X11 backend
+// (kbinani/screenshot over XShm) is the default; a Wayland session (see
+// platformInit) gets waylandCapturer, which tries the PipeWire portal and
+// falls back (capture_pipewire_linux.go).
+func newCapturer() capturer {
+	if waylandMode.Load() {
+		return newWaylandCapturer()
+	}
+	return screenCapturer{}
+}

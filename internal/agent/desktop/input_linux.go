@@ -63,6 +63,12 @@ type x11Injector struct {
 }
 
 func newInjector() (injector, error) {
+	// On Wayland, XTEST reaches only XWayland clients, so prefer the kernel
+	// /dev/uinput backend (see input_uinput_linux.go). It falls through to
+	// XTEST when uinput cannot be opened or the session is X11.
+	if inj, ok := tryUinputInjector(); ok {
+		return inj, nil
+	}
 	c, err := xgb.NewConn()
 	if err != nil {
 		return nil, fmt.Errorf("connect to X display: %w", err)

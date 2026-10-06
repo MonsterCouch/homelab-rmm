@@ -47,6 +47,15 @@ const (
 	msgRefresh    = "refresh"
 	msgAck        = "ack"
 	msgCtrlAltDel = "ctrlaltdel"
+
+	// WebRTC signaling and transport-switch messages (see webrtc_session.go
+	// and docs/DESKTOP-PROTOCOL.md). Offer/candidate carry SDP; active and
+	// fallback switch the video transport between the WebRTC track and the
+	// JPEG tile stream.
+	msgWebRTCOffer     = "webrtc_offer"
+	msgWebRTCCandidate = "webrtc_candidate"
+	msgWebRTCActive    = "webrtc_active"
+	msgFallbackTiles   = "fallback_tiles"
 )
 
 // Mouse buttons as the viewer numbers them.

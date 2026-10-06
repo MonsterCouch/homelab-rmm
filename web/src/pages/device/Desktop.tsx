@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button, Dropdown } from '../../components/ui';
 import { IconClipboard, IconExpand, IconKeyboard, IconMore, IconRefresh, IconStop } from '../../components/Icons';
-import { bytes } from '../../lib/format';
+import { bps, bytes } from '../../lib/format';
 import { host } from '../../lib/host';
 import { useToast } from '../../state/toast';
 import type { TabProps } from './DeviceDetail';
@@ -9,11 +9,16 @@ import { copyText, readClipboard } from './clipboard';
 import { KeyBar, KeyButton } from './KeyBar';
 import { coarsePointer, useCoarsePointer, useFillHeight } from './touch';
 import { createTrackpad } from './trackpad';
+import { ViewerRTC } from './webrtc';
 import '../../styles/device-touch.css';
 
 // Implements docs/DESKTOP-PROTOCOL.md. The server bridges frames verbatim, so
 // everything here talks to the helper directly: JSON text frames for control
 // and input, little-endian binary frames for tiles.
+//
+// Two engines share the stage. JPEG tiles on the <canvas> start at once and
+// are the fallback; WebRTC video (hardware-decoded, ./webrtc.ts) takes over
+// when it connects, and hands back to the tiles if it never does or drops.
 
 type Status = 'idle' | 'connecting' | 'connected' | 'closed' | 'error';
 
@@ -40,6 +45,9 @@ interface TextMsg {
   text?: string;
   x?: number;
   y?: number;
+  sdp?: string;
+  ice_servers?: RTCIceServer[];
+  candidate?: RTCIceCandidateInit;
 }
 
 function wsURL(path: string): string {
@@ -48,6 +56,17 @@ function wsURL(path: string): string {
 
 const TILE = 0x01;
 const FRAME_END = 0x02;
+
+/** WebRTC gets this long after the offer to connect before the tiles stay. */
+const RTC_CONNECT_MS = 4000;
+/** Grace period for ICE to recover from a transient `disconnected` before
+ *  giving up and reverting to tiles; `failed`/`closed` fall back at once. */
+const RTC_DISCONNECT_GRACE_MS = 4000;
+/** The messages the helper also accepts over the WebRTC data channels. */
+const INPUT_TYPES: ReadonlySet<string> = new Set(['mousemove', 'mousedown', 'mouseup', 'wheel', 'keydown', 'keyup', 'paste', 'ctrlaltdel']);
+
+type Transport = 'ws' | 'rtc';
+type Mode = 'console' | 'backstage';
 
 // ---- wheel normalisation (docs/DESKTOP-PROTOCOL.md) ----
 //
@@ -182,6 +201,7 @@ export function Desktop({ agent, canWrite }: TabProps) {
   const page = useRef<HTMLDivElement>(null);
   const wrap = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
+  const video = useRef<HTMLVideoElement>(null);
   const cursorEl = useRef<HTMLDivElement>(null);
   const kbd = useRef<HTMLInputElement>(null);
   const ws = useRef<WebSocket | null>(null);
@@ -193,6 +213,16 @@ export function Desktop({ agent, canWrite }: TabProps) {
   const moveRaf = useRef(0);
   const pendingMove = useRef<{ x: number; y: number } | null>(null);
   const stats = useRef({ frames: 0, bytes: 0 });
+
+  // WebRTC state. `rtc` is the live peer connection, if any; `rtcActive` is
+  // true once its <video> is playing (and the helper has been told to stop
+  // sending tiles); `rtcWatch` is the connect watchdog.
+  const rtc = useRef<ViewerRTC | null>(null);
+  const rtcActive = useRef(false);
+  const rtcWatch = useRef(0);
+  const rtcGrace = useRef(0);
+  const rtcOnRef = useRef(true);
+  const modeRef = useRef<Mode>('console');
 
   // touch state
   /** Where the trackpad cursor is, in remote pixels (fractional while zoomed). */
@@ -213,6 +243,10 @@ export function Desktop({ agent, canWrite }: TabProps) {
   const [dims, setDims] = useState({ w: 0, h: 0 });
   const [fps, setFps] = useState(0);
   const [kbps, setKbps] = useState(0);
+  const [rttMs, setRttMs] = useState<number | null>(null);
+  const [transport, setTransport] = useState<Transport>('ws');
+  const [mode, setMode] = useState<Mode>('console');
+  const [rtcOn, setRtcOn] = useState(true);
   const [remoteClip, setRemoteClip] = useState('');
   const [fullscreen, setFullscreen] = useState(false);
   const [zoom, setZoom] = useState<'fit' | number>('fit');
@@ -224,6 +258,9 @@ export function Desktop({ agent, canWrite }: TabProps) {
   viewOnlyRef.current = viewOnly;
 
   const send = useCallback((msg: Record<string, unknown>) => {
+    // Input prefers the WebRTC data channels once connected; control messages
+    // (ack, monitor, quality, refresh, ...) always ride the WebSocket.
+    if (typeof msg.t === 'string' && INPUT_TYPES.has(msg.t) && rtc.current?.connected && rtc.current.sendInput(msg)) return;
     const s = ws.current;
     if (s && s.readyState === WebSocket.OPEN) s.send(JSON.stringify(msg));
   }, []);
@@ -267,6 +304,14 @@ export function Desktop({ agent, canWrite }: TabProps) {
     scaleRef.current = scale;
     c.style.width = `${Math.floor(screen.current.w * scale)}px`;
     c.style.height = `${Math.floor(screen.current.h * scale)}px`;
+    // The video sits exactly over the canvas, which keeps the input geometry.
+    const v = video.current;
+    if (v) {
+      v.style.width = c.style.width;
+      v.style.height = c.style.height;
+      v.style.left = `${c.offsetLeft}px`;
+      v.style.top = `${c.offsetTop}px`;
+    }
     drawCursor();
   }, [fitScale, drawCursor]);
 
@@ -293,13 +338,98 @@ export function Desktop({ agent, canWrite }: TabProps) {
     });
   }, []);
 
+  /** Drop the peer connection and its watchdog; back to the tiles' canvas. */
+  const closeRTC = useCallback(() => {
+    window.clearTimeout(rtcWatch.current);
+    rtcWatch.current = 0;
+    window.clearTimeout(rtcGrace.current);
+    rtcGrace.current = 0;
+    const r = rtc.current;
+    rtc.current = null;
+    rtcActive.current = false;
+    r?.close();
+    if (video.current) video.current.srcObject = null;
+    setTransport('ws');
+  }, []);
+
+  /** WebRTC failed or dropped: tell the helper to resume tiles and show them. */
+  const rtcFallback = useCallback(
+    (r: ViewerRTC, s: WebSocket) => {
+      if (rtc.current !== r) return; // already torn down or replaced
+      closeRTC();
+      if (s.readyState === WebSocket.OPEN) {
+        s.send(JSON.stringify({ t: 'fallback_tiles' }));
+        // The canvas went stale while the video ran; ask for a full frame.
+        s.send(JSON.stringify({ t: 'refresh' }));
+      }
+    },
+    [closeRTC],
+  );
+
+  const startRTC = useCallback(
+    (s: WebSocket, iceServers: RTCIceServer[]) => {
+      closeRTC();
+      const signal = (o: Record<string, unknown>) => {
+        if (s.readyState === WebSocket.OPEN) s.send(JSON.stringify(o));
+      };
+      let r: ViewerRTC;
+      try {
+        r = new ViewerRTC(iceServers, signal, {
+          onStream: (stream) => {
+            const v = video.current;
+            if (rtc.current !== r || !v) return;
+            v.srcObject = stream;
+            void v.play().catch(() => undefined); // autoplay is muted, so this is a nudge only
+          },
+          onState: (st) => {
+            if (rtc.current !== r) return;
+            if (st === 'connected') {
+              window.clearTimeout(rtcWatch.current);
+              rtcWatch.current = 0;
+              // Recovered from a blip: cancel any pending give-up.
+              window.clearTimeout(rtcGrace.current);
+              rtcGrace.current = 0;
+            } else if (st === 'failed' || st === 'closed') {
+              rtcFallback(r, s); // permanent: revert to tiles now
+            } else if (st === 'disconnected') {
+              // Often transient (a roaming Wi-Fi hop, a NAT rebind); give ICE a
+              // moment to restore the connection before falling back.
+              if (!rtcGrace.current) {
+                rtcGrace.current = window.setTimeout(() => {
+                  rtcGrace.current = 0;
+                  if (rtc.current === r && !r.connected) rtcFallback(r, s);
+                }, RTC_DISCONNECT_GRACE_MS);
+              }
+            }
+          },
+        });
+      } catch (err) {
+        console.warn('webrtc unavailable', err);
+        signal({ t: 'fallback_tiles' });
+        return;
+      }
+      rtc.current = r;
+      rtcWatch.current = window.setTimeout(() => {
+        if (rtc.current === r && !r.connected) rtcFallback(r, s);
+      }, RTC_CONNECT_MS);
+      r.start().catch((err) => {
+        console.warn('webrtc offer failed', err);
+        rtcFallback(r, s);
+      });
+    },
+    [closeRTC, rtcFallback],
+  );
+
   const connect = useCallback(() => {
+    closeRTC();
     ws.current?.close();
     setStatus('connecting');
     setDetail('');
     setNote('');
     drawQueue.current = Promise.resolve();
-    const s = new WebSocket(wsURL(`/ws/desktop/${encodeURIComponent(agent.id)}?quality=${quality}`));
+    const wantRTC = rtcOnRef.current && typeof RTCPeerConnection !== 'undefined';
+    const query = `quality=${quality}${wantRTC ? '&webrtc=1' : ''}${modeRef.current === 'backstage' ? '&mode=backstage' : ''}`;
+    const s = new WebSocket(wsURL(`/ws/desktop/${encodeURIComponent(agent.id)}?${query}`));
     s.binaryType = 'arraybuffer';
     ws.current = s;
     s.onmessage = (e: MessageEvent<ArrayBuffer | string>) => {
@@ -344,6 +474,23 @@ export function Desktop({ agent, canWrite }: TabProps) {
           case 'cursor':
             // The viewer shows the local cursor; position hints are not needed.
             break;
+          // WebRTC signalling. Ignore a socket that has been replaced.
+          case 'webrtc_config':
+            if (ws.current === s && rtcOnRef.current) startRTC(s, m.ice_servers ?? []);
+            break;
+          case 'webrtc_answer': {
+            const r = rtc.current;
+            if (ws.current === s && r && m.sdp) {
+              r.applyAnswer(m.sdp).catch((err) => {
+                console.warn('webrtc answer rejected', err);
+                rtcFallback(r, s);
+              });
+            }
+            break;
+          }
+          case 'webrtc_candidate':
+            if (ws.current === s && m.candidate) void rtc.current?.addCandidate(m.candidate);
+            break;
         }
         return;
       }
@@ -369,26 +516,31 @@ export function Desktop({ agent, canWrite }: TabProps) {
       setDetail((d) => d || 'connection failed (is the device online?)');
     };
     s.onclose = (ev) => {
-      if (ws.current === s) ws.current = null;
+      if (ws.current === s) {
+        ws.current = null;
+        closeRTC();
+      }
       setStatus((st) => (st === 'error' ? st : 'closed'));
       if (!ev.wasClean && ev.code !== 1000) setDetail((d) => d || `socket closed (${ev.code})`);
       pressed.current.clear();
       mouseDown.current.clear();
     };
-  }, [agent.id, quality, drawTile, layout]);
+  }, [agent.id, quality, drawTile, layout, closeRTC, startRTC, rtcFallback]);
 
   const disconnect = useCallback(() => {
+    closeRTC();
     ws.current?.close();
     ws.current = null;
     pressed.current.clear();
     mouseDown.current.clear();
     setStatus('closed');
-  }, []);
+  }, [closeRTC]);
 
   useEffect(() => {
     const id = window.setTimeout(connect, 50);
     return () => {
       window.clearTimeout(id);
+      closeRTC();
       ws.current?.close();
       ws.current = null;
     };
@@ -420,9 +572,29 @@ export function Desktop({ agent, canWrite }: TabProps) {
     layout();
   }, [zoom, layout]);
 
-  // fps / bandwidth counters
+  // The canvas only gets its box (and so its offsets) once it is displayed;
+  // place the video over it from there.
+  useEffect(() => {
+    layout();
+  }, [dims.w, dims.h, layout]);
+
+  // fps / bandwidth counters; the WebRTC numbers come from getStats()
   useEffect(() => {
     const id = window.setInterval(() => {
+      const r = rtcActive.current ? rtc.current : null;
+      if (r) {
+        stats.current = { frames: 0, bytes: 0 };
+        r.getStats()
+          .then((st) => {
+            if (rtc.current !== r) return;
+            setFps(st.fps);
+            setKbps(st.bytesPerSec);
+            setRttMs(st.rttMs);
+          })
+          .catch(() => undefined);
+        return;
+      }
+      setRttMs(null);
       setFps(stats.current.frames);
       setKbps(stats.current.bytes);
       stats.current = { frames: 0, bytes: 0 };
@@ -815,6 +987,46 @@ export function Desktop({ agent, canWrite }: TabProps) {
       {quality}
     </label>
   );
+  /** Playing is what flips the engine: tell the helper to stop sending tiles. */
+  const onVideoPlaying = () => {
+    const r = rtc.current;
+    if (!r || rtcActive.current) return;
+    rtcActive.current = true;
+    window.clearTimeout(rtcWatch.current);
+    rtcWatch.current = 0;
+    send({ t: 'webrtc_active' });
+    setTransport('rtc');
+  };
+  // Both of these reconnect: the engine and the mode are chosen by query
+  // string when the socket opens.
+  const toggleRtc = () => {
+    const next = !rtcOnRef.current;
+    rtcOnRef.current = next;
+    setRtcOn(next);
+    connect();
+  };
+  const toggleBackstage = () => {
+    const next: Mode = modeRef.current === 'backstage' ? 'console' : 'backstage';
+    modeRef.current = next;
+    setMode(next);
+    connect();
+  };
+  const engineControls = (
+    <>
+      <label className="row small muted" style={{ gap: 6 }} title="Hardware-decoded WebRTC video with automatic fallback to the WebSocket. Off forces WebSocket only.">
+        <input type="checkbox" checked={rtcOn} onChange={toggleRtc} aria-label="Use WebRTC" />
+        WebRTC
+      </label>
+      <Button
+        size="sm"
+        onClick={toggleBackstage}
+        title={mode === 'backstage' ? 'Back to the console session (reconnects)' : 'Work in a Backstage session (reconnects)'}
+        aria-pressed={mode === 'backstage'}
+      >
+        {mode === 'backstage' ? 'Backstage on' : 'Backstage'}
+      </Button>
+    </>
+  );
   const refreshControl = (
     <Button onClick={() => send({ t: 'refresh' })} disabled={!live} title="Request a full frame">
       <IconRefresh /> Refresh
@@ -851,6 +1063,7 @@ export function Desktop({ agent, canWrite }: TabProps) {
         {!touchUI && monitorSelect}
         {!touchUI && qualityControl}
         {!touchUI && refreshControl}
+        {!touchUI && engineControls}
         {!viewOnly && (
           <>
             {!touchUI && casControl}
@@ -877,6 +1090,7 @@ export function Desktop({ agent, canWrite }: TabProps) {
             {monitorSelect}
             {qualityControl}
             {refreshControl}
+            {engineControls}
             {casControl}
           </Dropdown>
         )}
@@ -904,7 +1118,24 @@ export function Desktop({ agent, canWrite }: TabProps) {
           onMouseUp={onMouseButton('mouseup')}
           onWheel={onWheel}
           onDoubleClick={(e) => e.preventDefault()}
-          style={{ display: dims.w ? 'block' : 'none' }}
+          style={{ display: dims.w ? 'block' : 'none', opacity: transport === 'rtc' ? 0 : 1 }}
+        />
+        {/* The WebRTC engine. Laid over the canvas by layout(); it never takes
+            pointer events, so the canvas keeps receiving all input. */}
+        <video
+          ref={video}
+          autoPlay
+          playsInline
+          muted
+          onPlaying={onVideoPlaying}
+          aria-hidden="true"
+          style={{
+            position: 'absolute',
+            pointerEvents: 'none',
+            objectFit: 'fill',
+            background: '#000',
+            opacity: transport === 'rtc' ? 1 : 0,
+          }}
         />
         {/* The trackpad cursor. A finger has no pointer of its own, so the
             viewer draws the one the taps act on. */}
@@ -960,6 +1191,32 @@ export function Desktop({ agent, canWrite }: TabProps) {
             {status === 'closed' && 'Disconnected'}
             {status === 'error' && <span style={{ color: 'var(--danger)' }}>{detail || 'Error'}</span>}
             {status === 'idle' && 'Not connected'}
+          </div>
+        )}
+        {live && dims.w > 0 && (
+          <div
+            className="mono"
+            aria-hidden="true"
+            style={{
+              position: 'absolute',
+              top: 8,
+              right: 8,
+              zIndex: 2,
+              pointerEvents: 'none',
+              background: 'rgba(20, 24, 31, 0.7)',
+              color: '#e6e9ef',
+              padding: '4px 8px',
+              borderRadius: 'var(--radius-sm)',
+              fontSize: 11,
+              lineHeight: 1.45,
+              textAlign: 'right',
+            }}
+          >
+            <div>{transport === 'rtc' ? 'WebRTC P2P (UDP)' : 'WebSocket Relay'}</div>
+            <div>
+              {fps} fps · {rttMs === null ? '— ms' : `${rttMs} ms`} · {bps(kbps)}
+            </div>
+            <div>{mode === 'backstage' ? 'Backstage' : 'Console'}</div>
           </div>
         )}
         {fullscreen && (
