@@ -221,16 +221,24 @@ type ShellChunk struct {
 	EOF     bool   `json:"eof,omitempty"`
 }
 
+// Default script execution resource quotas.
+const (
+	DefaultScriptMaxMemoryMB     uint64 = 1024 // Default memory ceiling: 1024 MB (1 GB)
+	DefaultScriptCPULimitPercent uint32 = 80   // Default CPU rate hard cap: 80%
+)
+
 // ---- Scripts ----
 
 type ScriptRun struct {
-	RunID    string            `json:"run_id"`
-	Language string            `json:"language"` // powershell, cmd, bash, sh, python
-	Body     string            `json:"body"`
-	Args     []string          `json:"args,omitempty"`
-	Env      map[string]string `json:"env,omitempty"`
-	Timeout  int               `json:"timeout_sec"`
-	RunAs    string            `json:"run_as,omitempty"` // "" (system) or "user"
+	RunID           string            `json:"run_id"`
+	Language        string            `json:"language"` // powershell, cmd, bash, sh, python
+	Body            string            `json:"body"`
+	Args            []string          `json:"args,omitempty"`
+	Env             map[string]string `json:"env,omitempty"`
+	Timeout         int               `json:"timeout_sec"`
+	RunAs           string            `json:"run_as,omitempty"`            // "" (system) or "user"
+	MaxMemoryMB     uint64            `json:"max_memory_mb,omitempty"`     // 0 = default (1024 MB)
+	CPULimitPercent uint32            `json:"cpu_limit_percent,omitempty"` // 0 = default (80%)
 }
 
 type ScriptChunk struct {

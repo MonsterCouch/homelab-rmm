@@ -19,9 +19,11 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/shirou/gopsutil/v4/process"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/netscan"
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
+	"github.com/MonsterCouch/homelab-rmm/internal/supervisor"
 )
 
 type Agent struct {
@@ -41,6 +43,14 @@ type Agent struct {
 	baselines *baselineEngine
 	// wake is signalled when the config changes so tickers restart
 	wake chan struct{}
+
+	// Supervisor IPC integration (Milestone 6)
+	ipcClient         *supervisor.IPCClient
+	ipcMu             sync.Mutex
+	ipcPath           string
+	heartbeatInterval time.Duration
+	stopHeartbeat     chan struct{}
+	heartbeatDone     chan struct{}
 }
 
 // socket returns the live connection, or nil when the agent is offline. Every
@@ -76,6 +86,11 @@ func (a *Agent) Run(ctx context.Context) error {
 	// the socket comes back.
 	a.baselines.start(ctx)
 	a.startPortalPipe(ctx)
+
+	// Supervisor IPC integration (Milestone 6)
+	a.initSupervisorIPC(ctx)
+	defer a.closeSupervisorIPC()
+
 	backoff := 2 * time.Second
 	for {
 		err := a.session(ctx)
@@ -164,6 +179,10 @@ func (a *Agent) session(ctx context.Context) error {
 	a.applyConfig(welcome.Config)
 	ws.SetReadDeadline(time.Time{})
 	slog.Info("connected", "server", a.cfg.ServerURL, "agent_id", a.cfg.AgentID)
+
+	// Notify supervisor that TLS handshake, WS upgrade, and check-in succeeded (Milestone 6)
+	a.notifyHealthy()
+
 	// Catch-up is exactly one re-send of the cached last report per baseline,
 	// with its original timestamp and version; the start-up pass that follows
 	// supersedes it server-side (A14).
@@ -318,7 +337,7 @@ func (a *Agent) checkAutoUpdate(ctx context.Context) {
 			SHA256:  res.SHA256,
 			Version: res.Version,
 		}
-		if err := selfUpdate(ctx, a.cfg, uReq); err != nil {
+		if err := selfUpdate(ctx, a.cfg, uReq, a.IPCClient()); err != nil {
 			slog.Warn("agent auto-update failed", "err", err)
 		}
 	}
@@ -521,7 +540,7 @@ func (a *Agent) handle(ctx context.Context, env protocol.Envelope) {
 	case protocol.ReqAgentUpdate:
 		var in protocol.AgentUpdate
 		if err = json.Unmarshal(env.D, &in); err == nil {
-			err = selfUpdate(ctx, a.cfg, in)
+			err = selfUpdate(ctx, a.cfg, in, a.IPCClient())
 		}
 	case protocol.ReqDeviceIsolate:
 		var in protocol.DeviceIsolate
@@ -575,3 +594,186 @@ func (a *Agent) handle(ctx context.Context, env protocol.Envelope) {
 	}
 	c.reply(env.ID, out)
 }
+
+// detectSupervisorIPC detects if the worker was spawned under supervisor IPC.
+// Precedence: HOMELAB_RMM_IPC_PIPE, RMM_SUPERVISOR_PIPE (Windows Named Pipe)
+// then HOMELAB_RMM_IPC_SOCKET, RMM_SUPERVISOR_SOCKET (Linux Unix Domain Socket).
+func detectSupervisorIPC() (string, bool) {
+	if p := os.Getenv("HOMELAB_RMM_IPC_PIPE"); p != "" {
+		return p, true
+	}
+	if p := os.Getenv("RMM_SUPERVISOR_PIPE"); p != "" {
+		return p, true
+	}
+	if s := os.Getenv("HOMELAB_RMM_IPC_SOCKET"); s != "" {
+		return s, true
+	}
+	if s := os.Getenv("RMM_SUPERVISOR_SOCKET"); s != "" {
+		return s, true
+	}
+	return "", false
+}
+
+func (a *Agent) initSupervisorIPC(ctx context.Context) {
+	a.ipcMu.Lock()
+	client := a.ipcClient
+	a.ipcMu.Unlock()
+
+	if client == nil {
+		path, found := detectSupervisorIPC()
+		if !found {
+			slog.Debug("standalone mode: no supervisor IPC environment detected")
+			return
+		}
+
+		c, err := supervisor.ConnectIPC(path)
+		if err != nil {
+			slog.Warn("failed to connect to supervisor IPC, falling back to standalone mode",
+				"path", path, "err", err)
+			return
+		}
+		a.ipcMu.Lock()
+		a.ipcClient = c
+		a.ipcPath = path
+		a.ipcMu.Unlock()
+		slog.Info("connected to supervisor IPC", "path", path)
+	}
+
+	a.ipcMu.Lock()
+	if a.heartbeatInterval <= 0 {
+		a.heartbeatInterval = 5 * time.Second
+	}
+	if a.stopHeartbeat == nil {
+		a.stopHeartbeat = make(chan struct{})
+		a.heartbeatDone = make(chan struct{})
+		go a.heartbeatLoop(ctx)
+	}
+	a.ipcMu.Unlock()
+}
+
+func (a *Agent) heartbeatLoop(ctx context.Context) {
+	a.ipcMu.Lock()
+	interval := a.heartbeatInterval
+	stopCh := a.stopHeartbeat
+	doneCh := a.heartbeatDone
+	a.ipcMu.Unlock()
+
+	defer close(doneCh)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Emit immediate first heartbeat
+	a.sendHeartbeat()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			a.sendHeartbeat()
+		}
+	}
+}
+
+func (a *Agent) sendHeartbeat() {
+	a.ipcMu.Lock()
+	client := a.ipcClient
+	a.ipcMu.Unlock()
+
+	if client == nil {
+		return
+	}
+
+	msg := &supervisor.IPCMessage{
+		Type:     supervisor.MsgHeartbeat,
+		PID:      os.Getpid(),
+		RSSBytes: getProcessRSS(),
+	}
+
+	if err := client.Send(msg); err != nil {
+		slog.Debug("failed to emit heartbeat to supervisor", "err", err)
+	}
+}
+
+func (a *Agent) notifyHealthy() {
+	a.ipcMu.Lock()
+	client := a.ipcClient
+	a.ipcMu.Unlock()
+
+	if client == nil {
+		return
+	}
+
+	msg := &supervisor.IPCMessage{
+		Type:    supervisor.MsgNotifyHealthy,
+		PID:     os.Getpid(),
+		Version: Version,
+	}
+
+	if err := client.Send(msg); err != nil {
+		slog.Warn("failed to emit notify_healthy to supervisor", "err", err)
+	} else {
+		slog.Info("emitted notify_healthy to supervisor", "version", Version, "pid", os.Getpid())
+	}
+}
+
+func (a *Agent) closeSupervisorIPC() {
+	a.ipcMu.Lock()
+	client := a.ipcClient
+	stopCh := a.stopHeartbeat
+	doneCh := a.heartbeatDone
+	a.ipcClient = nil
+	a.stopHeartbeat = nil
+	a.heartbeatDone = nil
+	a.ipcMu.Unlock()
+
+	if stopCh != nil {
+		close(stopCh)
+	}
+	if doneCh != nil {
+		select {
+		case <-doneCh:
+		case <-time.After(1 * time.Second):
+		}
+	}
+	if client != nil {
+		_ = client.Close()
+	}
+}
+
+func getProcessRSS() uint64 {
+	p, err := process.NewProcess(int32(os.Getpid()))
+	if err == nil && p != nil {
+		if mi, err := p.MemoryInfo(); err == nil && mi != nil {
+			return mi.RSS
+		}
+	}
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.Sys
+}
+
+// SetIPCClient allows test fixtures to inject an in-memory or mock supervisor IPC client.
+func (a *Agent) SetIPCClient(c *supervisor.IPCClient) {
+	a.ipcMu.Lock()
+	defer a.ipcMu.Unlock()
+	a.ipcClient = c
+}
+
+// IPCClient exposes the active IPCClient for update staging flows.
+func (a *Agent) IPCClient() *supervisor.IPCClient {
+	a.ipcMu.Lock()
+	defer a.ipcMu.Unlock()
+	return a.ipcClient
+}
+
+// SetHeartbeatInterval configures the heartbeat emission frequency.
+func (a *Agent) SetHeartbeatInterval(d time.Duration) {
+	a.ipcMu.Lock()
+	defer a.ipcMu.Unlock()
+	a.heartbeatInterval = d
+}
+

@@ -19,15 +19,20 @@ import (
 
 	"github.com/MonsterCouch/homelab-rmm/internal/agent"
 	"github.com/MonsterCouch/homelab-rmm/internal/agent/desktop"
+	"github.com/MonsterCouch/homelab-rmm/internal/supervisor"
 	"github.com/MonsterCouch/homelab-rmm/internal/svc"
 )
+
+var errUsage = errors.New("usage requested")
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `Homelab RMM agent %s
 
 Usage:
-  rmm-agent run [--config-dir DIR]       run in the foreground (what the service runs)
-  rmm-agent install --server URL --token TOKEN [--fingerprint HEX] [--config-dir DIR]
+  rmm-agent supervisor [--config-dir DIR] [--base-dir DIR]
+                                         run the supervisor daemon (what the service runs)
+  rmm-agent run [--config-dir DIR]       run the worker in the foreground directly
+  rmm-agent install --server URL --token TOKEN [--fingerprint HEX] [--config-dir DIR] [--base-dir DIR]
                                          save config, register the service and start it
   rmm-agent uninstall | start | stop | restart | status   [--config-dir DIR]
   rmm-agent desktop-helper --server URL --token TOKEN [--fingerprint HEX] [--quality N]
@@ -42,7 +47,7 @@ Config: %s
 }
 
 func spec() svc.Spec {
-	args := []string{"run"}
+	args := []string{"supervisor"}
 	// The service manager starts the agent with an environment of its own:
 	// the RMM_AGENT_DIR the operator (or the install script) exported for
 	// `install` is not there to be inherited, and sudo's env_reset drops it
@@ -311,51 +316,227 @@ func startFailureHint(logPath, goos string) string {
 	return hint + ", and `journalctl -u " + agent.ServiceName + "` (or /var/log/" + agent.ServiceName + ".err without systemd)"
 }
 
+// parseAndRoute parses command line arguments and determines the target subcommand.
+// When invoked with no subcommand while running under a service manager (!isInteractive),
+// it automatically defaults to "supervisor" for backward and daemon compatibility.
+func parseAndRoute(args []string, isInteractive bool) (action string, subArgs []string, err error) {
+	if len(args) == 0 {
+		if !isInteractive {
+			return "supervisor", nil, nil
+		}
+		return "", nil, errUsage
+	}
+
+	first := args[0]
+	switch first {
+	case "version", "-v", "--version", "-version":
+		return "version", args[1:], nil
+	case "help", "-h", "--help", "-help":
+		return "help", args[1:], nil
+	case "supervisor", "run", "install", "uninstall", "start", "stop", "restart", "status", "desktop-helper":
+		return first, args[1:], nil
+	}
+
+	// Flag provided as first argument without explicit subcommand
+	if strings.HasPrefix(first, "-") {
+		if !isInteractive {
+			// Running as service with flags (e.g. ImagePath: "rmm-agent.exe --config-dir D:\c")
+			return "supervisor", args, nil
+		}
+		if first == "-server" || first == "--server" || first == "-token" || first == "--token" {
+			return "", nil, fmt.Errorf("error: '%s' provided without a subcommand. Did you mean 'rmm-agent install %s'?", first, strings.Join(args, " "))
+		}
+		return "", nil, fmt.Errorf("unknown flag or subcommand '%s'. Run 'rmm-agent help' for usage.", first)
+	}
+
+	return "", nil, fmt.Errorf("unknown command '%s'. Run 'rmm-agent help' for usage.", first)
+}
+
+// copyBinary copies src file to dst with executable permissions.
+func copyBinary(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
+// ensureSlotsPopulated initializes A/B slot directories and ensures the stable
+// slot binary exists, copying the running executable if necessary.
+func ensureSlotsPopulated(baseDir string) (*supervisor.SlotManager, error) {
+	slots, err := supervisor.InitSlots(baseDir)
+	if err != nil {
+		return nil, fmt.Errorf("init slots: %w", err)
+	}
+
+	slotABin := filepath.Join(slots.GetActiveSlotDir(), supervisor.BinaryExecutableName)
+	if _, err := os.Stat(slotABin); os.IsNotExist(err) {
+		exe, err := os.Executable()
+		if err == nil {
+			if absExe, err := filepath.Abs(exe); err == nil && absExe != slotABin {
+				if err := copyBinary(absExe, slotABin); err != nil {
+					slog.Warn("could not copy running binary to active slot", "src", absExe, "dst", slotABin, "err", err)
+				}
+			}
+		}
+	}
+	return slots, nil
+}
+
 func main() {
-	if len(os.Args) < 2 {
+	isInteractive := service.Interactive()
+	cmd, subArgs, err := parseAndRoute(os.Args[1:], isInteractive)
+	if err != nil {
+		if !errors.Is(err, errUsage) {
+			fmt.Fprintln(os.Stderr, err)
+		}
 		usage()
 		os.Exit(2)
 	}
-	cmd := os.Args[1]
+
 	switch cmd {
-	case "version", "-v", "--version":
+	case "version":
 		fmt.Println(agent.Version)
+	case "help":
+		usage()
+	case "supervisor":
+		runSupervisorCmd(subArgs)
 	case "run":
-		fs := flag.NewFlagSet("run", flag.ExitOnError)
-		dir := configDirFlag(fs)
-		fs.Parse(os.Args[2:])
-		// Before setupLogging: agent.log lives in this directory too.
-		applyConfigDir(*dir)
-		setupLogging(logService)
-		cfg, err := agent.LoadConfig()
-		if err != nil {
-			slog.Error(msgConfigLoadFailed, "path", agent.ConfigPath(), "err", err)
-			os.Exit(1)
-		}
-		// Not only at install time: a config edited by hand, or copied from
-		// another device, has to say so on every start of the service.
-		if cfg.Plaintext() {
-			slog.Warn("server URL is plaintext: the device key and everything this agent sends travel unencrypted",
-				"server_url", cfg.ServerURL, "fingerprint_ignored", cfg.Fingerprint != "")
-		}
-		err = svc.Run(spec(), func(ctx context.Context) error { return agent.New(cfg).Run(ctx) })
-		if err != nil {
-			slog.Error(msgAgentStopped, "err", err)
-			os.Exit(1)
-		}
+		runWorkerCmd(subArgs)
 	case "install":
-		fs := flag.NewFlagSet("install", flag.ExitOnError)
-		server := fs.String("server", "", "server URL, e.g. https://rmm.lan:8443")
-		token := fs.String("token", "", "enrollment token from the console")
-		fp := fs.String("fingerprint", "", "server certificate SHA-256 fingerprint (omit when the certificate is publicly trusted)")
-		fromMSI := fs.String("from-msi", "", "path to MSI containing embedded [HOMELAB_RMM_CONFIG] tag")
-		noService := fs.Bool("no-service", false, "write the config only; do not register a service")
-		dir := configDirFlag(fs)
-		fs.Parse(os.Args[2:])
-		applyConfigDir(*dir)
+		runInstallCmd(subArgs)
+	case "uninstall", "start", "stop", "restart", "status":
+		runControlCmd(cmd, subArgs)
+	case "desktop-helper":
+		runDesktopHelperCmd(subArgs)
+	}
+}
+
+func runSupervisorCmd(args []string) {
+	fs := flag.NewFlagSet("supervisor", flag.ExitOnError)
+	dir := configDirFlag(fs)
+	baseDir := fs.String("base-dir", "", "base directory for A/B slots (default: "+supervisor.DefaultInstallBaseDir+")")
+	pipeName := fs.String("pipe-name", "", "Windows named pipe override for supervisor IPC")
+	socketPath := fs.String("socket-path", "", "Linux unix domain socket override for supervisor IPC")
+	fs.Parse(args)
+
+	applyConfigDir(*dir)
+	setupLogging(logService)
+
+	bDir := *baseDir
+	if bDir == "" {
+		bDir = supervisor.DefaultInstallBaseDir
+	}
+
+	slots, err := ensureSlotsPopulated(bDir)
+	if err != nil {
+		slog.Error("failed to initialize slot manager", "base_dir", bDir, "err", err)
+		os.Exit(1)
+	}
+
+	supCfg := supervisor.SupervisorConfig{
+		BaseDir:    bDir,
+		Slots:      slots,
+		PipeName:   *pipeName,
+		SocketPath: *socketPath,
+	}
+
+	// Fallback to running executable if slot binary is missing
+	if _, err := os.Stat(slots.GetCurrentBinaryPath()); os.IsNotExist(err) {
+		if exe, err := os.Executable(); err == nil {
+			supCfg.WorkerCommand = exe
+		}
+	}
+
+	// Propagate --config-dir to worker if non-default
+	if cfgDir := configDir(); cfgDir != agent.DefaultConfigDir() {
+		supCfg.WorkerArgs = []string{"run", "--config-dir", cfgDir}
+	} else {
+		supCfg.WorkerArgs = []string{"run"}
+	}
+
+	slog.Info("supervisor starting", "version", agent.Version, "base_dir", bDir)
+	err = svc.Run(spec(), func(ctx context.Context) error {
+		sup, err := supervisor.NewSupervisor(supCfg)
+		if err != nil {
+			return fmt.Errorf("init supervisor: %w", err)
+		}
+		return sup.Start(ctx)
+	})
+	if err != nil {
+		slog.Error("supervisor stopped", "err", err)
+		os.Exit(1)
+	}
+}
+
+func runWorkerCmd(args []string) {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	dir := configDirFlag(fs)
+	fs.Parse(args)
+
+	applyConfigDir(*dir)
+	setupLogging(logService)
+
+	cfg, err := agent.LoadConfig()
+	if err != nil {
+		slog.Error(msgConfigLoadFailed, "path", agent.ConfigPath(), "err", err)
+		os.Exit(1)
+	}
+	if cfg.Plaintext() {
+		slog.Warn("server URL is plaintext: the device key and everything this agent sends travel unencrypted",
+			"server_url", cfg.ServerURL, "fingerprint_ignored", cfg.Fingerprint != "")
+	}
+	err = svc.Run(spec(), func(ctx context.Context) error { return agent.New(cfg).Run(ctx) })
+	if err != nil {
+		slog.Error(msgAgentStopped, "err", err)
+		os.Exit(1)
+	}
+}
+
+func runInstallCmd(args []string) {
+	fs := flag.NewFlagSet("install", flag.ExitOnError)
+	server := fs.String("server", "", "server URL, e.g. https://rmm.lan:8443")
+	token := fs.String("token", "", "enrollment token from the console")
+	fp := fs.String("fingerprint", "", "server certificate SHA-256 fingerprint (omit when the certificate is publicly trusted)")
+	fromMSI := fs.String("from-msi", "", "path to MSI containing embedded [HOMELAB_RMM_CONFIG] tag")
+	noService := fs.Bool("no-service", false, "write the config only; do not register a service")
+	baseDir := fs.String("base-dir", "", "base directory for A/B partitions (default: "+supervisor.DefaultInstallBaseDir+")")
+	dir := configDirFlag(fs)
+	fs.Parse(args)
+
+	applyConfigDir(*dir)
+	if *server == "" || *token == "" {
+		if *fromMSI != "" {
+			if tag, err := readTaggedConfig(*fromMSI); err == nil {
+				if *server == "" {
+					*server = tag.Server
+				}
+				if *token == "" {
+					*token = tag.Token
+				}
+				if *fp == "" {
+					*fp = tag.Fingerprint
+				}
+			}
+		}
 		if *server == "" || *token == "" {
-			if *fromMSI != "" {
-				if tag, err := readTaggedConfig(*fromMSI); err == nil {
+			if exe, err := os.Executable(); err == nil {
+				if tag, err := readTaggedConfig(exe); err == nil {
 					if *server == "" {
 						*server = tag.Server
 					}
@@ -367,99 +548,86 @@ func main() {
 					}
 				}
 			}
-			if *server == "" || *token == "" {
-				if exe, err := os.Executable(); err == nil {
-					if tag, err := readTaggedConfig(exe); err == nil {
-						if *server == "" {
-							*server = tag.Server
-						}
-						if *token == "" {
-							*token = tag.Token
-						}
-						if *fp == "" {
-							*fp = tag.Fingerprint
-						}
-					}
-				}
-			}
 		}
-		if *server == "" || *token == "" {
-			fmt.Fprintln(os.Stderr, "--server and --token are required (or a tagged MSI/installer)")
-			os.Exit(2)
-		}
-		cfg := &agent.Config{ServerURL: strings.TrimRight(*server, "/"), EnrollToken: *token, Fingerprint: strings.ToLower(strings.ReplaceAll(*fp, ":", ""))}
-		if old, err := agent.LoadConfig(); err == nil && old.ServerURL == cfg.ServerURL && old.Key != "" {
-			cfg.AgentID, cfg.Key = old.AgentID, old.Key // keep identity across reinstalls
-		}
-		if err := cfg.Save(); err != nil {
-			fmt.Fprintln(os.Stderr, "cannot write config:", err)
-			os.Exit(1)
-		}
-		fmt.Println("config written to", agent.ConfigPath())
-		// Warnings, not refusals: a loopback server without TLS and an agent
-		// run out of its own build tree are both normal while developing, and
-		// an install that could not be completed would only be worked around.
-		if w := cfg.PlaintextWarning(); w != "" {
+	}
+	if *server == "" || *token == "" {
+		fmt.Fprintln(os.Stderr, "--server and --token are required (or a tagged MSI/installer)")
+		os.Exit(2)
+	}
+	cfg := &agent.Config{ServerURL: strings.TrimRight(*server, "/"), EnrollToken: *token, Fingerprint: strings.ToLower(strings.ReplaceAll(*fp, ":", ""))}
+	if old, err := agent.LoadConfig(); err == nil && old.ServerURL == cfg.ServerURL && old.Key != "" {
+		cfg.AgentID, cfg.Key = old.AgentID, old.Key // keep identity across reinstalls
+	}
+	if err := cfg.Save(); err != nil {
+		fmt.Fprintln(os.Stderr, "cannot write config:", err)
+		os.Exit(1)
+	}
+	fmt.Println("config written to", agent.ConfigPath())
+
+	// Ensure A/B slot partition layout is initialized and populated
+	bDir := *baseDir
+	if bDir == "" {
+		bDir = supervisor.DefaultInstallBaseDir
+	}
+	if _, err := ensureSlotsPopulated(bDir); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: cannot initialize A/B partitions:", err)
+	}
+
+	if w := cfg.PlaintextWarning(); w != "" {
+		fmt.Fprintln(os.Stderr, w)
+	}
+	if *noService {
+		return
+	}
+	if exe, err := os.Executable(); err == nil {
+		if w := svc.ImagePathWarning(exe); w != "" {
 			fmt.Fprintln(os.Stderr, w)
 		}
-		if *noService {
-			return
-		}
-		if exe, err := os.Executable(); err == nil {
-			if w := svc.ImagePathWarning(exe); w != "" {
-				fmt.Fprintln(os.Stderr, w)
-			}
-		}
-		// Read the log's length before the service touches it, so the
-		// check below only ever reads what this start wrote.
-		logPath := agent.LogPath()
-		from := logSize(logPath)
-		if err := svc.Control(spec(), "install"); err != nil {
-			fmt.Fprintln(os.Stderr, "service install failed:", err)
-			os.Exit(1)
-		}
-		if err := confirmStarted(logPath, from, serviceStatus, startSettle, startTimeout); err != nil {
-			fmt.Fprintln(os.Stderr, "the service was registered but is not running:", err)
-			fmt.Fprintln(os.Stderr, startFailureHint(logPath, runtime.GOOS))
-			os.Exit(1)
-		}
-		fmt.Println("service installed and started")
-	case "uninstall", "start", "stop", "restart", "status":
-		fs := flag.NewFlagSet(cmd, flag.ExitOnError)
-		dir := configDirFlag(fs)
-		fs.Parse(os.Args[2:])
-		applyConfigDir(*dir)
-		if err := svc.Control(spec(), cmd); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		if cmd == "uninstall" {
-			fmt.Println("service removed; config left at", agent.ConfigPath())
-		}
-	case "desktop-helper":
-		// Its own log file: the service's belongs to the service (desk-04).
-		logPath := setupLogging(logHelper)
-		fs := flag.NewFlagSet("desktop-helper", flag.ExitOnError)
-		server := fs.String("server", "", "")
-		token := fs.String("token", "", "")
-		fp := fs.String("fingerprint", "", "")
-		quality := fs.Int("quality", 60, "")
-		fs.Parse(os.Args[2:])
-		// The launcher passes the one-time token in the environment so it
-		// never shows up in /proc/<pid>/cmdline or Process Explorer;
-		// --token stays as a developer override. Drop it from our own
-		// environment once read: nothing this process starts needs it.
-		if *token == "" {
-			*token = os.Getenv(desktop.TokenEnv)
-		}
-		os.Unsetenv(desktop.TokenEnv)
-		slog.Info("desktop helper starting", "server", *server, "quality", *quality, "log", logPath)
-		if err := desktop.Serve(context.Background(), *server, *token, *fp, *quality); err != nil {
-			slog.Error("desktop helper ended", "err", err)
-			os.Exit(1)
-		}
-	default:
-		usage()
-		os.Exit(2)
+	}
+	logPath := agent.LogPath()
+	from := logSize(logPath)
+	if err := svc.Control(spec(), "install"); err != nil {
+		fmt.Fprintln(os.Stderr, "service install failed:", err)
+		os.Exit(1)
+	}
+	if err := confirmStarted(logPath, from, serviceStatus, startSettle, startTimeout); err != nil {
+		fmt.Fprintln(os.Stderr, "the service was registered but is not running:", err)
+		fmt.Fprintln(os.Stderr, startFailureHint(logPath, runtime.GOOS))
+		os.Exit(1)
+	}
+	fmt.Println("service installed and started")
+}
+
+func runControlCmd(cmd string, args []string) {
+	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+	dir := configDirFlag(fs)
+	fs.Parse(args)
+	applyConfigDir(*dir)
+	if err := svc.Control(spec(), cmd); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if cmd == "uninstall" {
+		fmt.Println("service removed; config left at", agent.ConfigPath())
+	}
+}
+
+func runDesktopHelperCmd(args []string) {
+	logPath := setupLogging(logHelper)
+	fs := flag.NewFlagSet("desktop-helper", flag.ExitOnError)
+	server := fs.String("server", "", "")
+	token := fs.String("token", "", "")
+	fp := fs.String("fingerprint", "", "")
+	quality := fs.Int("quality", 60, "")
+	fs.Parse(args)
+
+	if *token == "" {
+		*token = os.Getenv(desktop.TokenEnv)
+	}
+	os.Unsetenv(desktop.TokenEnv)
+	slog.Info("desktop helper starting", "server", *server, "quality", *quality, "log", logPath)
+	if err := desktop.Serve(context.Background(), *server, *token, *fp, *quality); err != nil {
+		slog.Error("desktop helper ended", "err", err)
+		os.Exit(1)
 	}
 }

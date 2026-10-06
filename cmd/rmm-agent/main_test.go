@@ -24,7 +24,7 @@ func TestSpecPinsANonDefaultConfigDir(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(agent.EnvConfigDir, dir)
 	args := spec().Args
-	want := []string{"run", "--config-dir", dir}
+	want := []string{"supervisor", "--config-dir", dir}
 	if len(args) != len(want) {
 		t.Fatalf("args = %q, want %q", args, want)
 	}
@@ -37,8 +37,8 @@ func TestSpecPinsANonDefaultConfigDir(t *testing.T) {
 
 func TestSpecLeavesTheDefaultConfigDirImplicit(t *testing.T) {
 	t.Setenv(agent.EnvConfigDir, "")
-	if args := spec().Args; len(args) != 1 || args[0] != "run" {
-		t.Fatalf("args = %q, want [run]", args)
+	if args := spec().Args; len(args) != 1 || args[0] != "supervisor" {
+		t.Fatalf("args = %q, want [supervisor]", args)
 	}
 }
 
@@ -292,3 +292,123 @@ func TestStartFailureHintNamesWhereToLook(t *testing.T) {
 		t.Errorf("the Linux hint does not name the log and the journal: %q", unix)
 	}
 }
+
+func TestSpecDefaultSubcommandIsSupervisor(t *testing.T) {
+	t.Setenv(agent.EnvConfigDir, "")
+	args := spec().Args
+	if len(args) != 1 || args[0] != "supervisor" {
+		t.Fatalf("spec().Args = %v, want [supervisor]", args)
+	}
+}
+
+func TestParseAndRoute_Interactive(t *testing.T) {
+	// Empty args in interactive mode triggers usage error
+	_, _, err := parseAndRoute(nil, true)
+	if !errors.Is(err, errUsage) {
+		t.Fatalf("expected errUsage on empty interactive args, got: %v", err)
+	}
+
+	// Version flags
+	for _, f := range []string{"version", "-v", "--version", "-version"} {
+		cmd, _, err := parseAndRoute([]string{f}, true)
+		if err != nil || cmd != "version" {
+			t.Errorf("parseAndRoute(%q) = (%q, %v), want version", f, cmd, err)
+		}
+	}
+
+	// Help flags
+	for _, f := range []string{"help", "-h", "--help", "-help"} {
+		cmd, _, err := parseAndRoute([]string{f}, true)
+		if err != nil || cmd != "help" {
+			t.Errorf("parseAndRoute(%q) = (%q, %v), want help", f, cmd, err)
+		}
+	}
+
+	// Standard subcommands
+	for _, sub := range []string{"supervisor", "run", "install", "status", "uninstall", "desktop-helper"} {
+		cmd, subArgs, err := parseAndRoute([]string{sub, "--foo", "bar"}, true)
+		if err != nil || cmd != sub || len(subArgs) != 2 {
+			t.Errorf("parseAndRoute(%q) = (%q, %v, %v), want subcommand with args", sub, cmd, subArgs, err)
+		}
+	}
+
+	// Accidental install flags without subcommand
+	_, _, err = parseAndRoute([]string{"--server", "https://rmm.lan:8443"}, true)
+	if err == nil || !strings.Contains(err.Error(), "Did you mean 'rmm-agent install") {
+		t.Errorf("expected install hint error, got: %v", err)
+	}
+
+	// Unknown command
+	_, _, err = parseAndRoute([]string{"bogus"}, true)
+	if err == nil || !strings.Contains(err.Error(), "unknown command") {
+		t.Errorf("expected unknown command error, got: %v", err)
+	}
+}
+
+func TestParseAndRoute_ServiceManager(t *testing.T) {
+	// Non-interactive (service manager) with empty args defaults to supervisor
+	cmd, args, err := parseAndRoute(nil, false)
+	if err != nil || cmd != "supervisor" || len(args) != 0 {
+		t.Fatalf("parseAndRoute(nil, false) = (%q, %v, %v), want supervisor with nil args", cmd, args, err)
+	}
+
+	// Non-interactive with flags defaults to supervisor and retains flags
+	cmd, args, err = parseAndRoute([]string{"--config-dir", "/etc/homelab-rmm"}, false)
+	if err != nil || cmd != "supervisor" || len(args) != 2 {
+		t.Fatalf("parseAndRoute(flags, false) = (%q, %v, %v), want supervisor with preserved flags", cmd, args, err)
+	}
+
+	// Explicit run subcommand under service manager (backwards compatibility)
+	cmd, args, err = parseAndRoute([]string{"run"}, false)
+	if err != nil || cmd != "run" {
+		t.Fatalf("parseAndRoute([run], false) = (%q, %v), want run", cmd, err)
+	}
+}
+
+func TestEnsureSlotsPopulated(t *testing.T) {
+	baseDir := t.TempDir()
+	slots, err := ensureSlotsPopulated(baseDir)
+	if err != nil {
+		t.Fatalf("ensureSlotsPopulated failed: %v", err)
+	}
+	if slots == nil {
+		t.Fatal("expected non-nil SlotManager")
+	}
+
+	// Verify directories exist
+	if _, err := os.Stat(slots.GetActiveSlotDir()); err != nil {
+		t.Errorf("active slot dir does not exist: %v", err)
+	}
+	if _, err := os.Stat(slots.GetInactiveSlotDir()); err != nil {
+		t.Errorf("inactive slot dir does not exist: %v", err)
+	}
+
+	// Verify state file exists
+	if state := slots.GetState(); state.ActiveSlot != "slot_a" {
+		t.Errorf("initial active slot = %q, want slot_a", state.ActiveSlot)
+	}
+}
+
+func TestCopyBinary(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.bin")
+	dst := filepath.Join(dir, "sub", "dst.bin")
+
+	content := []byte("binary-test-payload-12345")
+	if err := os.WriteFile(src, content, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := copyBinary(src, dst); err != nil {
+		t.Fatalf("copyBinary failed: %v", err)
+	}
+
+	read, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read dst failed: %v", err)
+	}
+	if string(read) != string(content) {
+		t.Fatalf("got %q, want %q", read, content)
+	}
+}
+

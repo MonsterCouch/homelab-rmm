@@ -20,11 +20,16 @@ import (
 	"time"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
+	"github.com/MonsterCouch/homelab-rmm/internal/supervisor"
 )
 
 var (
 	cachedSelfSHA string
 	cachedSHAMu   sync.Mutex
+
+	// updateExitFunc and updateExitDelay allow deterministic unit testing of worker exit
+	updateExitFunc  = os.Exit
+	updateExitDelay = 500 * time.Millisecond
 )
 
 // currentBinarySHA256 calculates and caches the SHA256 of the running agent executable
@@ -57,32 +62,227 @@ func currentBinarySHA256() string {
 // sha256HexRE is a whole SHA-256 in hex and nothing else.
 var sha256HexRE = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 
-// selfUpdate downloads a new binary, verifies its hash and swaps it in next
-// to the running one. The service manager restarts the agent afterwards
-// (Windows: the service restarts on exit; systemd: Restart=always).
-func selfUpdate(ctx context.Context, cfg *Config, req protocol.AgentUpdate) error {
-	return doSelfUpdate(ctx, cfg, req.URL, req.SHA256)
+// selfUpdate downloads a new binary, verifies its hash, and stages it into the inactive slot.
+// If running under supervisor, it requests supervisor restart and gracefully exits.
+// If running in standalone mode, it adheres to the standalone fallback policy.
+func selfUpdate(ctx context.Context, cfg *Config, req protocol.AgentUpdate, ipc ...*supervisor.IPCClient) error {
+	var client *supervisor.IPCClient
+	if len(ipc) > 0 && ipc[0] != nil {
+		client = ipc[0]
+	}
+	return ApplyStagedUpdate(ctx, cfg, req, client)
 }
 
-func doSelfUpdate(ctx context.Context, cfg *Config, binURL, sum string) error {
-	// What this installs runs as SYSTEM/root on the next restart, so the hash
-	// is not optional: an empty one used to skip verification altogether and
-	// leave the download as the only thing standing - over a TLS config that
-	// pins nothing when the agent has no fingerprint.
-	if !sha256HexRE.MatchString(sum) {
+// ApplyStagedUpdate executes the full staged update workflow.
+func ApplyStagedUpdate(ctx context.Context, cfg *Config, req protocol.AgentUpdate, ipc *supervisor.IPCClient) error {
+	// Pre-flight check: SHA-256 must be exactly 64 hex characters
+	if !sha256HexRE.MatchString(req.SHA256) {
 		return errors.New("agent update: sha256 must be 64 hex characters")
 	}
-	if err := checkUpdateURL(cfg.ServerURL, binURL); err != nil {
+
+	// Pre-flight check: URL scheme and server trust boundaries
+	if err := checkUpdateURL(cfg.ServerURL, req.URL); err != nil {
 		return err
 	}
+
+	// Standalone fallback handling
+	if ipc == nil {
+		if os.Getenv("RMM_ALLOW_LEGACY_UPDATE") == "1" {
+			slog.Warn("supervisor IPC not available, falling back to legacy in-place update")
+			return doLegacySelfUpdate(ctx, cfg, req.URL, req.SHA256)
+		}
+		slog.Warn("self-update unavailable in standalone mode: supervisor IPC required",
+			"url", req.URL,
+			"version", req.Version,
+		)
+		return errors.New("self-update unavailable: agent is running in standalone mode without supervisor IPC")
+	}
+
+	// Step 1: Query supervisor for inactive slot path over IPC
+	resp, err := ipc.RoundTrip(&supervisor.IPCMessage{
+		Type: supervisor.MsgGetInactive,
+		PID:  os.Getpid(),
+	})
+	if err != nil {
+		return fmt.Errorf("query inactive slot from supervisor: %w", err)
+	}
+	if resp.Type != supervisor.MsgInactiveResp || resp.Path == "" {
+		return fmt.Errorf("unexpected supervisor response for inactive slot: type=%s, path=%s", resp.Type, resp.Path)
+	}
+
+	inactiveDir := resp.Path
+	slog.Info("staging agent update into inactive partition",
+		"slot", resp.Slot,
+		"dir", inactiveDir,
+		"target_version", req.Version,
+	)
+
+	// Step 2: Download binary payload with TLS pinning
+	client := &http.Client{
+		Timeout:   10 * time.Minute,
+		Transport: &http.Transport{TLSClientConfig: TLSConfig(cfg.Fingerprint)},
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, req.URL, nil)
+	if err != nil {
+		return fmt.Errorf("create download request: %w", err)
+	}
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("download update payload: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed: HTTP %s", httpResp.Status)
+	}
+
+	// Step 3: Stream payload into inactive slot with header sniffing and checksum verification
+	targetBin := filepath.Join(inactiveDir, supervisor.BinaryExecutableName)
+	if err := stageBinaryToSlot(httpResp.Body, inactiveDir, targetBin, req.SHA256); err != nil {
+		return fmt.Errorf("stage binary into %s: %w", inactiveDir, err)
+	}
+
+	slog.Info("agent update binary verified and staged",
+		"binary", targetBin,
+		"sha256", req.SHA256,
+		"version", req.Version,
+	)
+
+	// Step 4: Request supervisor restart and slot flip
+	restartMsg := &supervisor.IPCMessage{
+		Type:    supervisor.MsgRequestRestart,
+		PID:     os.Getpid(),
+		Reason:  "update_staged",
+		Version: req.Version,
+	}
+	if err := ipc.Send(restartMsg); err != nil {
+		return fmt.Errorf("send restart request to supervisor: %w", err)
+	}
+
+	// Step 5: Schedule graceful worker exit to allow server reply flush
+	scheduleWorkerExit(req.Version)
+
+	return nil
+}
+
+// stageBinaryToSlot streams binary payload from r into a temporary staging file in targetDir,
+// verifies PE/ELF binary header and SHA-256 digest, sets permissions, and atomically replaces targetBin.
+func stageBinaryToSlot(r io.Reader, targetDir, targetBin, expectedSHA string) error {
+	tmpFile, err := os.CreateTemp(targetDir, ".stage-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp staging file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	cleanedUp := false
+	defer func() {
+		if !cleanedUp {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	hasher := sha256.New()
+	tee := io.TeeReader(r, hasher)
+
+	// Read and validate the first 4 bytes for PE/ELF header magic
+	header := make([]byte, 4)
+	n, err := io.ReadFull(tee, header)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return fmt.Errorf("read binary header: %w", err)
+	}
+	if n < 2 {
+		return fmt.Errorf("staged binary too small (%d bytes)", n)
+	}
+	if err := supervisor.ValidateBinaryHeader(header[:n]); err != nil {
+		return fmt.Errorf("validate binary header: %w", err)
+	}
+
+	// Write header bytes to temp file
+	if _, err := tmpFile.Write(header[:n]); err != nil {
+		return fmt.Errorf("write binary header: %w", err)
+	}
+
+	// Stream remaining binary content
+	if _, err := io.Copy(tmpFile, tee); err != nil {
+		return fmt.Errorf("stream binary content: %w", err)
+	}
+
+	// Verify SHA-256 checksum
+	actualSHA := hex.EncodeToString(hasher.Sum(nil))
+	if !strings.EqualFold(actualSHA, expectedSHA) {
+		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedSHA, actualSHA)
+	}
+
+	if err := tmpFile.Sync(); err != nil {
+		return fmt.Errorf("sync staged binary: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close staged binary: %w", err)
+	}
+
+	if err := os.Chmod(tmpPath, 0755); err != nil {
+		return fmt.Errorf("chmod staged binary: %w", err)
+	}
+
+	if err := replaceBinaryAtomic(tmpPath, targetBin); err != nil {
+		return fmt.Errorf("replace staged binary: %w", err)
+	}
+
+	if err := supervisor.ValidateBinaryFile(targetBin); err != nil {
+		_ = os.Remove(targetBin)
+		return fmt.Errorf("validate staged binary file: %w", err)
+	}
+
+	cleanedUp = true
+	return nil
+}
+
+// replaceBinaryAtomic atomically replaces dst with src with retry backoff on Windows.
+func replaceBinaryAtomic(src, dst string) error {
+	var lastErr error
+	for i := 0; i < 5; i++ {
+		if err := os.Rename(src, dst); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	_ = os.Remove(dst)
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	return fmt.Errorf("replace binary %s -> %s: %w", src, dst, lastErr)
+}
+
+func scheduleWorkerExit(version string) {
+	go func() {
+		if updateExitDelay > 0 {
+			time.Sleep(updateExitDelay)
+		}
+		slog.Info("agent update staged successfully, worker exiting for supervisor promotion and restart",
+			"version", version,
+		)
+		updateExitFunc(0)
+	}()
+}
+
+// doSelfUpdate maintains compatibility for legacy callers and unit tests.
+func doSelfUpdate(ctx context.Context, cfg *Config, binURL, sum string) error {
+	req := protocol.AgentUpdate{
+		URL:    binURL,
+		SHA256: sum,
+	}
+	return ApplyStagedUpdate(ctx, cfg, req, nil)
+}
+
+// doLegacySelfUpdate implements the legacy in-place file swap for standalone fallback.
+func doLegacySelfUpdate(ctx context.Context, cfg *Config, binURL, sum string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	// EvalSymlinks returns ("", err) on failure, and swallowing that left exe
-	// empty: the binary was downloaded to a stray ".new" in whatever the
-	// service's working directory happens to be, and the swap then failed on
-	// a rename with no path in the message.
 	resolved, err := filepath.EvalSymlinks(exe)
 	if err != nil {
 		return fmt.Errorf("resolve %s: %w", exe, err)
@@ -118,11 +318,6 @@ func doSelfUpdate(ctx context.Context, cfg *Config, binURL, sum string) error {
 		return errors.New("checksum mismatch")
 	}
 	old := exe + ".old"
-	// A previous generation's image can still be mapped - on Windows the
-	// desktop helper runs from the same file and outlives a service restart -
-	// and Windows refuses to delete or overwrite a mapped executable. Ignoring
-	// that failure left the rename below to hit the same refusal and wedge
-	// every future update, so move aside to a name nothing can be holding.
 	if err := os.Remove(old); err != nil && !os.IsNotExist(err) {
 		old = fmt.Sprintf("%s.old.%d", exe, time.Now().UnixNano())
 	}
@@ -135,7 +330,7 @@ func doSelfUpdate(ctx context.Context, cfg *Config, binURL, sum string) error {
 		os.Remove(tmp)
 		return err
 	}
-	slog.Info("agent update applied successfully, restarting service", "exe", exe)
+	slog.Info("agent update applied successfully in legacy mode, restarting service", "exe", exe)
 	go func() {
 		time.Sleep(1 * time.Second)
 		if runtime.GOOS == "windows" {

@@ -90,6 +90,9 @@ func (r *scriptRunner) run(parent context.Context, req protocol.ScriptRun, emit 
 		delete(r.cancels, req.RunID)
 		r.mu.Unlock()
 		res.Duration = time.Since(start).Milliseconds()
+		if res.Error != "" {
+			res.Error = RedactSecrets(res.Error)
+		}
 	}()
 
 	dir, err := os.MkdirTemp("", scriptTempPrefix)
@@ -141,11 +144,9 @@ func (r *scriptRunner) run(parent context.Context, req protocol.ScriptRun, emit 
 		res.Error = err.Error()
 		return res
 	}
-	// On Windows this puts the interpreter and everything it spawns in a
-	// kill-on-close job, so a timeout or a cancel reaches a descendant whose
-	// parent already exited - the one that would otherwise hold the output
-	// writers open for ever. Elsewhere the process group already does that.
-	defer superviseCommand(cmd)()
+	// Enforce process sandboxing and resource quotas (Job Object on Windows,
+	// RLIMIT_AS / cgroups on Linux).
+	defer superviseSandboxedCommand(cmd, req.MaxMemoryMB, req.CPULimitPercent)()
 	waitErr := cmd.Wait()
 	outS.flush()
 	errS.flush()
@@ -174,6 +175,9 @@ func (r *scriptRunner) run(parent context.Context, req protocol.ScriptRun, emit 
 	default:
 		res.Error = waitErr.Error()
 	}
+	if res.Error != "" {
+		res.Error = RedactSecrets(res.Error)
+	}
 	return res
 }
 
@@ -194,14 +198,18 @@ type scriptStream struct {
 	b         strings.Builder
 	pending   []byte
 	truncated bool
+	redactor  *StreamRedactor
 }
 
 func newScriptStream(onLine func(string)) *scriptStream {
-	return &scriptStream{onLine: onLine, limit: maxCapture}
+	return &scriptStream{onLine: onLine, limit: maxCapture, redactor: NewStreamRedactor()}
 }
 
 func (s *scriptStream) Write(p []byte) (int, error) {
 	s.mu.Lock()
+	if s.redactor == nil {
+		s.redactor = NewStreamRedactor()
+	}
 	s.pending = append(s.pending, p...)
 	var lines []string
 	for {
@@ -209,13 +217,16 @@ func (s *scriptStream) Write(p []byte) (int, error) {
 		if i < 0 {
 			break
 		}
-		lines = append(lines, scriptDecodeOutput(bytes.TrimSuffix(s.pending[:i], []byte("\r")))+"\n")
+		raw := scriptDecodeOutput(bytes.TrimSuffix(s.pending[:i], []byte("\r")))
+		clean := s.redactor.RedactLine(raw) + "\n"
+		lines = append(lines, clean)
 		s.pending = s.pending[i+1:]
 	}
 	if len(s.pending) >= maxScriptLine {
 		// A line with no end in sight: hand over what there is instead of
 		// buffering it forever. No "\n" - the line has not ended.
-		lines = append(lines, scriptDecodeOutput(s.pending))
+		raw := scriptDecodeOutput(s.pending)
+		lines = append(lines, s.redactor.RedactLine(raw))
 		s.pending = nil
 	}
 	if len(s.pending) == 0 {
@@ -235,11 +246,18 @@ func (s *scriptStream) Write(p []byte) (int, error) {
 // interpreter has exited.
 func (s *scriptStream) flush() {
 	s.mu.Lock()
+	if s.redactor == nil {
+		s.redactor = NewStreamRedactor()
+	}
 	var line string
 	if len(s.pending) > 0 {
-		line = scriptDecodeOutput(bytes.TrimSuffix(s.pending, []byte("\r"))) + "\n"
+		raw := scriptDecodeOutput(bytes.TrimSuffix(s.pending, []byte("\r")))
+		line = s.redactor.RedactLine(raw) + "\n"
 		s.pending = nil
 		s.capture(line)
+	}
+	if s.redactor != nil {
+		s.redactor.Reset()
 	}
 	s.mu.Unlock()
 	if line != "" {
