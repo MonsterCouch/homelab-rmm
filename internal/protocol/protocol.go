@@ -19,6 +19,11 @@ type Envelope struct {
 	ID  string          `json:"id,omitempty"`
 	D   json.RawMessage `json:"d,omitempty"`
 	Err string          `json:"err,omitempty"`
+	// A carries the operator signatures that authorize a protected request
+	// (docs/plans/2026-10-06-phase3-signed-actions.md). Agents without a
+	// trust bundle ignore it; old agents never see it as anything but an
+	// unknown field.
+	A *ActionAuth `json:"a,omitempty"`
 }
 
 // Message types sent by the agent.
@@ -67,6 +72,7 @@ const (
 	ReqDeviceIsolate     = "device.isolate"     // firewall isolate or release endpoint
 	ReqNetworkScan       = "network.scan"       // agent-driven subnet probe
 	ReqSNMPPoll          = "snmp.poll"          // agent-driven SNMP query
+	ReqTrustUpdate       = "trust.update"       // replace the agent's trust bundle (signed by the current bundle's signers or a recovery key)
 )
 
 // TypeBaseline is sent by the agent after every evaluation pass (scheduled,
@@ -82,6 +88,11 @@ type Hello struct {
 	Arch            string `json:"arch"`
 	Version         string `json:"version"`
 	ProtocolVersion int    `json:"protocol_version"`
+	// TrustEpoch and TrustHash identify the trust bundle the agent holds
+	// (zero / empty: none yet). The server replays the bundles the agent
+	// is missing as trust.update requests after the welcome.
+	TrustEpoch int64  `json:"trust_epoch,omitempty"`
+	TrustHash  string `json:"trust_hash,omitempty"`
 }
 
 // AgentConfig is pushed by the server after hello and whenever settings change.
@@ -94,6 +105,10 @@ type AgentConfig struct {
 	// agent evaluates them on their own interval, offline too, and reports
 	// with TypeBaseline. An empty list clears every assignment.
 	Baselines []BaselineSpec `json:"baselines,omitempty"`
+	// BaselineAuth holds each spec's standing approval, keyed by the spec's
+	// ID in decimal. An agent holding a trust bundle keeps only the specs
+	// whose approval verifies (in enforce mode; audit keeps and reports).
+	BaselineAuth map[string]*ActionAuth `json:"baseline_auth,omitempty"`
 }
 
 // Inventory is the full description of a device.
@@ -434,10 +449,10 @@ type DesktopStartResult struct {
 // WebRTCSignalingMessage encapsulates JSON signaling messages exchanged between
 // the browser viewer and the agent desktop helper via the server WebSocket bridge.
 type WebRTCSignalingMessage struct {
-	Type       string          `json:"t"`                  // "webrtc_offer", "webrtc_answer", "webrtc_candidate", "webrtc_config", "webrtc_active", "fallback_tiles"
-	SDP        string          `json:"sdp,omitempty"`       // For offer and answer
-	Candidate  json.RawMessage `json:"candidate,omitempty"` // For trickle ICE candidate
-	Reason     string          `json:"reason,omitempty"`    // For fallback notification
+	Type       string          `json:"t"`                     // "webrtc_offer", "webrtc_answer", "webrtc_candidate", "webrtc_config", "webrtc_active", "fallback_tiles"
+	SDP        string          `json:"sdp,omitempty"`         // For offer and answer
+	Candidate  json.RawMessage `json:"candidate,omitempty"`   // For trickle ICE candidate
+	Reason     string          `json:"reason,omitempty"`      // For fallback notification
 	ICEServers json.RawMessage `json:"ice_servers,omitempty"` // For webrtc_config
 }
 
@@ -572,3 +587,48 @@ func Must(v any) json.RawMessage {
 	}
 	return b
 }
+
+// ---- Action authorization (Phase 3) ----
+//
+// See internal/actionauth for the verification rules and
+// docs/plans/2026-10-06-phase3-signed-actions.md for the design. Every
+// binary field is unpadded base64url.
+
+// Assertion is one WebAuthn assertion used as a signature: the authenticator
+// signed authenticatorData || SHA-256(clientDataJSON), and clientDataJSON's
+// challenge is SHA-256 of the signed document.
+type Assertion struct {
+	Cred string `json:"cred"` // credential ID
+	AD   string `json:"ad"`   // authenticatorData
+	CD   string `json:"cd"`   // clientDataJSON
+	Sig  string `json:"sig"`  // signature
+}
+
+// ActionAuth is a signed manifest and its detached signatures. M is the
+// exact manifest bytes; nobody re-serializes them.
+type ActionAuth struct {
+	M string      `json:"m"`
+	S []Assertion `json:"s"`
+}
+
+// RecoverySig is an Ed25519 signature by an offline recovery key over the
+// exact bundle bytes.
+type RecoverySig struct {
+	ID  string `json:"id"`
+	Sig string `json:"sig"`
+}
+
+// TrustUpdate replaces the agent's trust bundle. Bundle is the exact bundle
+// bytes; S are WebAuthn assertions by signers of the agent's CURRENT bundle,
+// R are recovery-key signatures.
+type TrustUpdate struct {
+	Bundle string        `json:"bundle"`
+	S      []Assertion   `json:"s,omitempty"`
+	R      []RecoverySig `json:"r,omitempty"`
+}
+
+// Security events are TypeEvent frames with Event.Kind "security". Fields:
+// "op" (the request type), "mode" (audit | enforce), "executed" ("true" or
+// "false"), "reason" (why verification failed, or what changed) and
+// "manifest" (the manifest ID, when one was presented).
+const EventKindSecurity = "security"

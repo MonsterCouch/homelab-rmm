@@ -3,8 +3,9 @@ import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { Button } from '../../components/ui';
 import { IconClipboard, IconCopy, IconRefresh, IconStop } from '../../components/Icons';
+import { GRANT_OPS, ensureGrant } from '../../lib/grants';
 import { host } from '../../lib/host';
-import { useToast } from '../../state/toast';
+import { errMsg, useToast } from '../../state/toast';
 import type { TabProps } from './DeviceDetail';
 import { copyText, readClipboard } from './clipboard';
 import { KeyBar, KeyButton } from './KeyBar';
@@ -122,6 +123,57 @@ export function Terminal({ agent }: TabProps) {
     }
   }, []);
 
+  // Bumped by every connect and disconnect: a signing dialog the operator
+  // answers late must not open a socket they have since abandoned.
+  const attempt = useRef(0);
+
+  const open = useCallback(
+    (t: XTerm) => {
+      const s = new WebSocket(wsURL(`/ws/shell/${encodeURIComponent(agent.id)}`));
+      ws.current = s;
+      s.onopen = () => {
+        fit.current?.fit();
+        send({ t: 'open', shell, cols: t.cols, rows: t.rows });
+      };
+      s.onmessage = (e: MessageEvent<string>) => {
+        let m: ShellMsg;
+        try {
+          m = JSON.parse(e.data) as ShellMsg;
+        } catch {
+          return;
+        }
+        switch (m.t) {
+          case 'opened':
+            setStatus('connected');
+            t.focus();
+            break;
+          case 'out':
+            if (m.data) t.write(m.data);
+            break;
+          case 'closed':
+            setStatus((st) => (st === 'error' ? st : 'closed'));
+            t.write('\r\n\x1b[90m[session closed]\x1b[0m\r\n');
+            break;
+          case 'error':
+            setStatus('error');
+            setDetail(m.message ?? 'unknown error');
+            t.write(`\r\n\x1b[31m[error] ${m.message ?? ''}\x1b[0m\r\n`);
+            break;
+        }
+      };
+      s.onerror = () => {
+        setStatus((st) => (st === 'connected' ? 'closed' : 'error'));
+        setDetail((d) => d || 'connection failed (is the device online?)');
+      };
+      s.onclose = (ev) => {
+        if (ws.current === s) ws.current = null;
+        setStatus((st) => (st === 'error' ? st : 'closed'));
+        if (ev.code !== 1000 && ev.code !== 1005 && !ev.wasClean) setDetail((d) => d || `socket closed (${ev.code})`);
+      };
+    },
+    [agent.id, shell, send],
+  );
+
   const connect = useCallback(() => {
     const t = term.current;
     if (!t) return;
@@ -129,48 +181,21 @@ export function Terminal({ agent }: TabProps) {
     setStatus('connecting');
     setDetail('');
     t.reset();
-    const s = new WebSocket(wsURL(`/ws/shell/${encodeURIComponent(agent.id)}`));
-    ws.current = s;
-    s.onopen = () => {
-      fit.current?.fit();
-      send({ t: 'open', shell, cols: t.cols, rows: t.rows });
-    };
-    s.onmessage = (e: MessageEvent<string>) => {
-      let m: ShellMsg;
-      try {
-        m = JSON.parse(e.data) as ShellMsg;
-      } catch {
-        return;
-      }
-      switch (m.t) {
-        case 'opened':
-          setStatus('connected');
-          t.focus();
-          break;
-        case 'out':
-          if (m.data) t.write(m.data);
-          break;
-        case 'closed':
-          setStatus((st) => (st === 'error' ? st : 'closed'));
-          t.write('\r\n\x1b[90m[session closed]\x1b[0m\r\n');
-          break;
-        case 'error':
-          setStatus('error');
-          setDetail(m.message ?? 'unknown error');
-          t.write(`\r\n\x1b[31m[error] ${m.message ?? ''}\x1b[0m\r\n`);
-          break;
-      }
-    };
-    s.onerror = () => {
-      setStatus((st) => (st === 'connected' ? 'closed' : 'error'));
-      setDetail((d) => d || 'connection failed (is the device online?)');
-    };
-    s.onclose = (ev) => {
-      if (ws.current === s) ws.current = null;
-      setStatus((st) => (st === 'error' ? st : 'closed'));
-      if (ev.code !== 1000 && ev.code !== 1005 && !ev.wasClean) setDetail((d) => d || `socket closed (${ev.code})`);
-    };
-  }, [agent.id, shell, send]);
+    const n = ++attempt.current;
+    // Phase 3: a shell needs a signed grant first (a no-op when the
+    // organization has no trust bundle, or the grant is still live).
+    ensureGrant(agent.id, GRANT_OPS.shell).then(
+      () => {
+        if (n === attempt.current && term.current === t) open(t);
+      },
+      (err: unknown) => {
+        if (n !== attempt.current) return;
+        setStatus('error');
+        setDetail(errMsg(err));
+        t.write(`\r\n\x1b[31m[${errMsg(err)}]\x1b[0m\r\n`);
+      },
+    );
+  }, [agent.id, open]);
 
   // create the terminal once
   useEffect(() => {
@@ -277,8 +302,10 @@ export function Terminal({ agent }: TabProps) {
   useEffect(() => host.onPaste((text) => text && term.current?.paste(text)), []);
 
   const disconnect = () => {
+    attempt.current++; // also cancels a connect that is still waiting for a signature
     send({ t: 'close' });
     ws.current?.close();
+    if (!ws.current) setStatus('closed');
   };
 
   const copySel = async () => {

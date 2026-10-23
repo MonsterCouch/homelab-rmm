@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { api, setUnauthorizedHandler } from '../api/client';
 import type { User } from '../api/types';
+import { forgetGrants } from '../lib/grants';
 
 interface AuthCtx {
   /** undefined while the initial /api/auth/state request is in flight */
@@ -52,6 +53,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       await api.logout();
     } finally {
+      // signed grants belong to the operator who signed them
+      forgetGrants();
       setUser(null);
     }
   }, []);

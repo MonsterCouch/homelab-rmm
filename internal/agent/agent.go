@@ -41,6 +41,8 @@ type Agent struct {
 	// baselines is the desired-state engine: its own goroutine, its own
 	// on-disk state, running whether or not there is a server to talk to.
 	baselines *baselineEngine
+	// trust is the pinned trust bundle and nonce store (Phase 3); see trust.go.
+	trust *trustState
 	// wake is signalled when the config changes so tickers restart
 	wake chan struct{}
 
@@ -73,6 +75,7 @@ func New(cfg *Config) *Agent {
 	a.shells = newShellManager()
 	a.runs = newScriptRunner()
 	a.baselines = newBaselineEngine(a)
+	a.trust = loadTrust()
 	a.remote = protocol.AgentConfig{MetricsIntervalSec: 30, InventoryIntervalSec: 3600, PatchScanIntervalSec: 6 * 3600}
 	return a
 }
@@ -116,10 +119,14 @@ func (a *Agent) Run(ctx context.Context) error {
 
 func (a *Agent) hello() protocol.Hello {
 	host, _ := os.Hostname()
-	return protocol.Hello{
+	h := protocol.Hello{
 		AgentID: a.cfg.AgentID, Hostname: host, OS: runtime.GOOS, Platform: platformName(),
 		Arch: runtime.GOARCH, Version: Version, ProtocolVersion: protocol.Version,
 	}
+	if a.trust != nil {
+		h.TrustEpoch, h.TrustHash = a.trust.epochHash()
+	}
+	return h
 }
 
 func (a *Agent) session(ctx context.Context) error {
@@ -161,9 +168,9 @@ func (a *Agent) session(ctx context.Context) error {
 		return errors.New("server refused: " + env.Err)
 	}
 	var welcome struct {
-		AgentID  string               `json:"agent_id"`
-		AgentKey string               `json:"agent_key"`
-		Config   protocol.AgentConfig `json:"config"`
+		AgentID  string          `json:"agent_id"`
+		AgentKey string          `json:"agent_key"`
+		Config   json.RawMessage `json:"config"`
 	}
 	if err := json.Unmarshal(env.D, &welcome); err != nil {
 		return err
@@ -176,7 +183,7 @@ func (a *Agent) session(ctx context.Context) error {
 			slog.Info("enrolled", "agent_id", welcome.AgentID)
 		}
 	}
-	a.applyConfig(welcome.Config)
+	a.applyConfigRaw(welcome.Config)
 	ws.SetReadDeadline(time.Time{})
 	slog.Info("connected", "server", a.cfg.ServerURL, "agent_id", a.cfg.AgentID)
 
@@ -212,7 +219,24 @@ func (a *Agent) session(ctx context.Context) error {
 	}
 }
 
-func (a *Agent) applyConfig(cfg protocol.AgentConfig) {
+// applyConfigRaw applies a pushed config from its JSON, keeping each baseline
+// spec's bytes as received so their standing approvals can be checked.
+func (a *Agent) applyConfigRaw(data json.RawMessage) {
+	if len(data) == 0 {
+		a.applyConfig(protocol.AgentConfig{}, nil, nil)
+		return
+	}
+	cfg, raws, auth, err := splitConfig(data)
+	if err != nil {
+		slog.Warn("agent config ignored", "err", err)
+		return
+	}
+	specs, rm, am := a.filterSpecs(cfg, raws, auth)
+	cfg.Baselines = specs
+	a.applyConfig(cfg, rm, am)
+}
+
+func (a *Agent) applyConfig(cfg protocol.AgentConfig, raws map[int64]json.RawMessage, auths map[int64]*protocol.ActionAuth) {
 	if cfg.MetricsIntervalSec < 5 {
 		cfg.MetricsIntervalSec = 30
 	}
@@ -225,7 +249,7 @@ func (a *Agent) applyConfig(cfg protocol.AgentConfig) {
 	// The pushed set is always complete: a baseline that is missing here was
 	// unassigned, disabled or deleted, and the engine stops it at once (A10).
 	if a.baselines != nil {
-		a.baselines.setSpecs(cfg.Baselines)
+		a.baselines.setSpecsApproved(cfg.Baselines, raws, auths)
 	}
 	select {
 	case a.wake <- struct{}{}:
@@ -368,15 +392,18 @@ func (a *Agent) dispatch(ctx context.Context, env protocol.Envelope) {
 	if c == nil {
 		return
 	}
+	// Authorization comes first, ahead of the fast path below: agent.config
+	// and shell input are handled there and must not skip the gate.
+	env, ok := a.authorize(c, env)
+	if !ok {
+		return
+	}
 	switch env.T {
 	case protocol.ReqPing:
 		c.send(protocol.Envelope{T: protocol.TypePong, ID: env.ID})
 		return
 	case protocol.ReqAgentConfig:
-		var cfg protocol.AgentConfig
-		if json.Unmarshal(env.D, &cfg) == nil {
-			a.applyConfig(cfg)
-		}
+		a.applyConfigRaw(env.D)
 		return
 	case protocol.ReqShellInput:
 		var in protocol.ShellInput
@@ -542,6 +569,8 @@ func (a *Agent) handle(ctx context.Context, env protocol.Envelope) {
 		if err = json.Unmarshal(env.D, &in); err == nil {
 			err = selfUpdate(ctx, a.cfg, in, a.IPCClient())
 		}
+	case protocol.ReqTrustUpdate:
+		out, err = a.trustUpdate(env)
 	case protocol.ReqDeviceIsolate:
 		var in protocol.DeviceIsolate
 		if err = json.Unmarshal(env.D, &in); err == nil {
@@ -776,4 +805,3 @@ func (a *Agent) SetHeartbeatInterval(d time.Duration) {
 	defer a.ipcMu.Unlock()
 	a.heartbeatInterval = d
 }
-

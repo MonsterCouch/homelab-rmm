@@ -295,18 +295,32 @@ func (s *Server) handleDispatchAgentUpdate(w http.ResponseWriter, r *http.Reques
 		Version: Version,
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-
-	if err := s.hub.Request(ctx, id, protocol.ReqAgentUpdate, req, nil); err != nil {
-		fail(w, fmt.Errorf("failed to dispatch update to agent: %w", err))
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"message": fmt.Sprintf("Update command sent to agent %s (%s)", a.DisplayName, Version),
+	// agent.update replaces the agent's own code: high-risk, and the signed
+	// payload carries the binary's SHA-256, which the agent checks after the
+	// download, so a server cannot swap the binary under an operator's signature.
+	s.runSigned(w, r, signedAction{
+		Org: a.OrgID, Op: protocol.ReqAgentUpdate, Targets: []string{id}, Payload: req,
+		Summary: fmt.Sprintf("Update the agent on %s to %s (binary SHA-256 %s)", agentLabel(a), Version, clip(serverSHA, 16)),
+		Run: func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth) {
+			ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+			defer cancel()
+			if err := s.hub.RequestA(ctx, id, protocol.ReqAgentUpdate, req, nil, auth); err != nil {
+				fail(w, fmt.Errorf("failed to dispatch update to agent: %w", err))
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":      true,
+				"message": fmt.Sprintf("Update command sent to agent %s (%s)", a.DisplayName, Version),
+			})
+		},
 	})
+}
+
+func skippedSignedNote(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("; %d device(s) in organizations that sign actions were skipped and must be updated one at a time", n)
 }
 
 // handleDispatchAllAgentsUpdate pushes ReqAgentUpdate to all online agents
@@ -317,9 +331,16 @@ func (s *Server) handleDispatchAllAgentsUpdate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	count := 0
+	count, skippedSigned := 0, 0
 	for _, a := range agents {
 		if !s.hub.IsOnline(a.ID) {
+			continue
+		}
+		// A signed update is one manifest per organization, operating system
+		// and architecture; this fleet-wide push cannot carry them. Devices
+		// of organizations that sign actions are updated one at a time.
+		if s.activeBundle(a.OrgID) != nil {
+			skippedSigned++
 			continue
 		}
 		fam := agentOSFamily(a)
@@ -347,8 +368,9 @@ func (s *Server) handleDispatchAllAgentsUpdate(w http.ResponseWriter, r *http.Re
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":            true,
-		"dispatched_to": count,
-		"message":       fmt.Sprintf("Dispatched update command to %d online agent(s)", count),
+		"ok":             true,
+		"dispatched_to":  count,
+		"skipped_signed": skippedSigned,
+		"message":        fmt.Sprintf("Dispatched update command to %d online agent(s)%s", count, skippedSignedNote(skippedSigned)),
 	})
 }

@@ -93,6 +93,7 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	s.db.SetSetting("public_url", in.PublicURL)
 	s.db.SetSettingJSON("smtp", in.SMTP)
 	in.AgentDefaults.Baselines = nil // never stored in settings; see loadSettings
+	in.AgentDefaults.BaselineAuth = nil
 	s.db.SetSettingJSON("agent_defaults", in.AgentDefaults)
 	s.db.SetSettingJSON("retention", in.Retention)
 	// The audit log is the one place that answers "who changed what", and a

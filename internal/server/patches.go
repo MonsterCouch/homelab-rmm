@@ -266,16 +266,34 @@ func (s *Server) patchScanLocked(agentID string) error {
 }
 
 // patchInstall installs the given ids (nil = every approved patch) and records the outcome.
-func (s *Server) patchInstall(agentID string, ids []string, reboot bool, by string) (*protocol.UpdatesInstallResult, error) {
+func (s *Server) patchInstall(agentID string, ids []string, reboot bool, by string, auth *protocol.ActionAuth) (*protocol.UpdatesInstallResult, error) {
 	release, ok := s.claimPatchJob(agentID)
 	if !ok {
 		return nil, errPatchBusy
 	}
 	defer release()
-	return s.patchInstallLocked(agentID, ids, reboot, by)
+	return s.patchInstallLocked(agentID, ids, reboot, by, auth)
 }
 
-func (s *Server) patchInstallLocked(agentID string, ids []string, reboot bool, by string) (*protocol.UpdatesInstallResult, error) {
+// installablePatchIDs are the ids an "install everything" request will send:
+// what is available or already approved and installable by the agent.
+func (s *Server) installablePatchIDs(agentID string) []string {
+	rows, err := s.db.Query(`SELECT patch_id FROM patches WHERE agent_id = ? AND status IN ('available','approved')`+patchSourceInstallable+` ORDER BY patch_id`, agentID)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func (s *Server) patchInstallLocked(agentID string, ids []string, reboot bool, by string, auth *protocol.ActionAuth) (*protocol.UpdatesInstallResult, error) {
 	if ids == nil {
 		// Only what the agent can actually install: a winget row approved by
 		// hand would otherwise ride along in the batch and come back failed.
@@ -300,7 +318,7 @@ func (s *Server) patchInstallLocked(agentID string, ids []string, reboot bool, b
 	ctx, cancel := context.WithTimeout(s.jobContext(), 3*time.Hour)
 	defer cancel()
 	var res protocol.UpdatesInstallResult
-	err := s.hub.Request(ctx, agentID, protocol.ReqUpdatesInstall, protocol.UpdatesInstall{IDs: ids, Reboot: reboot}, &res)
+	err := s.hub.RequestA(ctx, agentID, protocol.ReqUpdatesInstall, protocol.UpdatesInstall{IDs: ids, Reboot: reboot}, &res, auth)
 	ts := now()
 	if err != nil {
 		for _, id := range ids {
@@ -362,14 +380,22 @@ func (s *Server) patchInstallPolicy(agentID string, p *PatchPolicy) {
 	case "security":
 		s.db.Exec(`UPDATE patches SET status='approved' WHERE agent_id=? AND status='available' AND (severity IN ('Critical','Important') OR categories LIKE '%Security%' OR source IN ('apt','dnf','pacman'))`, agentID)
 	}
-	res, err := s.patchInstallLocked(agentID, nil, p.Reboot == "if_required", "policy:"+p.Name)
+	// The policy runs with nobody present: its standing approvals (install,
+	// and the reboot after it) vouch for these requests, while they still
+	// match the policy as it is now.
+	instUnit, rebootU := policyUnits(p)
+	res, err := s.patchInstallLocked(agentID, nil, p.Reboot == "if_required", "policy:"+p.Name, s.standingAuthForUnit(agentID, instUnit, true))
 	if err != nil {
 		return
 	}
 	if p.Reboot == "always" && (len(res.Installed) > 0) {
 		ctx, cancel := context.WithTimeout(context.Background(), quickTimeout)
 		defer cancel()
-		s.hub.Request(ctx, agentID, protocol.ReqPower, protocol.Power{Action: "reboot", Delay: 60, Message: "Rebooting after patch installation (RMM policy " + p.Name + ")"}, nil)
+		var rebootAuth *protocol.ActionAuth
+		if rebootU != nil {
+			rebootAuth = s.standingAuthForUnit(agentID, *rebootU, true)
+		}
+		s.hub.RequestA(ctx, agentID, protocol.ReqPower, protocol.Power{Action: "reboot", Delay: 60, Message: "Rebooting after patch installation (RMM policy " + p.Name + ")"}, nil, rebootAuth)
 	}
 }
 
@@ -452,10 +478,7 @@ func (s *Server) handlePatchInstall(w http.ResponseWriter, r *http.Request) {
 		Reboot bool     `json:"reboot_if_required"`
 	}
 	readJSON(r, &in)
-	if in.All {
-		s.db.Exec(`UPDATE patches SET status='approved' WHERE agent_id=? AND status='available'`+patchSourceInstallable, id)
-		in.IDs = nil
-	} else if len(in.IDs) == 0 {
+	if !in.All && len(in.IDs) == 0 {
 		writeErr(w, 400, "ids required (or all=true)")
 		return
 	}
@@ -463,19 +486,40 @@ func (s *Server) handlePatchInstall(w http.ResponseWriter, r *http.Request) {
 		fail(w, ErrAgentOffline)
 		return
 	}
-	release, ok := s.claimPatchJob(id)
-	if !ok {
-		writeErr(w, http.StatusConflict, errPatchBusy.Error())
+	// What will be sent is settled now, because a signature covers it: "all"
+	// becomes the concrete list of what is installable at this moment.
+	ids := in.IDs
+	if in.All {
+		ids = s.installablePatchIDs(id)
+	}
+	run := func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth) {
+		if in.All {
+			s.db.Exec(`UPDATE patches SET status='approved' WHERE agent_id=? AND status='available'`+patchSourceInstallable, id)
+		}
+		release, ok := s.claimPatchJob(id)
+		if !ok {
+			writeErr(w, http.StatusConflict, errPatchBusy.Error())
+			return
+		}
+		s.audit(r, "patch.install.request", id, in)
+		// long-running: run in the background and let the UI follow via events
+		by, reboot := actor(r), in.Reboot
+		s.goJob(func() {
+			defer release()
+			s.patchInstallLocked(id, ids, reboot, by, auth)
+		})
+		writeJSON(w, 202, map[string]any{"ok": true})
+	}
+	if len(ids) == 0 {
+		run(w, r, nil) // nothing to install: nothing is sent
 		return
 	}
-	s.audit(r, "patch.install.request", id, in)
-	// long-running: run in the background and let the UI follow via events
-	by, ids, reboot := actor(r), in.IDs, in.Reboot
-	s.goJob(func() {
-		defer release()
-		s.patchInstallLocked(id, ids, reboot, by)
+	a, _ := s.db.GetAgent(id)
+	s.runSigned(w, r, signedAction{
+		Org: a.OrgID, Op: protocol.ReqUpdatesInstall, Targets: []string{id}, Payload: protocol.UpdatesInstall{IDs: ids, Reboot: in.Reboot},
+		Summary: fmt.Sprintf("Install %d update(s) on %s%s", len(ids), agentLabel(a), map[bool]string{true: ", rebooting if required", false: ""}[in.Reboot]),
+		Run:     run,
 	})
-	writeJSON(w, 202, map[string]any{"ok": true})
 }
 
 // patchRef is one item of a status change. Both spellings of the two keys are

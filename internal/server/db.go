@@ -595,6 +595,73 @@ CREATE INDEX IF NOT EXISTS idx_tickets_internal ON tickets(is_internal);
 UPDATE users SET role = 'poc' WHERE ticket_role = 'poc' AND role != 'admin';
 UPDATE users SET ticket_role = '';
 `,
+	// 13: Phase 3 signed actions. Security keys (WebAuthn credentials) and
+	// the per-organization trust bundle history. public_key is SPKI DER, the
+	// form the browser's getPublicKey() returns, so no CBOR is stored.
+	// trust_bundles keeps every activated epoch with the exact bytes and the
+	// signatures that activated it, because an agent that missed epochs is
+	// brought forward by replaying them in order.
+	`
+CREATE TABLE IF NOT EXISTS webauthn_credentials (
+	id TEXT PRIMARY KEY,
+	user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	name TEXT NOT NULL DEFAULT '',
+	alg INTEGER NOT NULL,
+	public_key BLOB NOT NULL,
+	created_at INTEGER NOT NULL,
+	last_used_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_webauthn_user ON webauthn_credentials(user_id);
+
+CREATE TABLE IF NOT EXISTS trust_bundles (
+	org_id TEXT NOT NULL,
+	epoch INTEGER NOT NULL,
+	bundle BLOB NOT NULL,
+	hash TEXT NOT NULL,
+	sigs TEXT NOT NULL DEFAULT '[]',
+	recovery_sigs TEXT NOT NULL DEFAULT '[]',
+	activated_by TEXT NOT NULL DEFAULT '',
+	activated_at INTEGER NOT NULL,
+	PRIMARY KEY (org_id, epoch)
+);
+
+CREATE TABLE IF NOT EXISTS trust_proposals (
+	id TEXT PRIMARY KEY,
+	org_id TEXT NOT NULL,
+	epoch INTEGER NOT NULL,
+	bundle BLOB NOT NULL,
+	sigs TEXT NOT NULL DEFAULT '[]',
+	recovery_sigs TEXT NOT NULL DEFAULT '[]',
+	created_by TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,
+	expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trust_proposals_org ON trust_proposals(org_id);
+
+ALTER TABLE agents ADD COLUMN trust_epoch INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agents ADD COLUMN trust_hash TEXT NOT NULL DEFAULT '';
+`,
+	// 14: Phase 3B standing approvals. One signed standing manifest per
+	// (organization, object, purpose); content_hash says which version of the
+	// object it covers, so an edit makes the approval stop matching without
+	// anything having to notice the edit. A patch policy has two purposes
+	// (install, reboot) and a catalog item one per action and OS.
+	`
+CREATE TABLE IF NOT EXISTS approvals (
+	org_id TEXT NOT NULL,
+	object_type TEXT NOT NULL,
+	object_id TEXT NOT NULL,
+	purpose TEXT NOT NULL DEFAULT '',
+	content_hash TEXT NOT NULL,
+	manifest BLOB NOT NULL,
+	sigs TEXT NOT NULL DEFAULT '[]',
+	need INTEGER NOT NULL DEFAULT 1,
+	created_by TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,
+	expires_at INTEGER NOT NULL,
+	PRIMARY KEY (org_id, object_type, object_id, purpose)
+);
+`,
 }
 
 // Close checkpoints the write-ahead log before closing, so a short-lived

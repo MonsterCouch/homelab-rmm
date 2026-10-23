@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -151,7 +152,8 @@ func (sc *scheduler) runTask(t *Task, by string) int {
 				continue
 			}
 			taskID := t.ID
-			if _, err := sc.s.runs.Start(a.ID, RunRequest{Script: script, Args: t.Args, Timeout: t.TimeoutSec, Trigger: "task", RunBy: by, TaskID: &taskID}); err == nil {
+			if _, err := sc.s.runs.Start(a.ID, RunRequest{Script: script, Args: t.Args, Timeout: t.TimeoutSec, Trigger: "task", RunBy: by, TaskID: &taskID,
+				Standing: &standingRef{Type: approvalTask, ID: strconv.FormatInt(t.ID, 10)}}); err == nil {
 				n++
 			}
 		case "patch_scan":
@@ -161,13 +163,15 @@ func (sc *scheduler) runTask(t *Task, by string) int {
 			}
 		case "patch_install":
 			if sc.s.hub.IsOnline(a.ID) {
-				go sc.s.patchInstall(a.ID, nil, opts.Reboot, by)
+				unit, ok := sc.s.unitForTask(t)
+				go sc.s.patchInstall(a.ID, nil, opts.Reboot, by, sc.s.standingAuthForUnit(a.ID, unit, ok))
 				n++
 			}
 		case "reboot":
 			if sc.s.hub.IsOnline(a.ID) {
 				ctx, cancel := context.WithTimeout(sc.ctx, quickTimeout)
-				sc.s.hub.Request(ctx, a.ID, protocol.ReqPower, protocol.Power{Action: "reboot", Delay: opts.Delay, Message: "Scheduled reboot by RMM task " + t.Name}, nil)
+				unit, ok := sc.s.unitForTask(t)
+				sc.s.hub.RequestA(ctx, a.ID, protocol.ReqPower, protocol.Power{Action: "reboot", Delay: opts.Delay, Message: "Scheduled reboot by RMM task " + t.Name}, nil, sc.s.standingAuthForUnit(a.ID, unit, ok))
 				cancel()
 				n++
 			}
@@ -291,7 +295,8 @@ func (sc *scheduler) runAutomation(a *Automation, agentID string, agent *Agent, 
 		if err != nil {
 			return
 		}
-		sc.s.runs.Start(agentID, RunRequest{Script: script, Args: p.Args, Trigger: "automation", RunBy: "automation:" + a.Name})
+		sc.s.runs.Start(agentID, RunRequest{Script: script, Args: p.Args, Trigger: "automation", RunBy: "automation:" + a.Name,
+			Standing: &standingRef{Type: approvalAutomation, ID: strconv.FormatInt(a.ID, 10)}})
 	case "email":
 		subj := p.Subject
 		if subj == "" {

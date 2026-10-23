@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -229,6 +230,14 @@ type RunRequest struct {
 	RunBy    string
 	TaskID   *int64
 	Name     string // display name for ad hoc
+	// Auth is the operator's signed action (Phase 3), attached to the request
+	// the agent receives. One manifest can authorize a run on many agents;
+	// each agent takes only its own run_id from its envelope.
+	Auth *protocol.ActionAuth
+	// Standing names the object (task, automation, catalog item) whose stored
+	// standing approval should authorize this unattended run. It is attached
+	// only when the approval still covers the exact body being sent.
+	Standing *standingRef
 }
 
 const maxOutput = 2 << 20
@@ -237,26 +246,9 @@ const maxOutput = 2 << 20
 // that the scheduler releases when they connect. The returned id is stable
 // either way.
 func (t *runTracker) Start(agentID string, req RunRequest) (string, error) {
-	lang, body, timeout, name := req.Language, req.Body, req.Timeout, req.Name
-	var scriptID *int64
-	if req.Script != nil {
-		lang, body, name = req.Script.Language, req.Script.Body, req.Script.Name
-		if timeout <= 0 {
-			timeout = req.Script.TimeoutSec
-		}
-		scriptID = &req.Script.ID
-	}
-	if !validLanguages[lang] {
-		return "", errors.New("invalid language")
-	}
-	if timeout <= 0 {
-		timeout = 300
-	}
-	if name == "" {
-		name = "ad hoc " + lang
-	}
-	if req.Args == nil {
-		req.Args = []string{}
+	lang, body, timeout, name, scriptID, err := resolveRun(&req)
+	if err != nil {
+		return "", err
 	}
 	id := randomHex(8)
 	status := "running"
@@ -277,11 +269,42 @@ func (t *runTracker) Start(agentID string, req RunRequest) (string, error) {
 	for k, v := range req.Env {
 		env[k] = v
 	}
-	t.launch(id, agentID, protocol.ScriptRun{RunID: id, Language: lang, Body: body, Args: req.Args, Env: env, Timeout: timeout})
+	auth := req.Auth
+	if auth == nil && req.Standing != nil {
+		auth = t.s.standingAuthForScript(agentID, *req.Standing, lang, body, req.Args)
+	}
+	t.launch(id, agentID, protocol.ScriptRun{RunID: id, Language: lang, Body: body, Args: req.Args, Env: env, Timeout: timeout}, auth)
 	return id, nil
 }
 
-func (t *runTracker) launch(id, agentID string, sr protocol.ScriptRun) {
+// resolveRun settles what a request will actually execute: the library
+// script's own language, body and timeout, or the ad hoc ones. It is shared
+// with the signing path, which must sign exactly what Start will send.
+func resolveRun(req *RunRequest) (lang, body string, timeout int, name string, scriptID *int64, err error) {
+	lang, body, timeout, name = req.Language, req.Body, req.Timeout, req.Name
+	if req.Script != nil {
+		lang, body, name = req.Script.Language, req.Script.Body, req.Script.Name
+		if timeout <= 0 {
+			timeout = req.Script.TimeoutSec
+		}
+		scriptID = &req.Script.ID
+	}
+	if !validLanguages[lang] {
+		return "", "", 0, "", nil, errors.New("invalid language")
+	}
+	if timeout <= 0 {
+		timeout = 300
+	}
+	if name == "" {
+		name = "ad hoc " + lang
+	}
+	if req.Args == nil {
+		req.Args = []string{}
+	}
+	return lang, body, timeout, name, scriptID, nil
+}
+
+func (t *runTracker) launch(id, agentID string, sr protocol.ScriptRun, auth *protocol.ActionAuth) {
 	lr := &liveRun{agentID: agentID}
 	t.mu.Lock()
 	if _, already := t.live[id]; already {
@@ -293,7 +316,7 @@ func (t *runTracker) launch(id, agentID string, sr protocol.ScriptRun) {
 	t.mu.Unlock()
 	t.s.hub.broadcast(hubEvent{Kind: "run", AgentID: agentID, Data: map[string]any{"run_id": id, "status": "running"}})
 
-	_, cancel, err := t.s.hub.Stream(agentID, protocol.ReqScriptRun, sr, func(env protocol.Envelope) {
+	_, cancel, err := t.s.hub.StreamA(agentID, protocol.ReqScriptRun, sr, func(env protocol.Envelope) {
 		switch env.T {
 		case protocol.TypeStream:
 			var c protocol.ScriptChunk
@@ -314,7 +337,7 @@ func (t *runTracker) launch(id, agentID string, sr protocol.ScriptRun) {
 			}
 			t.finish(id, agentID, status, res, lr)
 		}
-	})
+	}, auth)
 	if err != nil {
 		t.finish(id, agentID, "failed", protocol.ScriptResult{Error: err.Error(), ExitCode: -1}, lr)
 		return
@@ -442,6 +465,7 @@ func (t *runTracker) releaseQueued(agentID string) {
 		id   string
 		sid  sql.NullInt64
 		args string
+		tid  sql.NullInt64
 	}
 	var list []q
 	for rows.Next() {
@@ -473,7 +497,13 @@ func (t *runTracker) releaseQueued(agentID string) {
 		if n, _ := res.RowsAffected(); n != 1 {
 			continue
 		}
-		t.launch(x.id, agentID, protocol.ScriptRun{RunID: x.id, Language: sc.Language, Body: sc.Body, Args: args, Env: t.deviceEnv(agentID, "task", "queue"), Timeout: sc.TimeoutSec})
+		// A queued run was started by someone who has gone: only a task's
+		// standing approval can still vouch for it.
+		var auth *protocol.ActionAuth
+		if x.tid.Valid {
+			auth = t.s.standingAuthForScript(agentID, standingRef{Type: approvalTask, ID: strconv.FormatInt(x.tid.Int64, 10)}, sc.Language, sc.Body, args)
+		}
+		t.launch(x.id, agentID, protocol.ScriptRun{RunID: x.id, Language: sc.Language, Body: sc.Body, Args: args, Env: t.deviceEnv(agentID, "task", "queue"), Timeout: sc.TimeoutSec}, auth)
 	}
 }
 

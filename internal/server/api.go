@@ -100,6 +100,26 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("PUT /api/sites/{id}", s.requireAdmin(s.handleUpdateSite))
 	api.HandleFunc("DELETE /api/sites/{id}", s.requireAdmin(s.handleDeleteSite))
 
+	// Phase 3 signed actions. Security keys belong to whoever registers them;
+	// the trust bundle is the fleet's root of trust and admin only.
+	api.HandleFunc("POST /api/webauthn/register/begin", s.handleWebAuthnBegin)
+	api.HandleFunc("POST /api/webauthn/register/finish", s.handleWebAuthnFinish)
+	api.HandleFunc("GET /api/webauthn/credentials", s.handleListCredentials)
+	api.HandleFunc("DELETE /api/webauthn/credentials/{id}", s.handleDeleteCredential)
+	api.HandleFunc("GET /api/organizations/{id}/trust", s.requireAdmin(s.handleGetOrgTrust))
+	api.HandleFunc("POST /api/organizations/{id}/trust/proposals", s.requireAdmin(s.handleCreateTrustProposal))
+	api.HandleFunc("GET /api/trust/proposals/{pid}", s.requireAdmin(s.handleGetTrustProposal))
+	api.HandleFunc("POST /api/trust/proposals/{pid}/sign", s.requireAdmin(s.handleSignTrustProposal))
+	api.HandleFunc("POST /api/trust/proposals/{pid}/recovery", s.requireAdmin(s.handleRecoverTrustProposal))
+
+	// Signed actions: the approvals queue, standing approvals of unattended
+	// objects, and the grants behind the shell, desktop and file browser.
+	api.HandleFunc("GET /api/approvals", s.handleListApprovals)
+	api.HandleFunc("GET /api/approvals/unsigned", s.handleUnsignedApprovals)
+	api.HandleFunc("POST /api/approvals/objects/{type}/{id}/sign", s.requireWrite(s.handleSignObject))
+	api.HandleFunc("POST /api/approvals/{manifest_id}/sign", s.requireWrite(s.handleSignApproval))
+	api.HandleFunc("POST /api/agents/{id}/grant", s.requireWrite(s.handleGrant))
+
 	api.HandleFunc("GET /api/groups", s.handleListGroups)
 	api.HandleFunc("POST /api/groups", s.requireWrite(s.handleCreateGroup))
 	api.HandleFunc("PUT /api/groups/{id}", s.requireWrite(s.handleUpdateGroup))

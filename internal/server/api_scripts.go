@@ -2,9 +2,12 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
 )
 
 func (s *Server) handleListScripts(w http.ResponseWriter, r *http.Request) {
@@ -80,7 +83,15 @@ type runScriptInput struct {
 	AgentIDs []string          `json:"agent_ids"`
 }
 
-func (s *Server) startRuns(r *http.Request, in runScriptInput, agentIDs []string) (map[string]string, error) {
+// runPlan is a script run resolved against its targets: who will really
+// receive it, and what exactly they will be sent.
+type runPlan struct {
+	req     RunRequest
+	out     map[string]string // outcomes decided before anything starts
+	targets []string          // devices a run will be started on
+}
+
+func (s *Server) planRuns(r *http.Request, in runScriptInput, agentIDs []string) (*runPlan, error) {
 	req := RunRequest{Language: in.Language, Body: in.Body, Args: in.Args, Env: in.Env, Timeout: in.Timeout, Trigger: "manual", RunBy: actor(r)}
 	if in.ScriptID != nil {
 		sc, err := s.db.GetScript(*in.ScriptID)
@@ -90,23 +101,115 @@ func (s *Server) startRuns(r *http.Request, in runScriptInput, agentIDs []string
 		req.Script = sc
 	}
 	me := userFrom(r.Context())
-	out := map[string]string{}
+	pl := &runPlan{req: req, out: map[string]string{}}
 	for _, id := range agentIDs {
 		a, err := s.db.GetAgent(id)
 		if err != nil {
-			out[id] = "error: agent not found"
+			pl.out[id] = "error: agent not found"
 			continue
 		}
 		if !s.canAccessAgent(me, a.OrgID) {
-			out[id] = "error: agent not found"
+			pl.out[id] = "error: agent not found"
 			continue
 		}
 		if req.Script != nil && req.Script.OSFilter != "" {
 			if a.OS != req.Script.OSFilter {
-				out[id] = "skipped: os mismatch"
+				pl.out[id] = "skipped: os mismatch"
 				continue
 			}
 		}
+		pl.targets = append(pl.targets, id)
+	}
+	return pl, nil
+}
+
+// signedScriptPayload is the script.run payload a manifest carries: what the
+// agent will execute, without the run_id that differs per device (each agent
+// takes its own run_id from its envelope). One device: the payload is exactly
+// what that device is sent, device environment included. Several: a manifest
+// is one document for all of them, so only the operator's own env is signed.
+func (s *Server) signedScriptPayload(pl *runPlan) (json.RawMessage, string, error) {
+	req := pl.req
+	lang, body, timeout, name, _, err := resolveRun(&req)
+	if err != nil {
+		return nil, "", err
+	}
+	env := map[string]string{}
+	if len(pl.targets) == 1 {
+		env = s.runs.deviceEnv(pl.targets[0], req.Trigger, req.RunBy)
+	}
+	for k, v := range req.Env {
+		env[k] = v
+	}
+	sr := protocol.ScriptRun{Language: lang, Body: body, Args: req.Args, Env: env, Timeout: timeout}
+	raw, err := json.Marshal(sr)
+	if err != nil {
+		return nil, "", err
+	}
+	var m map[string]json.RawMessage
+	json.Unmarshal(raw, &m)
+	delete(m, "run_id")
+	raw, _ = json.Marshal(m)
+	return raw, fmt.Sprintf("Run %s script %q: %s", lang, name, clip(body, 300)), nil
+}
+
+// runScripts plans a run, takes it through the signing flow and starts it.
+// respond writes the handler's own response from the per-device outcomes.
+func (s *Server) runScripts(w http.ResponseWriter, r *http.Request, in runScriptInput, agentIDs []string, respond func(w http.ResponseWriter, r *http.Request, out map[string]string)) {
+	pl, err := s.planRuns(r, in, agentIDs)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	run := func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth) {
+		respond(w, r, s.startPlanned(pl, auth))
+	}
+	payload, summary, perr := s.signedScriptPayload(pl)
+	if perr != nil || len(pl.targets) == 0 {
+		// Nothing valid to start (bad language, no usable device): the
+		// per-device errors are the answer, and nothing is dispatched.
+		run(w, r, nil)
+		return
+	}
+	s.runSigned(w, r, signedAction{
+		Op: protocol.ReqScriptRun, Targets: pl.targets, Payload: payload,
+		Summary: summary + " " + summaryDevices(len(pl.targets), pl.targets[0]),
+		Run:     run,
+	})
+}
+
+// startOneRun takes a single-device run through the signing flow. respond
+// writes the handler's response from the outcome of Start.
+func (s *Server) startOneRun(w http.ResponseWriter, r *http.Request, req RunRequest, agentID, orgID string, respond func(w http.ResponseWriter, r *http.Request, runID string, err error)) {
+	run := func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth) {
+		req := req
+		req.Auth = auth
+		runID, err := s.runs.Start(agentID, req)
+		respond(w, r, runID, err)
+	}
+	payload, summary, err := s.signedScriptPayload(&runPlan{req: req, out: map[string]string{}, targets: []string{agentID}})
+	if err != nil {
+		run(w, r, nil) // an invalid request: Start reports why, nothing is sent
+		return
+	}
+	s.runSigned(w, r, signedAction{
+		Org: orgID, Op: protocol.ReqScriptRun, Targets: []string{agentID}, Payload: payload, Summary: summary, Run: run,
+	})
+}
+
+func (s *Server) startRuns(r *http.Request, in runScriptInput, agentIDs []string) (map[string]string, error) {
+	pl, err := s.planRuns(r, in, agentIDs)
+	if err != nil {
+		return nil, err
+	}
+	return s.startPlanned(pl, nil), nil
+}
+
+func (s *Server) startPlanned(pl *runPlan, auth *protocol.ActionAuth) map[string]string {
+	req := pl.req
+	req.Auth = auth
+	out := pl.out
+	for _, id := range pl.targets {
 		runID, err := s.runs.Start(id, req)
 		if err != nil {
 			out[id] = "error: " + err.Error()
@@ -114,7 +217,7 @@ func (s *Server) startRuns(r *http.Request, in runScriptInput, agentIDs []string
 		}
 		out[id] = runID
 	}
-	return out, nil
+	return out
 }
 
 // handleRunScript runs a library script or an ad hoc body on a target set.
@@ -139,13 +242,10 @@ func (s *Server) handleRunScript(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "no target devices")
 		return
 	}
-	out, err := s.startRuns(r, in, ids)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	s.audit(r, "script.run", strings.Join(ids, ","), map[string]any{"script_id": in.ScriptID, "language": in.Language})
-	writeJSON(w, 200, map[string]any{"runs": out})
+	s.runScripts(w, r, in, ids, func(w http.ResponseWriter, r *http.Request, out map[string]string) {
+		s.audit(r, "script.run", strings.Join(ids, ","), map[string]any{"script_id": in.ScriptID, "language": in.Language})
+		writeJSON(w, 200, map[string]any{"runs": out})
+	})
 }
 
 func (s *Server) handleRunScriptOnAgent(w http.ResponseWriter, r *http.Request) {
@@ -158,11 +258,12 @@ func (s *Server) handleRunScriptOnAgent(w http.ResponseWriter, r *http.Request) 
 		fail(w, err)
 		return
 	}
-	out, err := s.startRuns(r, in, []string{id})
-	if err != nil {
-		fail(w, err)
-		return
-	}
+	s.runScripts(w, r, in, []string{id}, func(w http.ResponseWriter, r *http.Request, out map[string]string) {
+		s.respondSingleRun(w, r, id, in, out)
+	})
+}
+
+func (s *Server) respondSingleRun(w http.ResponseWriter, r *http.Request, id string, in runScriptInput, out map[string]string) {
 	s.audit(r, "script.run", id, map[string]any{"script_id": in.ScriptID, "language": in.Language})
 	// startRuns encodes each agent's outcome in the map value, and only a real
 	// run id may leave here as one: a caller that follows the documented

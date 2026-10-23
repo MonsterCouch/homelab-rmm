@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button, Dropdown } from '../../components/ui';
 import { IconClipboard, IconExpand, IconKeyboard, IconMore, IconRefresh, IconStop } from '../../components/Icons';
 import { bps, bytes } from '../../lib/format';
+import { GRANT_OPS, ensureGrant } from '../../lib/grants';
 import { host } from '../../lib/host';
-import { useToast } from '../../state/toast';
+import { errMsg, useToast } from '../../state/toast';
 import type { TabProps } from './DeviceDetail';
 import { copyText, readClipboard } from './clipboard';
 import { KeyBar, KeyButton } from './KeyBar';
@@ -420,12 +421,11 @@ export function Desktop({ agent, canWrite }: TabProps) {
     [closeRTC, rtcFallback],
   );
 
-  const connect = useCallback(() => {
-    closeRTC();
-    ws.current?.close();
-    setStatus('connecting');
-    setDetail('');
-    setNote('');
+  // Bumped by every connect and disconnect: a signing dialog the operator
+  // answers late must not open a session they have since abandoned.
+  const attempt = useRef(0);
+
+  const openSocket = useCallback(() => {
     drawQueue.current = Promise.resolve();
     const wantRTC = rtcOnRef.current && typeof RTCPeerConnection !== 'undefined';
     const query = `quality=${quality}${wantRTC ? '&webrtc=1' : ''}${modeRef.current === 'backstage' ? '&mode=backstage' : ''}`;
@@ -527,7 +527,29 @@ export function Desktop({ agent, canWrite }: TabProps) {
     };
   }, [agent.id, quality, drawTile, layout, closeRTC, startRTC, rtcFallback]);
 
+  const connect = useCallback(() => {
+    closeRTC();
+    ws.current?.close();
+    setStatus('connecting');
+    setDetail('');
+    setNote('');
+    const n = ++attempt.current;
+    // Phase 3: remote desktop needs a signed grant first (a no-op when the
+    // organization has no trust bundle, or the grant is still live).
+    ensureGrant(agent.id, GRANT_OPS.desktop).then(
+      () => {
+        if (n === attempt.current) openSocket();
+      },
+      (err: unknown) => {
+        if (n !== attempt.current) return;
+        setStatus('error');
+        setDetail(errMsg(err));
+      },
+    );
+  }, [agent.id, closeRTC, openSocket]);
+
   const disconnect = useCallback(() => {
+    attempt.current++; // also cancels a connect that is still waiting for a signature
     closeRTC();
     ws.current?.close();
     ws.current = null;
@@ -539,6 +561,7 @@ export function Desktop({ agent, canWrite }: TabProps) {
   useEffect(() => {
     const id = window.setTimeout(connect, 50);
     return () => {
+      attempt.current++;
       window.clearTimeout(id);
       closeRTC();
       ws.current?.close();

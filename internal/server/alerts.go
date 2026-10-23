@@ -188,11 +188,19 @@ func (e *alertEngine) openDrift(agentID, key, severity, title, msg string, notif
 }
 
 func (e *alertEngine) openWith(ruleID *int64, kind, sev string, notify bool, agentID, key, title, msg string) {
+	e.openAlert(ruleID, kind, sev, notify, agentID, key, title, msg, false)
+}
+
+// openAlert is openWith with the maintenance-window check optional. A window
+// exists to silence noisy, expected conditions; a rejected signature or a
+// trust bundle that is not ours is neither, and a window that hid it would
+// be the quietest moment to tamper with a device.
+func (e *alertEngine) openAlert(ruleID *int64, kind, sev string, notify bool, agentID, key, title, msg string, ignoreMaintenance bool) {
 	var existing int64
 	if err := e.s.db.QueryRow(`SELECT id FROM alerts WHERE dedupe_key = ? AND status != 'resolved'`, key).Scan(&existing); err == nil {
 		return
 	}
-	if a, err := e.s.db.GetAgent(agentID); err == nil && a.MaintenanceUntil > now() {
+	if a, err := e.s.db.GetAgent(agentID); err == nil && a.MaintenanceUntil > now() && !ignoreMaintenance {
 		return // in maintenance: stay quiet
 	}
 	res, err := e.s.db.Exec(`INSERT INTO alerts(rule_id, rule_kind, agent_id, severity, title, message, dedupe_key, status, opened_at) VALUES(?,?,?,?,?,?,?,'open',?)`,
@@ -488,4 +496,57 @@ func humanBytes(n uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// agentLabel is the name an alert uses for a device.
+func (e *alertEngine) agentLabel(agentID string) string {
+	if a, err := e.s.db.GetAgent(agentID); err == nil {
+		if a.DisplayName != "" {
+			return a.DisplayName
+		}
+		if a.Hostname != "" {
+			return a.Hostname
+		}
+	}
+	return agentID
+}
+
+// security raises the alert for a security event an agent reported: a
+// protected request it refused (enforce) or ran without a valid signature
+// (audit). Enforce-mode refusals are critical because something the operator
+// or the server tried to do did not happen; audit findings are the rollout's
+// to-do list, so a warning. Keyed by device, operation, mode and outcome so a
+// device retrying one unsigned request does not open an alert per attempt.
+func (e *alertEngine) security(agentID string, ev *protocol.Event) {
+	f := ev.Fields
+	op, mode, executed := f["op"], f["mode"], f["executed"]
+	sev := "warning"
+	if mode == "enforce" && executed == "false" {
+		sev = "critical"
+	}
+	outcome := "ran without a valid signature"
+	if executed == "false" {
+		outcome = "was refused"
+	}
+	name := e.agentLabel(agentID)
+	title := fmt.Sprintf("Security: %s %s on %s", op, outcome, name)
+	if op == "" {
+		title = "Security event on " + name
+	}
+	msg := ev.Message
+	if r := f["reason"]; r != "" {
+		msg = r
+	}
+	if m := f["manifest"]; m != "" {
+		msg += " (manifest " + m + ")"
+	}
+	e.openAlert(nil, "security", sev, sev == "critical", agentID, fmt.Sprintf("security:%s:%s:%s:%s", agentID, op, mode, executed), title, msg, true)
+}
+
+// trustMismatch raises the alert for an agent whose trust bundle is not the
+// one the server issued, which sync refuses to paper over.
+func (e *alertEngine) trustMismatch(agentID, reason string) {
+	name := e.agentLabel(agentID)
+	e.openAlert(nil, "security", "critical", true, agentID, "trust-mismatch:"+agentID,
+		"trust bundle mismatch on "+name, reason+". The server did not push a bundle; check the device before trusting it.", true)
 }

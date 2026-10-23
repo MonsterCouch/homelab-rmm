@@ -231,6 +231,7 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.s.db.markOnline(agentID, hello, ip, true)
+	h.s.db.setAgentTrust(agentID, hello.TrustEpoch, hello.TrustHash)
 	slog.Info("agent connected", "id", agentID, "host", hello.Hostname, "ip", ip, "version", hello.Version)
 	h.broadcast(hubEvent{Kind: "agent_online", AgentID: agentID})
 	h.s.onAgentOnline(agentID)
@@ -240,6 +241,10 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		// automation), so an onboarding automation never ran at enrollment.
 		h.s.sched.automation("enrolled", agentID, map[string]any{"hostname": hello.Hostname})
 	}
+
+	// Bundle sync waits for the agent's reply, which the read loop below
+	// delivers, so it runs beside it and never inside it.
+	h.s.goJob(func() { h.s.syncTrust(agentID) })
 
 	go h.keepalive(ac)
 	go h.ingestLoop(ac)
@@ -485,6 +490,12 @@ func (h *Hub) OnlineIDs() []string {
 // Request sends a request and waits for its single reply, decoding D into out
 // (which may be nil). The context bounds the wait.
 func (h *Hub) Request(ctx context.Context, agentID, typ string, payload any, out any) error {
+	return h.RequestA(ctx, agentID, typ, payload, out, nil)
+}
+
+// RequestA is Request carrying the operator signatures (Envelope.A) that
+// authorize the request; nil sends it unsigned.
+func (h *Hub) RequestA(ctx context.Context, agentID, typ string, payload any, out any, auth *protocol.ActionAuth) error {
 	ac, ok := h.get(agentID)
 	if !ok {
 		return ErrAgentOffline
@@ -498,7 +509,7 @@ func (h *Hub) Request(ctx context.Context, agentID, typ string, payload any, out
 	if payload != nil {
 		d = protocol.Must(payload)
 	}
-	if err := ac.send(protocol.Envelope{T: typ, ID: id, D: d}); err != nil {
+	if err := ac.send(protocol.Envelope{T: typ, ID: id, D: d, A: auth}); err != nil {
 		ac.pmu.Lock()
 		delete(ac.pending, id)
 		ac.pmu.Unlock()
@@ -526,6 +537,11 @@ func (h *Hub) Request(ctx context.Context, agentID, typ string, payload any, out
 // the request id so the caller can address follow-up messages (shell input)
 // and a cancel that detaches the sink.
 func (h *Hub) Stream(agentID, typ string, payload any, sink func(protocol.Envelope)) (string, func(), error) {
+	return h.StreamA(agentID, typ, payload, sink, nil)
+}
+
+// StreamA is Stream carrying the operator signatures that authorize it.
+func (h *Hub) StreamA(agentID, typ string, payload any, sink func(protocol.Envelope), auth *protocol.ActionAuth) (string, func(), error) {
 	ac, ok := h.get(agentID)
 	if !ok {
 		return "", nil, ErrAgentOffline
@@ -538,7 +554,7 @@ func (h *Hub) Stream(agentID, typ string, payload any, sink func(protocol.Envelo
 	if payload != nil {
 		d = protocol.Must(payload)
 	}
-	if err := ac.send(protocol.Envelope{T: typ, ID: id, D: d}); err != nil {
+	if err := ac.send(protocol.Envelope{T: typ, ID: id, D: d, A: auth}); err != nil {
 		ac.pmu.Lock()
 		delete(ac.streams, id)
 		ac.pmu.Unlock()
@@ -554,6 +570,11 @@ func (h *Hub) Stream(agentID, typ string, payload any, sink func(protocol.Envelo
 
 // Notify sends a fire-and-forget message (shell input, resize, close, config).
 func (h *Hub) Notify(agentID, typ string, payload any) error {
+	return h.NotifyA(agentID, typ, payload, nil)
+}
+
+// NotifyA is Notify carrying the operator signatures that authorize it.
+func (h *Hub) NotifyA(agentID, typ string, payload any, auth *protocol.ActionAuth) error {
 	ac, ok := h.get(agentID)
 	if !ok {
 		return ErrAgentOffline
@@ -562,7 +583,7 @@ func (h *Hub) Notify(agentID, typ string, payload any) error {
 	if payload != nil {
 		d = protocol.Must(payload)
 	}
-	return ac.send(protocol.Envelope{T: typ, D: d})
+	return ac.send(protocol.Envelope{T: typ, D: d, A: auth})
 }
 
 // CloseAll sends every connected agent a close frame and drops the socket.

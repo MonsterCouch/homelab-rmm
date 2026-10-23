@@ -187,12 +187,17 @@ func skipf(format string, args ...any) error {
 type baselineEngine struct {
 	a *Agent
 
-	mu      sync.Mutex
-	specs   map[int64]protocol.BaselineSpec
-	due     map[int64]time.Time
-	reason  map[int64]string // why the next pass was scheduled: config or startup
-	last    map[int64]*protocol.BaselineReport
-	holdoff map[int64]int64 // check id -> unix seconds until a fix may run again
+	mu    sync.Mutex
+	specs map[int64]protocol.BaselineSpec
+	// raw and auth are each spec's JSON as received and its standing
+	// approval. They are persisted so a spec that runs offline is re-verified
+	// before every pass rather than trusted forever once accepted.
+	raw           map[int64]json.RawMessage
+	auth          map[int64]*protocol.ActionAuth
+	due           map[int64]time.Time
+	reason        map[int64]string // why the next pass was scheduled: config or startup
+	last          map[int64]*protocol.BaselineReport
+	holdoff       map[int64]int64 // check id -> unix seconds until a fix may run again
 	postpones     map[int64]int   // check id -> number of postpones used
 	postponeUntil map[int64]int64 // check id -> unix seconds until postponed reboot may prompt again
 
@@ -231,6 +236,8 @@ func newBaselineEngine(a *Agent) *baselineEngine {
 	e := &baselineEngine{
 		a:             a,
 		specs:         map[int64]protocol.BaselineSpec{},
+		raw:           map[int64]json.RawMessage{},
+		auth:          map[int64]*protocol.ActionAuth{},
 		due:           map[int64]time.Time{},
 		reason:        map[int64]string{},
 		last:          map[int64]*protocol.BaselineReport{},
@@ -284,7 +291,11 @@ func (e *baselineEngine) poke() {
 // stops immediately: its schedule, its cached report and its checks'
 // hold-offs go with it, and an in-flight pass for it is discarded when it
 // finishes rather than sent.
-func (e *baselineEngine) setSpecs(in []protocol.BaselineSpec) {
+func (e *baselineEngine) setSpecs(in []protocol.BaselineSpec) { e.setSpecsApproved(in, nil, nil) }
+
+// setSpecsApproved is setSpecs plus each spec's received JSON and approval,
+// kept for re-verification (see mayRun).
+func (e *baselineEngine) setSpecsApproved(in []protocol.BaselineSpec, raws map[int64]json.RawMessage, auths map[int64]*protocol.ActionAuth) {
 	now := e.now()
 	e.mu.Lock()
 	keep := map[int64]bool{}
@@ -302,6 +313,7 @@ func (e *baselineEngine) setSpecs(in []protocol.BaselineSpec) {
 		keep[s.ID] = true
 		old, had := e.specs[s.ID]
 		e.specs[s.ID] = s
+		e.raw[s.ID], e.auth[s.ID] = raws[s.ID], auths[s.ID]
 		if !had || old.Version != s.Version {
 			changed = true
 			// A changed version means the params may have changed, so the
@@ -325,6 +337,8 @@ func (e *baselineEngine) setSpecs(in []protocol.BaselineSpec) {
 		}
 		changed = true
 		delete(e.specs, id)
+		delete(e.raw, id)
+		delete(e.auth, id)
 		delete(e.due, id)
 		delete(e.reason, id)
 		delete(e.last, id)
@@ -352,6 +366,19 @@ func normaliseSpec(s protocol.BaselineSpec) protocol.BaselineSpec {
 	return s
 }
 
+// mayRun asks the trust layer, immediately before a pass, whether the spec's
+// stored approval still verifies. Checking only when a config arrives would
+// leave a spec running after a restart, an expiry or a switch to enforce.
+func (e *baselineEngine) mayRun(spec protocol.BaselineSpec) bool {
+	if e.a == nil {
+		return true
+	}
+	e.mu.Lock()
+	raw, auth := e.raw[spec.ID], e.auth[spec.ID]
+	e.mu.Unlock()
+	return e.a.specMayRun(spec.ID, spec.Version, raw, auth)
+}
+
 // ---- scheduling ----
 
 // runDue evaluates every baseline whose timer has expired, one after another
@@ -362,6 +389,9 @@ func (e *baselineEngine) runDue(ctx context.Context) {
 		spec, trigger, ok := e.nextDue()
 		if !ok {
 			return
+		}
+		if !e.mayRun(spec) {
+			continue // its next slot was already claimed by nextDue
 		}
 		rep := e.runPass(ctx, spec, trigger, passOpts{})
 		e.finishPass(spec, rep)
@@ -546,7 +576,7 @@ func (e *baselineEngine) serve(ctx context.Context, r *baselineReq) {
 			e.mu.Lock()
 			spec, ok := e.specs[id]
 			e.mu.Unlock()
-			if !ok {
+			if !ok || !e.mayRun(spec) {
 				continue
 			}
 			rep := e.runPass(ctx, spec, baselines.TriggerManual, passOpts{})
@@ -556,7 +586,7 @@ func (e *baselineEngine) serve(ctx context.Context, r *baselineReq) {
 		e.mu.Lock()
 		spec, ok := e.specs[r.baseline]
 		e.mu.Unlock()
-		if !ok {
+		if !ok || !e.mayRun(spec) {
 			return
 		}
 		opt := passOpts{manual: true, fixOnly: map[int64]bool{}}
@@ -977,6 +1007,11 @@ type baselineStateFile struct {
 	RebootSince   int64                               `json:"reboot_pending_since,omitempty"`
 	Postpones     map[string]int                      `json:"postpones,omitempty"`
 	PostponeUntil map[string]int64                    `json:"postpone_until,omitempty"`
+	// SpecRaw and SpecAuth are each spec's JSON as received and its standing
+	// approval. Absent in files written before Phase 3; such specs have no
+	// approval and do not run in enforce mode.
+	SpecRaw  map[string]json.RawMessage      `json:"spec_raw,omitempty"`
+	SpecAuth map[string]*protocol.ActionAuth `json:"spec_auth,omitempty"`
 }
 
 func baselineStatePath() string { return filepath.Join(ConfigDir(), "baselines.json") }
@@ -1032,6 +1067,12 @@ func (e *baselineEngine) load() {
 		}
 		s = normaliseSpec(s)
 		e.specs[s.ID] = s
+		if raw, ok := f.SpecRaw[strconv.FormatInt(s.ID, 10)]; ok {
+			e.raw[s.ID] = raw
+		}
+		if ap, ok := f.SpecAuth[strconv.FormatInt(s.ID, 10)]; ok {
+			e.auth[s.ID] = ap
+		}
 		e.due[s.ID] = now.Add(baselineStartDelay + e.jitter(baselineStartJitter))
 		e.reason[s.ID] = baselines.TriggerStartup
 	}
@@ -1079,6 +1120,8 @@ func (e *baselineEngine) save() {
 		RebootSince:   e.rebootSince,
 		Postpones:     map[string]int{},
 		PostponeUntil: map[string]int64{},
+		SpecRaw:       map[string]json.RawMessage{},
+		SpecAuth:      map[string]*protocol.ActionAuth{},
 	}
 	ids := make([]int64, 0, len(e.specs))
 	for id := range e.specs {
@@ -1087,6 +1130,13 @@ func (e *baselineEngine) save() {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	for _, id := range ids {
 		f.Specs = append(f.Specs, e.specs[id])
+		k := strconv.FormatInt(id, 10)
+		if raw := e.raw[id]; raw != nil {
+			f.SpecRaw[k] = raw
+		}
+		if ap := e.auth[id]; ap != nil {
+			f.SpecAuth[k] = ap
+		}
 	}
 	for id, rep := range e.last {
 		f.LastReports[strconv.FormatInt(id, 10)] = rep

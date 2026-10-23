@@ -1092,3 +1092,124 @@ export interface ServerVersionInfo {
   exe_path: string;
   staged_update?: StagedUpdate;
 }
+
+// ---- Phase 3: operator-signed actions ----
+// docs/plans/2026-10-06-phase3-signed-actions.md §4.1. Binary values are
+// unpadded base64url strings.
+
+/** 202 from a protected request that still needs more signers. */
+export interface ApprovalPending {
+  pending: true;
+  manifest_id: string;
+  have: number;
+  need: number;
+}
+
+export interface WebAuthnCredential {
+  id: string;
+  name: string;
+  /** COSE algorithm: -7 ES256, -8 EdDSA, -257 RS256 */
+  alg: number;
+  owner: string;
+  created_at: number;
+  last_used_at: number;
+  in_bundle: boolean;
+}
+
+export type TrustMode = 'off' | 'audit' | 'enforce';
+
+export interface TrustPolicy {
+  mode?: TrustMode;
+  require_uv?: boolean;
+  high_threshold?: number;
+  bundle_threshold?: number;
+  bulk_limit?: number;
+}
+
+export interface TrustSigner {
+  owner: string;
+  /** bundle shape */
+  creds?: { id: string; alg?: number; pub?: string }[];
+  /** proposal-request shape */
+  credential_ids?: string[];
+}
+
+export interface TrustCurrent {
+  epoch: number;
+  hash: string;
+  mode?: TrustMode;
+  policy?: TrustPolicy;
+  signers?: TrustSigner[] | null;
+  recovery_ids?: string[] | null;
+  rp_id?: string;
+  origins?: string[] | null;
+}
+
+export interface TrustProposal {
+  id: string;
+  epoch: number;
+  /** exact bundle bytes; absent from list rows on some servers (GET /api/trust/proposals/{pid} has it) */
+  bundle?: string;
+  need: number;
+  have: number;
+  created_by?: string;
+  created_at?: number;
+}
+
+export interface TrustAgentCounts {
+  at_current: number;
+  behind: number;
+  mismatched: number;
+  none: number;
+}
+
+export interface TrustInfo {
+  current: TrustCurrent | null;
+  proposals: TrustProposal[] | null;
+  agents: TrustAgentCounts;
+}
+
+export interface TrustProposalInput {
+  mode: TrustMode;
+  require_uv: boolean;
+  high_threshold: number;
+  bundle_threshold: number;
+  bulk_limit: number;
+  signers: { owner: string; credential_ids: string[] }[];
+  /** only the public half ever leaves the browser */
+  recovery: { id: string; pub: string }[];
+}
+
+export interface ProposalSignResult {
+  have: number;
+  need: number;
+  active: boolean;
+}
+
+export interface PendingApproval {
+  manifest_id: string;
+  /** exact manifest bytes; the console will not sign what it cannot show */
+  manifest?: string;
+  summary?: string;
+  issuer?: string;
+  org?: string;
+  have: number;
+  need: number;
+  created_at?: number;
+  expires_at?: number;
+}
+
+export type UnsignedType = 'task' | 'automation' | 'patch_policy' | 'catalog_item' | 'baseline';
+
+export interface UnsignedObject {
+  type: UnsignedType;
+  id: string | number;
+  name: string;
+  reason: 'missing' | 'expired' | 'content changed';
+}
+
+/** POST /api/agents/{id}/grant */
+export interface GrantResult {
+  required?: boolean;
+  expires_at?: number;
+}

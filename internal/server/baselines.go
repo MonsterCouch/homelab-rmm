@@ -185,6 +185,27 @@ func validateBaselineInput(in *baselineInput) error {
 
 // ---- config resolution ----
 
+// baselineSpec is a stored baseline as the agent receives it. A standing
+// approval binds the SHA-256 of exactly this value, so the config and the
+// Review & sign page must both build it here.
+func baselineSpec(b *Baseline) protocol.BaselineSpec {
+	spec := protocol.BaselineSpec{
+		ID:          b.ID,
+		Name:        b.Name,
+		Version:     b.Version,
+		Enforce:     b.Enforce,
+		IntervalSec: baselines.ClampInterval(b.IntervalSec),
+		Checks:      make([]protocol.BaselineCheck, 0, len(b.Checks)),
+	}
+	for _, c := range b.Checks {
+		spec.Checks = append(spec.Checks, protocol.BaselineCheck{
+			ID: c.ID, Name: c.Name, Kind: c.Kind, Params: c.Params, Remediate: c.Remediate,
+			Severity: c.Severity, OSFilter: c.OSFilter, TimeoutSec: baselines.ClampTimeout(c.TimeoutSec),
+		})
+	}
+	return spec
+}
+
 // baselineSpecsFor is the COMPLETE set of enabled baselines matching a
 // device. Partial or incremental pushes are forbidden: the agent replaces its
 // whole set on every config, so anything left out is stopped on the device.
@@ -199,21 +220,7 @@ func (s *Server) baselineSpecsFor(a *Agent) []protocol.BaselineSpec {
 		if !b.Enabled || !b.Targets.Matches(a) {
 			continue
 		}
-		spec := protocol.BaselineSpec{
-			ID:          b.ID,
-			Name:        b.Name,
-			Version:     b.Version,
-			Enforce:     b.Enforce,
-			IntervalSec: baselines.ClampInterval(b.IntervalSec),
-			Checks:      make([]protocol.BaselineCheck, 0, len(b.Checks)),
-		}
-		for _, c := range b.Checks {
-			spec.Checks = append(spec.Checks, protocol.BaselineCheck{
-				ID: c.ID, Name: c.Name, Kind: c.Kind, Params: c.Params, Remediate: c.Remediate,
-				Severity: c.Severity, OSFilter: c.OSFilter, TimeoutSec: baselines.ClampTimeout(c.TimeoutSec),
-			})
-		}
-		out = append(out, spec)
+		out = append(out, baselineSpec(b))
 	}
 	if len(out) > maxBaselinesPerDevice {
 		// Which ones survive has to be stable: the list arrives ordered by

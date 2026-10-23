@@ -70,6 +70,15 @@ type Server struct {
 	jobCtx    context.Context
 	jobCancel context.CancelFunc
 	jobs      sync.WaitGroup
+	// regs holds pending security-key registrations. trustMu serialises
+	// changes to trust bundles (proposal, signature, activation), which are
+	// read-modify-write over several rows; trustSyncs holds one lock per
+	// agent so a reconnect and an activation never replay an epoch twice.
+	regs       regChallenges
+	trustMu    sync.Mutex
+	trustSyncs sync.Map
+	// signing holds the pending 428 manifests and the grants operators hold.
+	signing signingState
 }
 
 // jobContext is the context long background work runs under. It is cancelled
@@ -375,14 +384,26 @@ func (s *Server) agentConfig(agentID string) protocol.AgentConfig {
 	// field is cleared on the way into settings (handlePutSettings): the
 	// operator-editable agent_defaults row must never be able to freeze a
 	// baseline set and push it to every device regardless of targets.
-	cfg.Baselines = nil
+	cfg.Baselines, cfg.BaselineAuth = nil, nil
 	if a, err := s.db.GetAgent(agentID); err == nil {
 		cfg.MonitoredServices = a.MonitoredServices
 		// Always the COMPLETE matching set: the agent replaces its whole set
 		// on every config, so anything left out is stopped on the device.
 		cfg.Baselines = s.baselineSpecsFor(a)
+		// Each spec's standing approval travels with it; the agent keeps
+		// only the specs whose approval verifies (3.3). Marshalled the same
+		// way the config will carry them, so the hash is of what is sent.
+		cfg.BaselineAuth = s.baselineAuthFor(a.OrgID, cfg.Baselines)
 	}
+	cfg.BaselineAuth = nilIfEmptyAuth(cfg.BaselineAuth)
 	return cfg
+}
+
+func nilIfEmptyAuth(m map[string]*protocol.ActionAuth) map[string]*protocol.ActionAuth {
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }
 
 func (s *Server) pushAgentConfig(agentID string) {
@@ -430,6 +451,9 @@ func (s *Server) onAgentEvent(id string, ev *protocol.Event) {
 	s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,?)`, id, ev.TS, ev.Kind, ev.Message, jsonText(ev.Fields))
 	s.hub.broadcast(hubEvent{Kind: "event", AgentID: id, Data: ev})
 	s.alerts.event(id, ev)
+	if ev.Kind == protocol.EventKindSecurity {
+		s.alerts.security(id, ev)
+	}
 }
 
 // Bounds on the timestamp a device reports with a metrics sample. A sample is

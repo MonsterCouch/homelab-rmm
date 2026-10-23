@@ -21,7 +21,8 @@ the console reachable on the LAN or over a VPN. Adversaries considered:
 
 Not designed for: exposing the console to the untrusted public internet without a reverse proxy/VPN,
 or adversaries with root/administrator access on the server host (they have everything: the SQLite file,
-the TLS private key, the SMTP credentials). Multi-tenancy (Organizations and Sites) is supported and
+the TLS private key, the SMTP credentials). With **signed actions** enabled, that adversary still cannot
+make devices act unless an operator signs; see Signed actions below for exactly what remains. Multi-tenancy (Organizations and Sites) is supported and
 enforces strict cross-tenant isolation and technician scoping.
 
 ## What is protected, and how
@@ -335,14 +336,82 @@ SYSTEM and reads the event log scores highly with behavioural engines. Exclusion
 deliberately, because an exclusion is a hole you are choosing to keep. The manual install needs
 neither the script nor the download.
 
+## Signed actions
+
+Once an organisation has a **trust bundle**, its devices stop taking the server's word for
+destructive requests. Running a script, killing a process, changing a service, writing or
+deleting files, rebooting, isolating, installing updates or a new agent build, opening a shell or
+the remote desktop, and browsing files all need an operator's **security key** (or passkey). The
+key must have signed that exact request for that device. The device checks the signature against
+the bundle it pinned, so a request the server altered, invented or replayed is refused there. The
+design is in `docs/plans/2026-10-06-phase3-signed-actions.md`.
+
+**What it stops:**
+- a stolen console session (a cookie, a phished password and TOTP);
+- anyone who can change the database: a SQL injection, a stolen backup, an edited script, schedule or
+  baseline;
+- a replayed request.
+
+None of them can make a device do anything, because they never touch an operator's key.
+
+**What it does not stop:**
+- **A fully compromised server can still trick you.** The console's JavaScript comes from the
+  server, and security keys do not display what they sign. A tampered console could show one
+  action and sign another. The signing dialog decodes the exact bytes your key signs, but that
+  dialog is also served by the server. A signer that runs outside the browser is planned (3D).
+- **Keystrokes into a session that is already open.** Signing covers opening a shell or remote
+  desktop, not each keystroke. Grants last 15 minutes and cover one device.
+- **Denial of service and telemetry.** A compromised server can still refuse to relay anything,
+  and it still sees what devices report.
+
+**Before you start:**
+- The console must be reached by a **DNS name**. Browsers do not offer security keys to a site
+  addressed by IP. Set `RMM_PUBLIC_URL` to the name, or `RMM_WEBAUTHN_RP_ID` and
+  `RMM_WEBAUTHN_ORIGINS` to override.
+- The browser must **trust the server certificate**. Import `server.crt` (Recommendations §4) or
+  use `tailscale cert`. A page with a certificate warning may not be allowed to use security keys.
+- Every operator who will approve actions registers keys under **Account → Security keys**.
+  Register two each (a key and a backup, or a key and a passkey).
+
+**Rolling out:**
+1. **Trust & signing → New proposal**, mode `audit`. Select the operators' keys, and generate a
+   **recovery key**. It is shown once: print it or store it in a password manager, offline from
+   the server. Sign the proposal. Devices pin this first bundle the next time they connect.
+2. In `audit` mode devices check every request but still run unsigned ones. Each unsigned request
+   raises a **security alert** naming the request type. Interactive actions now ask for your key;
+   **Continue without signing** is still offered.
+3. Things that run with nobody present (scheduled tasks, automations, patch policies, software
+   catalog items and baselines) need a **standing approval**. Sign each one under
+   **Approvals → Review & sign**. Editing one later makes it unsigned again until re-signed.
+4. When the alerts have stopped, propose the same bundle in `enforce` mode. Devices now refuse
+   anything unsigned. Enforce cannot be selected without a recovery key.
+
+**Changing the bundle** (adding an operator, a key or a recovery key, or changing the mode)
+takes signatures from operators of the **current** bundle, so the server cannot add its own key.
+
+**If every key is lost**, sign the next proposal with the recovery key on any machine with the
+`rmm-server` binary. Take the bundle text from the proposal's **Recovery** dialog:
+
+```
+rmm-server trust sign-bundle --key recovery.txt --bundle proposal.txt
+```
+
+Paste the output into the same dialog.
+
+**A device that refuses everything** after its `trust.json` (next to `agent.json`) was damaged
+has failed closed on purpose. An administrator on that device can delete `trust.json`; the agent
+then pins the server's current bundle on its next connection, as on first use.
+
 ## What is not protected
 
-- **Anyone with a console account is root everywhere.** There is no per-device permission model
-  beyond the three roles. Do not share accounts; create a `viewer` for people who only need to
-  look.
+- **Without signed actions, anyone with a console account is root everywhere.** There is no
+  per-device permission model beyond the roles. Do not share accounts, and create a `viewer` for
+  people who only need to look. With a trust bundle in `enforce` mode, an account alone is no
+  longer enough to change a device (see Signed actions).
 - **The console is not hardened for the open internet.** No account lockout beyond the
-  per-minute limiter, no WebAuthn, no IP allow-lists, no brute-force alerting. Keep it on the
-  LAN or behind a VPN (WireGuard, Tailscale).
+  per-minute limiter, no IP allow-lists, no brute-force alerting. Security keys gate actions on
+  devices, not signing in to the console. Keep it on the LAN or behind a VPN (WireGuard,
+  Tailscale).
 - **Behind a reverse proxy the client address is only as good as the proxy.** With
   `--trusted-proxies` set, anything that reaches the server from that network can claim any
   client address in `X-Forwarded-For`. Bind the HTTP listener to localhost when a proxy is used,

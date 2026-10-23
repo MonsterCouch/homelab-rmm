@@ -22,7 +22,7 @@ This document tracks the strategic architectural roadmap to transform **Homelab 
 flowchart TD
     P1["Phase 1: Resilience & Hardening<br/>(Supervisor Mode, A/B Updates, Job Object Caps)"]
     P2["Phase 2: Remote Control Overhaul<br/>(DXGI Capture, WebRTC Pion, Backstage Desktop)"]
-    P3["Phase 3: Zero-Trust Security & Transport<br/>(E2E-CAA FIDO2 Signing, QUIC/HTTP3, Rekor Log)"]
+    P3["Phase 3: Signed Actions & Audit<br/>(WebAuthn-Signed Manifests, Merkle Log; QUIC deferred)"]
     P4["Phase 4: Data Scaling & P2P Mesh<br/>(DB Decoupling, Subnet P2P Patch Cache)"]
 
     P1 --> P2 --> P3 --> P4
@@ -58,16 +58,13 @@ Plan: [`docs/plans/2026-10-01-phase2-remote-desktop-webrtc.md`](plans/2026-10-01
   - Done: `/dev/uinput` input injection and the XDG ScreenCast portal negotiation with a persisted restore token.
   - Open: PipeWire frame ingestion needs a PipeWire client (libpipewire, i.e. CGO), so Wayland sessions still capture through the X11 / screenshot-portal path.
 
-### Phase 3: Zero-Trust Security & Modernized Transport
-- [ ] **End-to-End Cryptographic Action Authorization (E2E-CAA):**
-  - Standardize on RFC 8785 Canonical JSON Action Manifests for all fleet-wide scripts and destructive actions.
-  - Hardware-backed Ed25519 signing (FIDO2 / WebAuthn) for administrative commands; M-of-N multi-party authorization for high-risk actions.
-  - Agent-side signature and anti-replay nonce verification against local TPM/keystores.
-- [ ] **Immutable Transparency Audit Log:**
-  - Integration with Sigstore Rekor append-only transparency log proofs to ensure non-repudiation.
-- [ ] **QUIC / HTTP/3 Transport Upgrade:**
-  - Migrate from Gorilla WebSocket over TCP (`internal/agent/conn.go`) to HTTP/3 & QUIC over UDP port 443.
-  - 64-bit Connection IDs for uninterrupted connection migration across roaming Wi-Fi/cellular transitions.
+### Phase 3: Signed Actions & Tamper-Evident Audit *(In progress)*
+Plan: [`docs/plans/2026-10-06-phase3-signed-actions.md`](plans/2026-10-06-phase3-signed-actions.md). Re-scoped on 2026-10-06: browser WebAuthn signing first and an out-of-band signer later; a local Merkle log instead of Sigstore Rekor; QUIC deferred.
+- [x] **3A Signed actions** *(implemented; not yet exercised with a real browser and security key)*: operator-signed manifests (WebAuthn: ES256/EdDSA/RS256) verified by the agent before any destructive action, shell/desktop session, or update; pinned trust bundle with quorum rotation and an offline recovery key; off → audit → enforce rollout; anti-replay by nonce, expiry and target binding. A failed check rejects and alerts, never isolates.
+- [x] **3B Standing approvals:** signed, content-hash-bound approvals for unattended runs (scheduled tasks, automations, patch policies, software catalog and client portal).
+- [ ] **3C Transparency log:** embedded RFC 6962-style Merkle log (`golang.org/x/mod/sumdb/tlog`) with signed tree heads; agents verify inclusion and consistency and keep their own executed-action log.
+- [ ] **3D Out-of-band signer & M-of-N:** a signer the server does not serve (native WebAuthn on Windows, or a native Android approval screen), closing the blind-signing gap against a fully compromised server.
+- [ ] **3E QUIC / HTTP/3 (deferred):** opt-in, with WebSocket fallback and per-request streams to remove head-of-line blocking.
 
 ### Phase 4: Data Scaling & Local Mesh Distribution
 - [ ] **Embedded Dual-Engine Storage:**

@@ -34,6 +34,8 @@ Usage:
   rmm-server user add --username U [--role admin|tech|viewer]   (prompts for password)
   rmm-server user passwd --username U
   rmm-server user list
+  rmm-server trust sign-bundle --key FILE --bundle FILE [--out FILE]
+                                    sign a trust-bundle proposal with the offline recovery key
   rmm-server version
 
 Flags for run/install:
@@ -51,7 +53,8 @@ install resolves --data, --cert, --key and --dev-web to absolute paths before st
 in the service definition, because the service manager runs from a different directory.
 
 Environment: RMM_DATA_DIR, RMM_LISTEN, RMM_PUBLIC_URL, RMM_CERT_FILE, RMM_KEY_FILE, RMM_INSECURE,
-             RMM_TRUSTED_PROXIES, RMM_DEV_WEB_DIR, RMM_DEBUG
+             RMM_TRUSTED_PROXIES, RMM_DEV_WEB_DIR, RMM_DEBUG,
+             RMM_WEBAUTHN_RP_ID, RMM_WEBAUTHN_ORIGINS (comma-separated; default: derived from the public URL)
 
 First run: with no users yet, navigate to the web console in your browser (e.g.
 https://localhost:8443) to create the first administrator account.
@@ -355,6 +358,8 @@ func run(args []string) int {
 		}
 	case "user":
 		return runUser(args)
+	case "trust":
+		return runTrust(args)
 	case "setup-code":
 		return runSetupCode(args)
 	default:

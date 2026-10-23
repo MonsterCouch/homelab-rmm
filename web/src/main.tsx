@@ -7,6 +7,7 @@ import { App } from './App';
 import { AuthProvider } from './state/auth';
 import { ToastProvider } from './state/toast';
 import { ConfirmProvider } from './components/Modal';
+import { SigningHost } from './components/SigningDialog';
 import { EventsProvider } from './hooks/useEvents';
 import { ErrorBoundary } from './components/ui';
 import { applyTheme } from './hooks/useTheme';
@@ -29,6 +30,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
               <BrowserRouter>
                 <App />
               </BrowserRouter>
+              <SigningHost />
             </ConfirmProvider>
           </EventsProvider>
         </AuthProvider>

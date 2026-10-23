@@ -72,6 +72,43 @@ type PortalCommentReq struct {
 }
 
 // agentOSFamily is "windows", "linux" or "" for anything else.
+// catalogBody is the exact script a catalog item runs for an action on one
+// kind of system: the item's own command, or the winget fallback, with the
+// unattended flags a Windows run needs. The standing approval of a catalog
+// item binds THIS text (docs/plans/2026-10-06-phase3-signed-actions.md, 3.7),
+// so the portal and the Review & sign page must both come through here.
+func catalogBody(item *SoftwareCatalogItem, action string, isWin bool) string {
+	var cmd string
+	switch action {
+	case "install":
+		cmd = item.InstallCmd
+		if cmd == "" && isWin {
+			cmd = fmt.Sprintf("winget install --id %s -e --silent --accept-source-agreements --accept-package-agreements --disable-interactivity", item.Name)
+		}
+	case "uninstall":
+		cmd = item.UninstallCmd
+		if cmd == "" && isWin {
+			cmd = fmt.Sprintf("winget uninstall --id %s -e --silent --disable-interactivity", item.Name)
+		}
+	case "update":
+		cmd = item.UpdateCmd
+		if cmd == "" {
+			if strings.Contains(item.InstallCmd, "winget install") {
+				cmd = strings.Replace(item.InstallCmd, "winget install", "winget upgrade", 1)
+			} else {
+				cmd = item.InstallCmd
+			}
+		}
+		if cmd == "" && isWin {
+			cmd = fmt.Sprintf("winget upgrade --id %s -e --silent --accept-source-agreements --accept-package-agreements --disable-interactivity", item.Name)
+		}
+	}
+	if strings.TrimSpace(cmd) != "" && isWin {
+		cmd = ensureWinGetFlags(cmd, action)
+	}
+	return cmd
+}
+
 func agentOSFamily(a *Agent) string {
 	low := strings.ToLower(a.OS)
 	switch {
@@ -260,39 +297,10 @@ func (s *Server) handlePortalSoftwareAction(w http.ResponseWriter, r *http.Reque
 		lang = "bash"
 	}
 
-	var cmd string
-	switch req.Action {
-	case "install":
-		cmd = item.InstallCmd
-		if cmd == "" && isWin {
-			cmd = fmt.Sprintf("winget install --id %s -e --silent --accept-source-agreements --accept-package-agreements --disable-interactivity", item.Name)
-		}
-	case "uninstall":
-		cmd = item.UninstallCmd
-		if cmd == "" && isWin {
-			cmd = fmt.Sprintf("winget uninstall --id %s -e --silent --disable-interactivity", item.Name)
-		}
-	case "update":
-		cmd = item.UpdateCmd
-		if cmd == "" {
-			if strings.Contains(item.InstallCmd, "winget install") {
-				cmd = strings.Replace(item.InstallCmd, "winget install", "winget upgrade", 1)
-			} else {
-				cmd = item.InstallCmd
-			}
-		}
-		if cmd == "" && isWin {
-			cmd = fmt.Sprintf("winget upgrade --id %s -e --silent --accept-source-agreements --accept-package-agreements --disable-interactivity", item.Name)
-		}
-	}
-
+	cmd := catalogBody(item, req.Action, isWin)
 	if strings.TrimSpace(cmd) == "" {
 		writeErr(w, http.StatusBadRequest, fmt.Sprintf("no %s command available for %s", req.Action, item.Name))
 		return
-	}
-
-	if isWin {
-		cmd = ensureWinGetFlags(cmd, req.Action)
 	}
 
 	who := ""
@@ -308,6 +316,9 @@ func (s *Server) handlePortalSoftwareAction(w http.ResponseWriter, r *http.Reque
 		Trigger:  "client-portal",
 		RunBy:    fmt.Sprintf("portal:%s:%s", req.Action, who),
 		Name:     fmt.Sprintf("Self-Service: %s %s", strings.Title(req.Action), item.Name),
+		// The contact never signs: the catalog item's standing approval
+		// vouches for this exact generated body (3.7).
+		Standing: &standingRef{Type: approvalCatalog, ID: item.ID},
 	}
 
 	runID, err := s.runs.Start(a.ID, runReq)

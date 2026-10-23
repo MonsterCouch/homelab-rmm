@@ -201,6 +201,15 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 			if session != "" {
 				continue
 			}
+			// Where the organization signs actions, a shell opens only under
+			// a grant the operator signed beforehand (POST /api/agents/{id}/grant);
+			// a websocket cannot answer 428 itself.
+			shellAuth, deny := s.grantAuth(r, agentID, protocol.ReqShellOpen)
+			if deny != "" {
+				send(map[string]any{"t": "error", "message": deny})
+				closeCode, closeText = websocket.ClosePolicyViolation, deny
+				return
+			}
 			// "opened" means a shell exists, so it waits for the device to
 			// say so rather than going out on the strength of a write to the
 			// agent socket: an open the device refuses (an unsupported shell
@@ -235,7 +244,7 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 				}
 				queued = nil
 			}
-			id, c, err := s.hub.Stream(agentID, protocol.ReqShellOpen, protocol.ShellOpen{Shell: msg.Shell, Cols: msg.Cols, Rows: msg.Rows}, func(env protocol.Envelope) {
+			id, c, err := s.hub.StreamA(agentID, protocol.ReqShellOpen, protocol.ShellOpen{Shell: msg.Shell, Cols: msg.Cols, Rows: msg.Rows}, func(env protocol.Envelope) {
 				openMu.Lock()
 				defer openMu.Unlock()
 				if env.Err != "" {
@@ -259,7 +268,7 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 					forward(map[string]any{"t": "out", "data": chunk.Data})
 				}
 				settle()
-			})
+			}, shellAuth)
 			if err != nil {
 				send(map[string]any{"t": "error", "message": err.Error()})
 				closeCode, closeText = websocket.CloseInternalServerErr, "shell could not be opened: "+err.Error()
@@ -528,6 +537,12 @@ func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 		ds.finish()
 	}()
 	s.audit(r, "desktop.open", agentID, nil)
+	desktopAuth, deny := s.grantAuth(r, agentID, protocol.ReqDesktopStart)
+	if deny != "" {
+		vw.json(map[string]string{"t": "error", "message": deny})
+		closeCode, closeText = websocket.ClosePolicyViolation, deny
+		return
+	}
 
 	quality := int(queryInt(r, "quality", 60))
 	// The viewer asks for WebRTC with ?webrtc=1 and the backstage
@@ -552,7 +567,7 @@ func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		var res protocol.DesktopStartResult
-		err := s.hub.Request(ctx, agentID, protocol.ReqDesktopStart, protocol.DesktopStart{Token: token, Quality: quality, Mode: mode, EnableWebRTC: enableWebRTC}, &res)
+		err := s.hub.RequestA(ctx, agentID, protocol.ReqDesktopStart, protocol.DesktopStart{Token: token, Quality: quality, Mode: mode, EnableWebRTC: enableWebRTC}, &res, desktopAuth)
 		if err != nil {
 			vw.json(map[string]string{"t": "error", "message": err.Error()})
 			startErr <- err

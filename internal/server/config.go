@@ -34,6 +34,14 @@ type Config struct {
 	// to a public STUN server so direct P2P still works on most networks; a
 	// LAN-only or NAT-restricted deployment should set its own TURN here.
 	ICEServers []string
+	// WebAuthnRPID and WebAuthnOrigins override what security-key
+	// registration and the trust bundle derive from the public URL (the
+	// hostname, and scheme://host[:port]). They exist for a console reached
+	// under several names or behind a proxy that rewrites the host: the RP ID
+	// and origins are pinned into every agent's trust bundle, so they must be
+	// exactly what the operators' browsers will report.
+	WebAuthnRPID    string
+	WebAuthnOrigins []string
 }
 
 // defaultICEServers is used when none are configured: a public STUN server is
@@ -121,6 +129,17 @@ func (c Config) FromEnv() Config {
 		for _, s := range strings.Split(v, ",") {
 			if s = strings.TrimSpace(s); s != "" {
 				c.ICEServers = append(c.ICEServers, s)
+			}
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("RMM_WEBAUTHN_RP_ID")); v != "" {
+		c.WebAuthnRPID = v
+	}
+	if v := os.Getenv("RMM_WEBAUTHN_ORIGINS"); v != "" {
+		c.WebAuthnOrigins = nil
+		for _, o := range strings.Split(v, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				c.WebAuthnOrigins = append(c.WebAuthnOrigins, o)
 			}
 		}
 	}
