@@ -102,6 +102,17 @@ func (s *Server) planRuns(r *http.Request, in runScriptInput, agentIDs []string)
 	}
 	me := userFrom(r.Context())
 	pl := &runPlan{req: req, out: map[string]string{}}
+	// Whether an organization signs actions, looked up once per organization
+	// rather than once per device: a bulk run names thousands.
+	signs := map[string]bool{}
+	orgSigns := func(org string) bool {
+		v, ok := signs[org]
+		if !ok {
+			v = s.activeBundle(org) != nil
+			signs[org] = v
+		}
+		return v
+	}
 	for _, id := range agentIDs {
 		a, err := s.db.GetAgent(id)
 		if err != nil {
@@ -117,6 +128,17 @@ func (s *Server) planRuns(r *http.Request, in runScriptInput, agentIDs []string)
 				pl.out[id] = "skipped: os mismatch"
 				continue
 			}
+		}
+		if !s.hub.IsOnline(id) && orgSigns(a.OrgID) {
+			// Nothing can be sent, so do not ask the operator to sign for a
+			// device that cannot receive it. Ad hoc bodies are never queued
+			// and keep their usual answer, as in startOneRun.
+			if req.Script == nil {
+				pl.out[id] = "error: " + ErrAgentOffline.Error()
+			} else {
+				pl.out[id] = "error: " + ErrSignedRunOffline.Error()
+			}
+			continue
 		}
 		pl.targets = append(pl.targets, id)
 	}
@@ -181,6 +203,16 @@ func (s *Server) runScripts(w http.ResponseWriter, r *http.Request, in runScript
 // startOneRun takes a single-device run through the signing flow. respond
 // writes the handler's response from the outcome of Start.
 func (s *Server) startOneRun(w http.ResponseWriter, r *http.Request, req RunRequest, agentID, orgID string, respond func(w http.ResponseWriter, r *http.Request, runID string, err error)) {
+	if s.activeBundle(orgID) != nil && !s.hub.IsOnline(agentID) {
+		// Nothing can be sent, so nothing is worth signing for. Ad hoc
+		// bodies are never queued and keep their usual answer.
+		if req.Script == nil {
+			respond(w, r, "", ErrAgentOffline)
+		} else {
+			respond(w, r, "", ErrSignedRunOffline)
+		}
+		return
+	}
 	run := func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth) {
 		req := req
 		req.Auth = auth

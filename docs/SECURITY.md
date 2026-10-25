@@ -184,7 +184,9 @@ The console says so in the Add-check dialog. Have the check read a secret on the
 file operation (`file.download`, `file.upload`, `file.delete`, `file.mkdir`, `file.rename`),
 settings change and user change is written to the `audit` table with user and source address,
 along with `setup.refused` (a wrong setup code), `agent.enrolled`, `agent.rekeyed` and
-`agent.duplicate_hostname`. A **service action, process kill or file operation is audited
+`agent.duplicate_hostname`. A signed action that several operators approved is audited in the
+name of the operator who asked for it, at the address they asked from; each signature is its own
+`action.sign` entry by its signer. A **service action, process kill or file operation is audited
 whether or not it worked**: the attempt is what the log is read for, and a refusal carries
 `"outcome":"failed"` with the device's own error, so "nobody tried to stop the antivirus" and
 "somebody tried and was refused" are not the same empty log — and a sweep for unreadable paths
@@ -213,6 +215,14 @@ desktop session.
 empty hash used to skip verification altogether) and will not fetch one from just anywhere: the
 URL must be `https`, or plain `http` against the configured server's own host, which is the
 `--insecure`-behind-a-proxy deployment. What it installs runs as SYSTEM/root at the next restart.
+In an organization that signs actions, the agent treats the check it makes every five minutes
+(`GET /api/agent/update-check`, where the server supplies both the URL and the hash, so no operator
+is behind it) as an unsigned `agent.update`: in `audit` mode it still installs and raises a security
+alert once for each binary the server advertises, and in `enforce` mode it refuses and reports that
+once. The server stops advertising to devices of organizations in `enforce` mode, so that a fleet
+does not alert every five minutes, but the device refuses on its own whatever the server says.
+Updating such a fleet takes one signed manifest per organization and agent build (see Signed
+actions, **Updating agents**).
 
 **Downloads.** `/api/agent-download/` is unauthenticated on purpose (the install script runs
 before the device has credentials), restricted to files named `rmm-agent-*` in the agents
@@ -386,6 +396,31 @@ None of them can make a device do anything, because they never touch an operator
 4. When the alerts have stopped, propose the same bundle in `enforce` mode. Devices now refuse
    anything unsigned. Enforce cannot be selected without a recovery key.
 
+**Updating agents.** *Update Agents* (on Devices, and under *Server & Fleet Updates*) works through
+the devices one organization and agent build at a time (2000 devices at most per signature) and asks
+for one signature for each, because a manifest names one organization and carries one binary.
+`agent.update` is high-risk, so each of those manifests needs `high_threshold` signers (1 by default;
+with more, the others sign under **Approvals**). The manifest binds the binary's SHA-256, which the
+device checks after the download, so the server cannot substitute another file under your signature.
+A device that already runs that build answers as done and downloads and restarts nothing, but the
+signature is asked for before any device is: there is no way to know first, so a repeat costs the
+same touch. Only devices that are online when you start are included, because a manifest lasts 5
+minutes (10 when several signers are needed). A device that was offline waits for the next signed
+push in `enforce` mode, so run *Update Agents* again once it is back (the console says how many were
+offline); in `audit` mode its own five-minute check still updates it and reports the unsigned update.
+The console counts a device as updated *by signed update* only when the server says the update was
+signed, so devices you let through with *Continue without signing* in `audit` mode are counted as
+sent without a signature, and it names the devices that failed with the reason each gave. Online
+devices for which the server has no agent build are reported as skipped. The audit log keeps who
+asked and from where (not the address of whoever added the last signature) and, for a failure,
+which devices and why.
+
+A signed run is never queued for an offline device: its signature lasts 5 minutes, so a queued run
+would start long after it expired and reach the device unsigned (an alarm in `audit` mode, a refusal
+in `enforce`). The console refuses it up front and asks you to run it again when the device is
+online. Unattended runs (tasks and automations) still queue, and the queued row keeps its standing
+approval, which the server presents when the device reconnects.
+
 **Changing the bundle** (adding an operator, a key or a recovery key, or changing the mode)
 takes signatures from operators of the **current** bundle, so the server cannot add its own key.
 
@@ -401,6 +436,40 @@ Paste the output into the same dialog.
 **A device that refuses everything** after its `trust.json` (next to `agent.json`) was damaged
 has failed closed on purpose. An administrator on that device can delete `trust.json`; the agent
 then pins the server's current bundle on its next connection, as on first use.
+
+### Transparency log
+
+The server keeps an append-only Merkle log (`internal/translog`, built on `golang.org/x/mod/sumdb/tlog`,
+the code behind Go's checksum database) of every manifest and signature set it releases, every trust
+bundle it activates and every audit row, with tree heads signed by a log key in `<data dir>/log.key`
+(mode 0600). A bundle pins that key as `log_key`; the server always adds its own when it composes a
+bundle and refuses a proposal naming another. A device holding such a bundle checks, before it runs a
+protected, signed request, that the manifest is in the log (it rebuilds the leaf itself and checks an
+inclusion proof against a signed head) and that the log only grew since the head it last accepted (a
+consistency proof; the head is kept in `log_head.json` next to `agent.json`). A bad proof is refused in
+`enforce` and reported once in `audit`; a request with no proof is refused only when the bundle's policy
+sets **Require log proofs** (`require_log_proof`, which needs a `log_key`). A manifest refused for its
+proof has spent its nonce, so the operator signs again. A damaged `log_head.json` fails closed like a
+damaged `trust.json`: the device refuses protected requests until an administrator deletes the file
+after confirming that the server's log is the one to trust, and changing `log_key` needs the same step.
+
+Each device also keeps `executed.log`, one hash-chained line per manifest it ran, and reports the head
+in hello and inventory, so the server cannot drop a manifest from a device's history without the head
+disagreeing with the file. Anyone can check from outside that the log only grew:
+
+```
+rmm-server log verify --server https://rmm.lan:8443 --key homelab-rmm-log+...
+```
+
+The first run pins the head in `log-verify.json` (or `--state`); later runs demand a consistency proof
+from it and report a rewritten or shrunk log. `rmm-server log head` prints the head and key. The log
+means the server cannot release or rewrite anything quietly. It does not protect against:
+- a server that never dispatches an action: nothing is logged because nothing was sent, so a device
+  that never hears from the server looks like an idle one;
+- an operator who holds both the log key and the database: they can rebuild a consistent log. Run
+  `log verify` from another host so that a rebuilt log fails its consistency check, and guard `log.key`;
+- a log that nobody checks: devices verify proofs only when the bundle pins `log_key`, and the command
+  only when someone runs it.
 
 ## What is not protected
 
@@ -515,7 +584,7 @@ backed by strict tenant-scoping defenses and role-based access control:
      (`/api/software-catalog`) requires the `admin` role. Technicians can trigger installs on scoped
      devices, but cannot alter package repositories or binaries.
    - **Automations & Fleet Updates (`VULN-008`, `VULN-011`)**: Accessing or modifying event automations
-     (`/api/automations`, `VULN-008`), triggering fleet-wide agent updates (`POST /api/agents/update-all`, `VULN-011`),
+     (`/api/automations`, `VULN-008`), triggering fleet-wide agent updates (`POST /api/agents/update-all`, `VULN-011`, and `POST /api/agents/update-batch`),
      in-place server updates (`POST /api/server/update`), and full system audit logs (`/api/audit`) require full `admin` rights.
    - **Network Subnet Scanning (`VULN-013`)**: Initiating server-side network scans without an agent probe
      (`POST /api/network-scans`) requires the `admin` role (`VULN-013`). Technicians can only dispatch scans via online agents in their `org_scope`.

@@ -49,10 +49,18 @@ func (s *Server) routes() http.Handler {
 
 	mux.HandleFunc("GET /api/agent/update-check", s.handleAgentUpdateCheck)
 
+	// Transparency log heads and proofs hold only hashes and sizes, and an
+	// outside auditor has no session. The leaves themselves are admin only
+	// (below).
+	mux.HandleFunc("GET /api/log/head", s.handleLogHead)
+	mux.HandleFunc("GET /api/log/proof", s.handleLogProof)
+	mux.HandleFunc("GET /api/log/consistency", s.handleLogConsistency)
+
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/server/version", s.handleServerVersionInfo)
 	api.HandleFunc("POST /api/server/update", s.requireAdmin(s.handleServerUpdate))
 	api.HandleFunc("POST /api/agents/update-all", s.requireAdmin(s.handleDispatchAllAgentsUpdate))
+	api.HandleFunc("POST /api/agents/update-batch", s.requireAdmin(s.handleDispatchAgentBatchUpdate))
 	api.HandleFunc("GET /api/me", s.handleMe)
 	api.HandleFunc("POST /api/me/password", s.handleChangePassword)
 	api.HandleFunc("POST /api/me/totp/begin", s.handleTOTPBegin)
@@ -77,6 +85,7 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("GET /api/agents/{id}/fs", s.handleFsList)
 	api.HandleFunc("GET /api/agents/{id}/fs/download", s.requireWrite(s.handleFsDownload))
 	api.HandleFunc("POST /api/agents/{id}/fs/upload", s.requireWrite(s.handleFsUpload))
+	api.HandleFunc("POST /api/agents/{id}/fs/commit", s.requireWrite(s.handleFsCommit))
 	api.HandleFunc("POST /api/agents/{id}/fs/delete", s.requireWrite(s.handleFsDelete))
 	api.HandleFunc("POST /api/agents/{id}/fs/mkdir", s.requireWrite(s.handleFsMkdir))
 	api.HandleFunc("POST /api/agents/{id}/fs/rename", s.requireWrite(s.handleFsRename))
@@ -111,6 +120,7 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("GET /api/trust/proposals/{pid}", s.requireAdmin(s.handleGetTrustProposal))
 	api.HandleFunc("POST /api/trust/proposals/{pid}/sign", s.requireAdmin(s.handleSignTrustProposal))
 	api.HandleFunc("POST /api/trust/proposals/{pid}/recovery", s.requireAdmin(s.handleRecoverTrustProposal))
+	api.HandleFunc("GET /api/log/entries/{index}", s.requireAdmin(s.handleLogEntry))
 
 	// Signed actions: the approvals queue, standing approvals of unattended
 	// objects, and the grants behind the shell, desktop and file browser.
@@ -314,6 +324,8 @@ func fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusNotFound, "not found")
 	case errors.Is(err, ErrAgentOffline):
 		writeErr(w, http.StatusConflict, "agent is offline")
+	case errors.Is(err, ErrSignedRunOffline):
+		writeErr(w, http.StatusConflict, err.Error())
 	default:
 		writeErr(w, http.StatusBadRequest, err.Error())
 	}
@@ -350,8 +362,20 @@ func actor(r *http.Request) string {
 	return "anonymous"
 }
 
+// audit records what a request did in the name of the person it speaks for,
+// at their address.
 func (s *Server) audit(r *http.Request, action, target string, details any) {
-	s.db.Audit(actor(r), s.clientIP(r), action, target, details)
+	s.db.Audit(actor(r), s.requesterIP(r), action, target, details)
+}
+
+// requesterIP is the address of the person a request speaks for: the client's,
+// unless the request runs a signed action for the operator who asked for it,
+// whose address the pending entry kept (see withIssuer).
+func (s *Server) requesterIP(r *http.Request) string {
+	if from, ok := r.Context().Value(issuerAddrKey{}).(string); ok && from != "" {
+		return from
+	}
+	return s.clientIP(r)
 }
 
 // ---- auth handlers ----
@@ -738,7 +762,7 @@ func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "limit", 200)
-	rows, err := s.db.Query(`SELECT id, ts, user, ip, action, target, details FROM audit ORDER BY ts DESC, id DESC LIMIT ?`, limit)
+	rows, err := s.db.Query(`SELECT id, ts, user, ip, action, target, details, log_index FROM audit ORDER BY ts DESC, id DESC LIMIT ?`, limit)
 	if err != nil {
 		fail(w, err)
 		return
@@ -752,11 +776,14 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 		Action  string `json:"action"`
 		Target  string `json:"target"`
 		Details string `json:"details"`
+		// LogIndex is the row's leaf in the transparency log, -1 for rows from
+		// before the log or whose append failed.
+		LogIndex int64 `json:"log_index"`
 	}
 	out := []row{}
 	for rows.Next() {
 		var x row
-		rows.Scan(&x.ID, &x.TS, &x.User, &x.IP, &x.Action, &x.Target, &x.Details)
+		rows.Scan(&x.ID, &x.TS, &x.User, &x.IP, &x.Action, &x.Target, &x.Details, &x.LogIndex)
 		out = append(out, x)
 	}
 	writeJSON(w, 200, out)

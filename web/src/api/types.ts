@@ -224,6 +224,8 @@ export interface Agent {
   isolated?: boolean;
   isolated_at?: number;
   isolated_by?: string;
+  /** head of the device's executed-action log, as the device last reported it */
+  executed_head?: string;
 }
 
 export interface AgentUpdate {
@@ -571,6 +573,8 @@ export interface AuditRow {
   action: string;
   target: string;
   details: string;
+  /** the entry's leaf in the transparency log; -1 when it was never logged */
+  log_index?: number;
 }
 
 export interface Dashboard {
@@ -1093,6 +1097,66 @@ export interface ServerVersionInfo {
   staged_update?: StagedUpdate;
 }
 
+/**
+ * Online devices of one organization that need one build of the agent, at most
+ * as many as one update may cover (a build more devices run comes back as
+ * several groups). A signed update names one organization and one binary, so
+ * each group costs one signature (lib/fleetUpdate.ts walks them).
+ */
+export interface SignedUpdateGroup {
+  /** organization id */
+  org: string;
+  org_name?: string;
+  os: string;
+  arch: string;
+  /** version the build reports */
+  version: string;
+  /** SHA-256 of the binary: the signature covers it and each device checks it */
+  sha256: string;
+  agent_ids: string[];
+}
+
+/**
+ * Reply to a fleet-wide update. Devices of organizations that do not sign
+ * actions are updated at once; the others come back as groups that still need
+ * a signature.
+ */
+export interface UpdateAllResult {
+  ok: boolean;
+  /** devices of organizations without signing that were sent the update */
+  dispatched_to: number;
+  signed_groups: SignedUpdateGroup[];
+  /** online devices the server has no agent build for (their OS or architecture), which it sent nothing */
+  skipped_no_build: number;
+  /** online devices left out because they reported the build being pushed within the last day */
+  up_to_date: number;
+  message: string;
+}
+
+/** Reply to a signed update of one group's devices. */
+export interface UpdateBatchResult {
+  ok: boolean;
+  /** devices that took the update: those that confirmed it and those still installing it */
+  dispatched_to: number;
+  /**
+   * whether the update went out under a signature. False for an update nobody
+   * signed: an operator who continued without signing in an organization that
+   * only audits, or an organization that stopped signing since the listing.
+   */
+  signed: boolean;
+  /** devices that confirmed it */
+  accepted: number;
+  /** devices that did not reply within 20 s: still downloading and staging the binary */
+  installing: number;
+  /** devices that were not connected */
+  offline: number;
+  /** devices that did not take the update because they answered with an error or could not be sent it, with the reason */
+  failed: { id: string; name?: string; error: string }[];
+  /** devices left out of the update because they already run this build */
+  up_to_date: number;
+  message: string;
+}
+
 // ---- Phase 3: operator-signed actions ----
 // docs/plans/2026-10-06-phase3-signed-actions.md §4.1. Binary values are
 // unpadded base64url strings.
@@ -1124,6 +1188,7 @@ export interface TrustPolicy {
   high_threshold?: number;
   bundle_threshold?: number;
   bulk_limit?: number;
+  require_log_proof?: boolean;
 }
 
 export interface TrustSigner {
@@ -1143,6 +1208,7 @@ export interface TrustCurrent {
   recovery_ids?: string[] | null;
   rp_id?: string;
   origins?: string[] | null;
+  log_key?: string;
 }
 
 export interface TrustProposal {
@@ -1154,6 +1220,15 @@ export interface TrustProposal {
   have: number;
   created_by?: string;
   created_at?: number;
+}
+
+/** GET /api/log/head: the transparency log's current signed head. */
+export interface LogHead {
+  size: number;
+  hash: string;
+  /** the verifier key an auditor pins */
+  key: string;
+  note: string;
 }
 
 export interface TrustAgentCounts {
@@ -1175,6 +1250,7 @@ export interface TrustProposalInput {
   high_threshold: number;
   bundle_threshold: number;
   bulk_limit: number;
+  require_log_proof: boolean;
   signers: { owner: string; credential_ids: string[] }[];
   /** only the public half ever leaves the browser */
   recovery: { id: string; pub: string }[];
@@ -1206,7 +1282,23 @@ export interface UnsignedObject {
   id: string | number;
   name: string;
   reason: 'missing' | 'expired' | 'content changed';
+  /** the organization the approval is for */
+  org: string;
+  /** what the signature covers when the object has several (a patch policy's "install" and "reboot", a catalog item's "install/windows"); empty when there is one */
+  purpose: string;
 }
+
+/** POST /api/approvals/objects/{type}/{id}/sign */
+export type SignObjectResult =
+  | {
+      expires_at?: number;
+      org?: string;
+      purpose?: string;
+      /** other units of the same object that still need a signature */
+      remaining?: number;
+      already_approved?: boolean;
+    }
+  | ApprovalPending;
 
 /** POST /api/agents/{id}/grant */
 export interface GrantResult {

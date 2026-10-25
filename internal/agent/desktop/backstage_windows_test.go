@@ -126,6 +126,20 @@ func openTestDesktop(t *testing.T) *backstageDesktop {
 	return d
 }
 
+// skipUnlessElevated skips a test that needs tools to run on the backstage
+// desktop. The desktop's DACL admits only SYSTEM and Administrators
+// (backstageSDDL) and the tools run on a copy of this process's token, so from a
+// session that is not elevated every tool dies while loading user32 (exit code
+// 0xC0000142) and no window can ever appear. The code is not at fault there:
+// the session cannot host it. The agent runs as SYSTEM, which is elevated, so
+// where the product runs these tests are not skipped.
+func skipUnlessElevated(t *testing.T) {
+	t.Helper()
+	if !windows.GetCurrentProcessToken().IsElevated() {
+		t.Skip("needs an elevated (administrator or SYSTEM) token: the backstage desktop admits only those, so its tools exit at once from this session")
+	}
+}
+
 func TestBackstageDesktopLifecycle(t *testing.T) {
 	d := openTestDesktop(t)
 	if d.h == 0 {
@@ -230,6 +244,7 @@ func TestBackstageDesktopDACL(t *testing.T) {
 // desktop, checks that its window is composited into the frame, drives it with
 // posted messages, and checks the physical cursor did not move.
 func TestBackstageLiveCompositeAndInput(t *testing.T) {
+	skipUnlessElevated(t)
 	d := openTestDesktop(t)
 	d.retain()
 	ptr := &bsPointerPos{}
@@ -410,6 +425,7 @@ func diffPixels(a, b *image.RGBA) int {
 // TestBackstageToolSuiteStartsAndStops runs the real default suite and checks
 // that closing the session leaves no process behind.
 func TestBackstageToolSuiteStartsAndStops(t *testing.T) {
+	skipUnlessElevated(t)
 	c, inj, err := newBackstage()
 	if err != nil {
 		t.Skipf("newBackstage unavailable here: %v", err)

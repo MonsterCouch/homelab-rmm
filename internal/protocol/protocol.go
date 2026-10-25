@@ -24,6 +24,10 @@ type Envelope struct {
 	// trust bundle ignore it; old agents never see it as anything but an
 	// unknown field.
 	A *ActionAuth `json:"a,omitempty"`
+	// Log is set on an agent's reply to a protected request: the size of the
+	// transparency log head the device holds now, so the server can send the
+	// next consistency proof from the right place.
+	Log int64 `json:"log,omitempty"`
 }
 
 // Message types sent by the agent.
@@ -73,6 +77,8 @@ const (
 	ReqNetworkScan       = "network.scan"       // agent-driven subnet probe
 	ReqSNMPPoll          = "snmp.poll"          // agent-driven SNMP query
 	ReqTrustUpdate       = "trust.update"       // replace the agent's trust bundle (signed by the current bundle's signers or a recovery key)
+	ReqFsStage           = "fs.stage"           // append a chunk of an upload to an agent-private staging file; nothing reads it until fs.commit
+	ReqFsCommit          = "fs.commit"          // move a staged upload into place once its size and SHA-256 match
 )
 
 // TypeBaseline is sent by the agent after every evaluation pass (scheduled,
@@ -93,6 +99,11 @@ type Hello struct {
 	// is missing as trust.update requests after the welcome.
 	TrustEpoch int64  `json:"trust_epoch,omitempty"`
 	TrustHash  string `json:"trust_hash,omitempty"`
+	// LogSize is the size of the last transparency log head the device
+	// accepted (0: none yet). ExecutedHead is the head of the device's
+	// hash-chained executed.log.
+	LogSize      int64  `json:"log_size,omitempty"`
+	ExecutedHead string `json:"executed_head,omitempty"`
 }
 
 // AgentConfig is pushed by the server after hello and whenever settings change.
@@ -136,13 +147,16 @@ type Inventory struct {
 	Software      []Software `json:"software"`
 	GPUs          []string   `json:"gpus"`
 	PublicIP      string     `json:"public_ip,omitempty"`
-	PendingReboot bool       `json:"pending_reboot"`
-	AntivirusName string     `json:"antivirus,omitempty"`
-	LastUser      string     `json:"last_user,omitempty"`
-	AgentVersion  string     `json:"agent_version"`
-	AgentPath     string     `json:"agent_path"`
-	CollectedAt   int64      `json:"collected_at"`
-	Extra         Extra      `json:"extra,omitempty"`
+	// ExecutedHead is the head of the device's hash-chained executed.log,
+	// reported so the server cannot quietly drop an executed manifest.
+	ExecutedHead  string `json:"executed_head,omitempty"`
+	PendingReboot bool   `json:"pending_reboot"`
+	AntivirusName string `json:"antivirus,omitempty"`
+	LastUser      string `json:"last_user,omitempty"`
+	AgentVersion  string `json:"agent_version"`
+	AgentPath     string `json:"agent_path"`
+	CollectedAt   int64  `json:"collected_at"`
+	Extra         Extra  `json:"extra,omitempty"`
 }
 
 // Extra holds free-form platform specifics.
@@ -402,6 +416,27 @@ type FsWrite struct {
 	Append bool   `json:"append"`
 }
 
+// FsStage appends Data at Offset of the staging file for UploadID. Offset
+// must equal the bytes staged so far (0 starts the upload over), so a chunk
+// that arrives twice or out of order is refused rather than corrupting it.
+type FsStage struct {
+	UploadID string `json:"upload_id"`
+	Offset   int64  `json:"offset"`
+	Data     []byte `json:"data"`
+}
+
+// FsCommit moves the staged upload UploadID to Path, but only when the
+// staged bytes are exactly Size long and hash to SHA256 (lowercase hex). It
+// is what an operator signs for an upload: a destination and a digest,
+// rather than the file itself, so a signed upload is not limited by the size
+// of a manifest.
+type FsCommit struct {
+	UploadID string `json:"upload_id"`
+	Path     string `json:"path"`
+	Size     int64  `json:"size"`
+	SHA256   string `json:"sha256"`
+}
+
 type FsPath struct {
 	Path string `json:"path"`
 }
@@ -609,6 +644,20 @@ type Assertion struct {
 type ActionAuth struct {
 	M string      `json:"m"`
 	S []Assertion `json:"s"`
+	// L proves the manifest is in the server's transparency log. The
+	// handler sets only Index; the hub completes the proof per send.
+	L *LogProof `json:"l,omitempty"`
+}
+
+// LogProof is an inclusion proof for a manifest leaf against a signed tree
+// head, optionally with a consistency proof from the head the device last
+// accepted.
+type LogProof struct {
+	Head        string   `json:"head"`                  // base64 of the signed tree head note
+	Index       int64    `json:"index"`                 // the manifest's leaf
+	Proof       []string `json:"proof"`                 // inclusion proof, base64 hashes
+	From        int64    `json:"from,omitempty"`        // size of the head the consistency proof starts from, 0 = none
+	Consistency []string `json:"consistency,omitempty"` // consistency proof, base64 hashes
 }
 
 // RecoverySig is an Ed25519 signature by an offline recovery key over the

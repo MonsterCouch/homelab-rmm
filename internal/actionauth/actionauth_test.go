@@ -552,3 +552,31 @@ func TestStandingRefusesForeignEnv(t *testing.T) {
 		}
 	}
 }
+
+func TestBundleLogKeyRules(t *testing.T) {
+	k := authtest.NewKey("alice", actionauth.AlgES256)
+	rec := []*authtest.RecoveryKey{authtest.NewRecoveryKey("rec")}
+	build := func(logKey string, require bool) error {
+		raw := authtest.Bundle(authtest.BundleSpec{Keys: []*authtest.Key{k}, Recovery: rec,
+			Policy: actionauth.Policy{RequireLogProof: require}})
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		if logKey != "" {
+			m["log_key"] = logKey
+		}
+		raw, _ = json.Marshal(m)
+		_, err := actionauth.ParseBundle(raw)
+		return err
+	}
+	if err := build("", true); err == nil {
+		t.Error("require_log_proof without a log key was accepted")
+	}
+	if err := build("not a key", false); err == nil {
+		t.Error("an unparsable log key was accepted")
+	}
+	if err := build("", false); err != nil {
+		t.Errorf("a bundle without a log key was refused: %v", err)
+	}
+}

@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 
+	"golang.org/x/mod/sumdb/note"
+
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
 )
 
@@ -78,6 +80,9 @@ type Policy struct {
 	HighThreshold   int    `json:"high_threshold"`
 	BundleThreshold int    `json:"bundle_threshold"`
 	BulkLimit       int    `json:"bulk_limit"`
+	// RequireLogProof makes a device refuse a protected request that
+	// carries no transparency log proof. It needs the bundle's log_key.
+	RequireLogProof bool `json:"require_log_proof,omitempty"`
 }
 
 // ParseBundle decodes and validates bundle bytes, parsing every public key
@@ -108,6 +113,16 @@ func ParseBundle(raw []byte) (*Bundle, error) {
 		// Enforcing without a way back is how a lost key becomes a fleet
 		// nobody can manage. Refuse it here as well as in the server UI.
 		return nil, errors.New("bundle: enforce mode requires a recovery key")
+	case b.Policy.RequireLogProof && b.LogKey == "":
+		// Devices would refuse every request that carries a manifest.
+		return nil, errors.New("bundle: require_log_proof needs a log_key to check the proofs against")
+	}
+	if b.LogKey != "" {
+		// Parsed here, like the credential keys, so a device or the offline
+		// signer never pins a bundle whose log key it cannot use.
+		if _, err := note.NewVerifier(b.LogKey); err != nil {
+			return nil, fmt.Errorf("bundle: log_key is not a usable transparency log verifier key: %w", err)
+		}
 	}
 	b.raw = append([]byte(nil), raw...)
 	b.hash = sha256.Sum256(raw)

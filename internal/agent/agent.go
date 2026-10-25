@@ -65,6 +65,9 @@ func (a *Agent) socket() *conn {
 }
 
 func (a *Agent) setConn(c *conn) {
+	if c != nil && a.trust != nil {
+		c.logSize = a.trust.logSize
+	}
 	a.cmu.Lock()
 	a.c = c
 	a.cmu.Unlock()
@@ -125,6 +128,7 @@ func (a *Agent) hello() protocol.Hello {
 	}
 	if a.trust != nil {
 		h.TrustEpoch, h.TrustHash = a.trust.epochHash()
+		h.LogSize, h.ExecutedHead = a.trust.logSize(), a.trust.executedHead()
 	}
 	return h
 }
@@ -298,6 +302,11 @@ type agentUpdateCheckResp struct {
 	Version         string `json:"version"`
 	SHA256          string `json:"sha256"`
 	URL             string `json:"url"`
+	// SignedUpdateRequired is what the server sends, instead of advertising a
+	// build, to devices of organizations that enforce signatures: a newer
+	// build is staged, but it reaches the device as a signed agent.update from
+	// the console, never through this unsigned poll.
+	SignedUpdateRequired bool `json:"signed_update_required"`
 }
 
 func (a *Agent) autoUpdateLoop(ctx context.Context) {
@@ -354,13 +363,29 @@ func (a *Agent) checkAutoUpdate(ctx context.Context) {
 		return
 	}
 
+	if res.SignedUpdateRequired {
+		// The server withholds the binary from an unsigned poll, so there is
+		// nothing to install here. Say so once per build, not every five
+		// minutes.
+		if a.trust == nil || a.trust.once("autoupdate-info/"+res.SHA256) {
+			slog.Info("agent auto-update: a new build is staged on the server; this organization requires a signed update from the console", "target_version", res.Version)
+		}
+		return
+	}
+
 	if res.UpdateAvailable && res.URL != "" && res.SHA256 != "" {
-		slog.Info("agent auto-update: new binary available on server, updating...", "target_version", res.Version)
 		uReq := protocol.AgentUpdate{
 			URL:     res.URL,
 			SHA256:  res.SHA256,
 			Version: res.Version,
 		}
+		// An advertised binary is an agent.update nobody signed, so an
+		// organization that signs actions gets to refuse it, before anything
+		// says an update is under way.
+		if !a.autoUpdateAllowed(uReq) {
+			return
+		}
+		slog.Info("agent auto-update: new binary available on server, updating...", "target_version", res.Version)
 		if err := selfUpdate(ctx, a.cfg, uReq, a.IPCClient()); err != nil {
 			slog.Warn("agent auto-update failed", "err", err)
 		}
@@ -372,6 +397,9 @@ func (a *Agent) sendInventory() {
 	if err != nil {
 		slog.Warn("inventory", "err", err)
 		return
+	}
+	if a.trust != nil {
+		inv.ExecutedHead = a.trust.executedHead()
 	}
 	if c := a.socket(); c != nil {
 		c.send(protocol.Envelope{T: protocol.TypeInventory, D: protocol.Must(inv)})
@@ -513,6 +541,16 @@ func (a *Agent) handle(ctx context.Context, env protocol.Envelope) {
 		var in protocol.FsWrite
 		if err = json.Unmarshal(env.D, &in); err == nil {
 			err = fsWrite(in)
+		}
+	case protocol.ReqFsStage:
+		var in protocol.FsStage
+		if err = json.Unmarshal(env.D, &in); err == nil {
+			err = fsStage(in)
+		}
+	case protocol.ReqFsCommit:
+		var in protocol.FsCommit
+		if err = json.Unmarshal(env.D, &in); err == nil {
+			err = fsCommit(in)
 		}
 	case protocol.ReqFsDelete:
 		var in protocol.FsPath

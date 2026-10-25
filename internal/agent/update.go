@@ -85,6 +85,17 @@ func ApplyStagedUpdate(ctx context.Context, cfg *Config, req protocol.AgentUpdat
 		return err
 	}
 
+	// A push of the build this device already runs has nothing to install, and
+	// would still download it, flip the slots and restart the worker, so it is
+	// answered as done. That comes before the standalone check, because a device
+	// that is already on the build has what was asked for whether or not it
+	// could have updated itself. The request has passed authorization by now, so
+	// this skips no verification.
+	if cur := currentBinarySHA256(); cur != "" && strings.EqualFold(cur, req.SHA256) {
+		slog.Info("agent update skipped: this device already runs that build", "sha256", req.SHA256, "version", req.Version)
+		return nil
+	}
+
 	// Standalone fallback handling
 	if ipc == nil {
 		if os.Getenv("RMM_ALLOW_LEGACY_UPDATE") == "1" {

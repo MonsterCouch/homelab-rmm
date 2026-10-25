@@ -19,6 +19,14 @@ import (
 // rmm-agent-linux-amd64, ...). The release archive ships them alongside the
 // server; the install script downloads the right one from here.
 func (s *Server) agentBinaryPath(osName, arch string) string {
+	// Both halves of the name can come from a device (its hello, its inventory,
+	// the update-check query), and filepath.Join cleans a ".." out of the middle
+	// of the result, so an unchecked value walks out of agents/ to any file the
+	// server can read. The install handlers already whitelist the same two
+	// values; the update paths reach here without having done so.
+	if (osName != "windows" && osName != "linux") || !archRe.MatchString(arch) {
+		return ""
+	}
 	name := fmt.Sprintf("rmm-agent-%s-%s", osName, arch)
 	if osName == "windows" {
 		name += ".exe"
@@ -29,14 +37,16 @@ func (s *Server) agentBinaryPath(osName, arch string) string {
 	if exe, err := os.Executable(); err == nil {
 		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "agents", name), filepath.Join(filepath.Dir(exe), name))
 	}
+	// Only a regular file is a build: a device node such as /dev/zero passes a
+	// not-a-directory test and would make the hash below read forever.
 	for _, c := range candidates {
-		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+		if st, err := os.Stat(c); err == nil && st.Mode().IsRegular() {
 			return c
 		}
 	}
 	if dev := devDistDir(); dev != "" {
 		p := filepath.Join(dev, name)
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+		if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() {
 			return p
 		}
 	}
@@ -79,7 +89,7 @@ func (s *Server) agentBinarySHA256(osName, arch string) string {
 		return ""
 	}
 	st, err := os.Stat(p)
-	if err != nil {
+	if err != nil || !st.Mode().IsRegular() {
 		return ""
 	}
 	key := fmt.Sprintf("%s|%d|%d", p, st.Size(), st.ModTime().UnixNano())

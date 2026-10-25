@@ -822,3 +822,51 @@ func sha256Hex(s string) string {
 	c := scriptConstraints("bash", s, nil)
 	return c.BodySHA256
 }
+
+// A catalog item has one approval per action, and "Review & sign" signs them one
+// at a time: each reply says how many units are still unsigned, and asking for an
+// approved unit again must not ask for another key touch.
+func TestSignObjectOneUnitAtATime(t *testing.T) {
+	f := newSignFixture(t, actionauth.ModeAudit, 1, 10)
+	f.addAgent("box1")
+	it := &SoftwareCatalogItem{ID: "sw_two", Name: "Widget", InstallCmd: "apt-get install -y widget", UninstallCmd: "apt-get remove -y widget", OS: "linux"}
+	if err := f.s.db.SaveSoftwareCatalogItem(it); err != nil {
+		t.Fatal(err)
+	}
+	var todo []map[string]any
+	f.admin.mustJSON("GET", "/api/approvals/unsigned?org="+trustOrg, nil, &todo)
+	var purposes []string
+	for _, u := range todo {
+		if u["type"] == "catalog_item" && u["id"] == "sw_two" {
+			purposes = append(purposes, u["purpose"].(string))
+		}
+	}
+	if len(purposes) != 2 {
+		t.Fatalf("catalog item needs %d approvals, want 2: %v", len(purposes), todo)
+	}
+	path := func(p string) string {
+		return "/api/approvals/objects/catalog_item/sw_two/sign?org=" + trustOrg + "&purpose=" + url.QueryEscape(p)
+	}
+	for i, want := range []float64{1, 0} {
+		st, body := signedCall(t, f.admin, f.ka, "POST", path(purposes[i]), nil)
+		if st != 200 {
+			t.Fatalf("sign %q = %d %s", purposes[i], st, body)
+		}
+		var r map[string]any
+		if err := json.Unmarshal(body, &r); err != nil {
+			t.Fatal(err)
+		}
+		if r["purpose"] != purposes[i] || r["remaining"] != want {
+			t.Fatalf("sign %q replied %v, want purpose %q and remaining %v", purposes[i], r, purposes[i], want)
+		}
+	}
+	// Approved now: no manifest, no signature, nothing left.
+	var again map[string]any
+	st, body := f.admin.do("POST", path(purposes[0]), nil)
+	if err := json.Unmarshal(body, &again); err != nil {
+		t.Fatal(err)
+	}
+	if st != 200 || again["already_approved"] != true || again["remaining"] != float64(0) {
+		t.Fatalf("re-sign of an approved unit = %d %v, want 200 already_approved with remaining 0", st, again)
+	}
+}

@@ -95,6 +95,10 @@ export interface BundleView {
   recovery: string[];
   mode: string;
   requireUV: boolean;
+  /** Devices refuse a protected request that carries no transparency log proof. */
+  requireLogProof: boolean;
+  /** The transparency log key devices pin, empty when the bundle pins none. */
+  logKey: string;
   highThreshold: number;
   bundleThreshold: number;
   bulkLimit: number;
@@ -127,6 +131,8 @@ export function decodeBundle(doc: unknown): { bytes: Uint8Array<ArrayBuffer>; b:
       recovery,
       mode: str(pol.mode),
       requireUV: pol.require_uv === true,
+      requireLogProof: pol.require_log_proof === true,
+      logKey: str(o.log_key),
       highThreshold: int(pol.high_threshold),
       bundleThreshold: int(pol.bundle_threshold),
       bulkLimit: int(pol.bulk_limit),
@@ -142,11 +148,15 @@ export function diffBundle(cur: BundleView | null, next: BundleView): string[] {
     out.push(`Mode: ${next.mode || 'unset'}`);
     out.push(`Signers: ${next.signers.length ? next.signers.map((s) => `${s.owner} (${s.creds.length} key${s.creds.length === 1 ? '' : 's'})`).join(', ') : 'none'}`);
     out.push(`Recovery keys: ${next.recovery.length ? next.recovery.join(', ') : 'none'}`);
+    out.push(`Require log proofs: ${next.requireLogProof ? 'yes' : 'no'}`);
+    out.push(`Transparency log key: ${next.logKey || 'none'}`);
     return out;
   }
   out.push(`Epoch ${cur.epoch} → ${next.epoch}`);
   if (cur.mode !== next.mode) out.push(`Mode: ${cur.mode || 'unset'} → ${next.mode || 'unset'}`);
   if (cur.requireUV !== next.requireUV) out.push(`Require user verification: ${cur.requireUV ? 'yes' : 'no'} → ${next.requireUV ? 'yes' : 'no'}`);
+  if (cur.requireLogProof !== next.requireLogProof) out.push(`Require log proofs: ${cur.requireLogProof ? 'yes' : 'no'} → ${next.requireLogProof ? 'yes' : 'no'}`);
+  if (cur.logKey !== next.logKey) out.push(`Transparency log key: ${cur.logKey || 'none'} → ${next.logKey || 'none'}`);
   if (cur.highThreshold !== next.highThreshold) out.push(`High-risk threshold: ${cur.highThreshold} → ${next.highThreshold}`);
   if (cur.bundleThreshold !== next.bundleThreshold) out.push(`Bundle-change threshold: ${cur.bundleThreshold} → ${next.bundleThreshold}`);
   if (cur.bulkLimit !== next.bulkLimit) out.push(`Bulk limit: ${cur.bulkLimit} → ${next.bulkLimit}`);

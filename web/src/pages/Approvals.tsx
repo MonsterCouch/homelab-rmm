@@ -7,6 +7,7 @@ import { useAsync, useInterval } from '../hooks/useAsync';
 import { dateTime, relTime } from '../lib/format';
 import { decodeManifest } from '../lib/manifest';
 import { requestSigning, SigningCancelled } from '../lib/signing';
+import { signAll, signAllTone, summarizeSignAll, unitLabel } from '../lib/signAll';
 import { isWebAuthnUsable } from '../lib/webauthn';
 import { errMsg, useToast } from '../state/toast';
 import '../styles/mobile-pages.css';
@@ -20,6 +21,11 @@ const TYPE_LABEL: Record<UnsignedType, string> = {
   catalog_item: 'Software catalog item',
   baseline: 'Baseline',
 };
+
+/** One row is one unit: an object in an organization, for one purpose. */
+function unitKey(o: UnsignedObject): string {
+  return `${o.type}:${o.id}:${o.org}:${o.purpose}`;
+}
 
 function objectLink(o: UnsignedObject): string {
   switch (o.type) {
@@ -172,15 +178,20 @@ function ReviewTab({ canSign }: { canSign: boolean }) {
   const [org, setOrg] = useState('org_default');
   const list = useAsync(() => api.unsignedApprovals(org), [org]);
   const [busy, setBusy] = useState<string | null>(null);
+  const [all, setAll] = useState(false);
+  const rows = list.data ?? [];
 
   const sign = async (o: UnsignedObject) => {
-    const key = `${o.type}:${o.id}`;
+    const key = unitKey(o);
     setBusy(key);
     try {
       // The server answers 428 with a standing manifest built from the
       // object's current content; request() shows it and retries.
-      const r = await api.signObject(o.type, o.id);
-      if (!isPending(r)) toast.success('Approved', `"${o.name}" may run unattended${'expires_at' in r && r.expires_at ? ` until ${dateTime(r.expires_at)}` : ''}.`);
+      // Org and purpose name this row's unit, so the signature covers what the row says.
+      const r = await api.signObject(o.type, o.id, { org: o.org, purpose: o.purpose });
+      if (isPending(r)) toast.info('Signature added', `"${unitLabel(o)}" is waiting for another approver.`);
+      else if (r.already_approved) toast.info('Already approved', `"${unitLabel(o)}" already has a valid approval.`);
+      else toast.success('Approved', `"${unitLabel(o)}" may run unattended${r.expires_at ? ` until ${dateTime(r.expires_at)}` : ''}.`);
       void list.reload();
     } catch (err) {
       toast.error('Approval failed', errMsg(err));
@@ -189,12 +200,25 @@ function ReviewTab({ canSign }: { canSign: boolean }) {
     }
   };
 
-  const rows = list.data ?? [];
+  const signEvery = async () => {
+    setAll(true);
+    try {
+      const s = await signAll(rows);
+      toast[signAllTone(s)](s.cancelled > 0 ? 'Signing stopped' : 'Approvals', summarizeSignAll(s));
+    } finally {
+      setAll(false);
+      void list.reload();
+    }
+  };
+
   return (
     <div className="card">
       <div className="card-head">
         Unattended work without a valid approval
         <div className="actions">
+          <Button size="sm" variant="primary" busy={all} disabled={!canSign || busy !== null || rows.length === 0} onClick={signEvery}>
+            Sign all
+          </Button>
           <select value={org} onChange={(e) => setOrg(e.target.value)} aria-label="Organization">
             {(orgs.data ?? [{ id: 'org_default', name: 'Default' }]).map((o) => (
               <option key={o.id} value={o.id}>
@@ -225,18 +249,19 @@ function ReviewTab({ canSign }: { canSign: boolean }) {
               </thead>
               <tbody>
                 {rows.map((o) => {
-                  const key = `${o.type}:${o.id}`;
+                  const key = unitKey(o);
                   return (
                     <tr key={key}>
                       <td>{TYPE_LABEL[o.type] ?? o.type}</td>
                       <td>
                         <Link to={objectLink(o)}>{o.name || String(o.id)}</Link>
+                        {o.purpose && <span className="muted small"> ({o.purpose})</span>}
                       </td>
                       <td>
                         <Chip tone={o.reason === 'content changed' ? 'warn' : o.reason === 'expired' ? 'warn' : 'danger'}>{o.reason}</Chip>
                       </td>
                       <td>
-                        <Button size="sm" variant="primary" busy={busy === key} disabled={!canSign} onClick={() => sign(o)}>
+                        <Button size="sm" variant="primary" busy={busy === key} disabled={!canSign || all || (busy !== null && busy !== key)} onClick={() => sign(o)}>
                           Review &amp; sign
                         </Button>
                       </td>

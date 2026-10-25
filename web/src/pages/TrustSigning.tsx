@@ -1,8 +1,9 @@
 import { useMemo, useState } from 'react';
 import { api } from '../api/client';
-import type { TrustCurrent, TrustMode, TrustProposal, TrustProposalInput, WebAuthnCredential } from '../api/types';
+import type { Agent, LogHead, TrustCurrent, TrustMode, TrustProposal, TrustProposalInput, WebAuthnCredential } from '../api/types';
 import { IconPlus } from '../components/Icons';
 import { Modal } from '../components/Modal';
+import { DataTable, type Column } from '../components/DataTable';
 import { Button, Checkbox, Chip, CopyButton, ErrorBox, Field, Loading, Switch } from '../components/ui';
 import { useAsync } from '../hooks/useAsync';
 import { dateTime } from '../lib/format';
@@ -39,10 +40,85 @@ function currentView(c: TrustCurrent, org: string): BundleView {
     recovery: c.recovery_ids ?? [],
     mode: modeOf(c),
     requireUV: c.policy?.require_uv === true,
+    requireLogProof: c.policy?.require_log_proof === true,
+    logKey: c.log_key ?? '',
     highThreshold: c.policy?.high_threshold ?? 1,
     bundleThreshold: c.policy?.bundle_threshold ?? 1,
     bulkLimit: c.policy?.bulk_limit ?? 10,
   };
+}
+
+/** Clip a long hash for a table cell; the caller keeps the full value in a title. */
+function clip(h: string): string {
+  return h.length > 20 ? `${h.slice(0, 12)}…${h.slice(-6)}` : h;
+}
+
+function LogCard({ head, error, onRetry }: { head: LogHead | null; error: string | null; onRetry: () => void }) {
+  const cmd = head ? `rmm-server log verify --server ${window.location.origin} --key ${head.key}` : '';
+  return (
+    <div className="card">
+      <div className="card-head">Transparency log</div>
+      <div className="card-body">
+        {error != null && !head && <ErrorBox error={error} onRetry={onRetry} />}
+        {!head && error == null && <Loading />}
+        {head && (
+          <>
+            <dl className="kv">
+              <dt>Size</dt>
+              <dd>{head.size} entries</dd>
+              <dt>Head</dt>
+              <dd className="mono small" title={head.hash}>
+                {clip(head.hash) || '-'}
+              </dd>
+              <dt>Verifier key</dt>
+              <dd className="row" style={{ gap: 8 }}>
+                <span className="mono small" style={{ wordBreak: 'break-all' }}>
+                  {head.key}
+                </span>
+                <CopyButton text={head.key} label="Copy key" />
+              </dd>
+            </dl>
+            <p className="muted small" style={{ marginBottom: 6 }}>
+              Anyone holding the key can check, from any machine, that the log only ever grew:
+            </p>
+            <div className="code-block">
+              {cmd}
+              <span className="copy">
+                <CopyButton text={cmd} label="Copy" />
+              </span>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DeviceLogHeads({ orgId }: { orgId: string }) {
+  const agents = useAsync(() => api.agents({ org_id: orgId }), [orgId]);
+  const columns: Column<Agent>[] = [
+    { key: 'host', header: 'Device', sort: (a) => a.display_name || a.hostname, render: (a) => <b>{a.display_name || a.hostname}</b> },
+    {
+      key: 'head',
+      header: 'Executed-log head',
+      sort: (a) => a.executed_head ?? '',
+      csv: (a) => a.executed_head ?? '',
+      render: (a) => (
+        <span className="mono small muted" title={a.executed_head || undefined}>
+          {a.executed_head ? clip(a.executed_head) : '-'}
+        </span>
+      ),
+    },
+  ];
+  return (
+    <div className="card" style={{ gridColumn: '1 / -1' }}>
+      <div className="card-head">Device logs</div>
+      <div className="card-body">
+        {agents.error && <ErrorBox error={agents.error} onRetry={agents.reload} />}
+        <DataTable columns={columns} rows={agents.data} loading={agents.loading} rowKey={(a) => a.id} compact emptyTitle="No devices" />
+      </div>
+    </div>
+  );
 }
 
 function download(name: string, text: string): void {
@@ -63,6 +139,7 @@ export function TrustSigning() {
   const [orgId, setOrgId] = useState('org_default');
   const trust = useAsync(() => api.trust(orgId), [orgId]);
   const creds = useAsync(() => api.webauthnCredentials(), []);
+  const logHead = useAsync(() => api.logHead(), []);
   const [editing, setEditing] = useState(false);
   const [recovering, setRecovering] = useState<TrustProposal | null>(null);
   const [signing, setSigning] = useState<string | null>(null);
@@ -94,6 +171,7 @@ export function TrustSigning() {
       if (r.active) toast.success('Trust bundle active', `Epoch ${p.epoch} is live and is being pushed to online devices.`);
       else toast.success('Signature added', `${r.have} of ${r.need} signatures.`);
       void trust.reload();
+      void logHead.reload();
     } catch (err) {
       if (err instanceof SigningCancelled) return;
       toast.error('Signing failed', errMsg(err));
@@ -165,6 +243,8 @@ export function TrustSigning() {
                     high-risk actions need {cur.policy?.high_threshold ?? 1} signer(s) · bundle changes need {cur.policy?.bundle_threshold ?? 1} · bulk over{' '}
                     {cur.policy?.bulk_limit ?? 10} devices
                   </dd>
+                  <dt>Log proofs</dt>
+                  <dd>{cur.policy?.require_log_proof ? 'required' : 'not required'}</dd>
                   <dt>Signers</dt>
                   <dd>
                     {(cur.signers ?? []).length
@@ -183,6 +263,7 @@ export function TrustSigning() {
           </div>
 
           <div className="stack" style={{ gap: 16 }}>
+            <LogCard head={logHead.data ?? null} error={logHead.error} onRetry={logHead.reload} />
             <div className="card">
               <div className="card-head">Devices</div>
               <div className="card-body">
@@ -229,6 +310,7 @@ export function TrustSigning() {
               </div>
             </div>
           </div>
+          <DeviceLogHeads orgId={orgId} />
         </div>
       )}
 
@@ -281,6 +363,7 @@ function ProposalEditor({
   const [high, setHigh] = useState(cur?.policy?.high_threshold ?? 1);
   const [bundleT, setBundleT] = useState(cur?.policy?.bundle_threshold ?? 1);
   const [bulk, setBulk] = useState(cur?.policy?.bulk_limit ?? 10);
+  const [requireLog, setRequireLog] = useState(cur?.policy?.require_log_proof === true);
   // Start from who is trusted now; for the very first bundle, from your own keys.
   const [chosen, setChosen] = useState<Set<string>>(() => {
     if (cur) return new Set((cur.signers ?? []).flatMap(credIds));
@@ -354,6 +437,7 @@ function ProposalEditor({
       high_threshold: high,
       bundle_threshold: bundleT,
       bulk_limit: bulk,
+      require_log_proof: requireLog,
       signers,
       // Only the public half leaves the browser.
       recovery: keys.map((k) => ({ id: k.key.id, pub: k.key.pub })),
@@ -417,6 +501,9 @@ function ProposalEditor({
           </Field>
           <Field label="User verification">
             <Switch checked={requireUV} onChange={setRequireUV} label="Require PIN or biometric on every signature" />
+          </Field>
+          <Field label="Require log proofs" hint="Devices refuse any signed action that does not carry a proof of its entry in this server's transparency log.">
+            <Checkbox checked={requireLog} onChange={setRequireLog} label="Require log proofs" />
           </Field>
         </div>
 

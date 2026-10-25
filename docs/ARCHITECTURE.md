@@ -336,7 +336,18 @@ enrolled agent within the target subnet.
   to restart the server daemon.
 - **Agent fleet updates**: `POST /api/agents/{id}/update` and `POST /api/agents/update-all` (admin-only,
   VULN-011) push update notifications to agents, directing them to download the matching agent binary
-  from `/api/agent-download/`, verify SHA-256 integrity, swap binaries, and restart.
+  from `/api/agent-download/`, verify SHA-256 integrity, swap binaries, and restart. In organizations
+  that sign actions `update-all` dispatches nothing to their devices and returns them as
+  `signed_groups` (one per organization and agent build, cut into groups of at most 2000 devices, the
+  most `update-batch` takes); `POST /api/agents/update-batch` sends one
+  group through the 428 signing flow as a single high-risk `agent.update` manifest (see
+  `docs/SECURITY.md`, Signed actions). Both look a build up by operating system and architecture, the
+  architecture being the one the device announced when it connected; a value that names no build the
+  server ships (`windows` or `linux`; `amd64`, `arm64`, `arm`, `386`) finds nothing, which keeps a device
+  from steering the lookup to another file. Online devices without a build are counted, not silently
+  dropped (`skipped_no_build`). The agents' own five-minute `update-check` counts as an
+  unsigned `agent.update` there, so for organizations in `enforce` mode the server answers
+  `signed_update_required` instead of advertising a binary.
 
 ### Device Network Isolation / Quarantine (`internal/agent/isolate_*.go`)
 `POST /api/agents/{id}/isolate` (with `{"isolate": true}` to isolate or `{"isolate": false}` to release)
@@ -370,6 +381,17 @@ would mean the seeds never appeared on upgrade. Both ship disabled *and* unenfor
 destructive check in them (`group_members`, the SMB1 registry value, service start-type changes,
 `reboot_pending`) ships `remediate = 0`.
 
+### Transparency log (`internal/translog`, `log_api.go`)
+`internal/translog` wraps `golang.org/x/mod/sumdb/tlog` and `note` into a `Log` over a `Storage`
+(`SQLStorage` on the server's database, `MemStorage` in tests) with tables `tlog_leaves(idx, kind, data,
+ts)` and `tlog_hashes(idx, hash)`, created by migration 17. `Server.tlog` opens it at start-up from
+`<data dir>/log.key` (a server that cannot does not start) and `DB.Audit` appends each row through a
+hook. A manifest is appended when it is released (`Server.release`, `putApproval`) and a bundle when
+it is activated. The handler sets only the leaf index; `agentConn.send` completes the inclusion and
+consistency proofs under `writeMu`, from the log size the connection last reported (hello, then
+`Envelope.Log` on replies). The agent verifies with the same package (`ParseHead`, `CheckInclusion`,
+`CheckConsistency`), as does `rmm-server log verify`. See `docs/SECURITY.md`, Transparency log.
+
 ## 5. Storage
 
 SQLite through `modernc.org/sqlite` (pure Go, so everything cross-compiles with `CGO_ENABLED=0`).
@@ -399,7 +421,8 @@ slice in `db.go`, applied in order and tracked in `PRAGMA user_version`.
 | `network_scans` | history of subnet discovery jobs | `subnet`, `agent_id`, `status`, `devices_found`, `started_at`, `completed_at`, `error` |
 | `tickets` | IT helpdesk tickets | `agent_id`, `org_id`, `site_id`, `subject`, `description`, `requester_name`, `requester_email`, `requester_phone`, `status`, `priority`, `assigned_to`, `source`, `is_internal` |
 | `ticket_comments` | conversation history on tickets | `ticket_id` (FK), `author`, `is_internal` (differentiates internal notes from client-visible replies), `body` |
-| `audit` | who did what | `user`, `ip`, `action`, `target`, `details` |
+| `audit` | who did what | `user`, `ip`, `action`, `target`, `details`, `log_index` (leaf in the transparency log, -1 if none) |
+| `tlog_leaves`, `tlog_hashes` | the transparency log: leaves by dense index, and the Merkle hashes `tlog.StoredHashes` produced for each | `kind` (`manifest`, `bundle`, `audit`), `data` (canonical JSON), `ts`. Related columns: `approvals.log_index`, `agents.executed_head`, `agents.binary_sha256` |
 | `agent_events` | the device event timeline: `patch` progress lines pushed by the agent, `enroll` and `drift` rows written by the server. Monitored-service state is **not** here — it rides in each metrics sample and reaches operators through the alert engine | `kind`, `message`, `fields` |
 | `baselines` | desired-state definitions | `targets` (JSON), `enforce`, `interval_sec`, `enabled`, `version` |
 | `baseline_checks` | the checks of a baseline | **`id INTEGER PRIMARY KEY AUTOINCREMENT`** (identity is permanent), `position` (presentation only), `kind`, `params` (JSON), `remediate`, `severity`, `os_filter`, `timeout_sec` |

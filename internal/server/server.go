@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
+	"github.com/MonsterCouch/homelab-rmm/internal/translog"
 	"github.com/MonsterCouch/homelab-rmm/internal/winsec"
 )
 
@@ -79,6 +80,9 @@ type Server struct {
 	trustSyncs sync.Map
 	// signing holds the pending 428 manifests and the grants operators hold.
 	signing signingState
+	// tlog is the transparency log of relayed manifests, activated bundles and
+	// audit rows. New refuses to start without it.
+	tlog *translog.Log
 }
 
 // jobContext is the context long background work runs under. It is cancelled
@@ -131,12 +135,21 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
+	// Before seeding, so the very first audit rows are logged too. A server
+	// that cannot keep its log would relay signed actions nobody can later
+	// prove, so a damaged or unreadable log.key stops it here.
+	tl, err := translog.Open(translog.NewSQLStorage(db.DB), cfg.path("log.key"))
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("open transparency log: %w", err)
+	}
+	db.logAppend = tl.Append
 	if !cfg.SkipSeed {
 		if err := seedDefaults(db); err != nil {
 			return nil, fmt.Errorf("seed defaults: %w", err)
 		}
 	}
-	s := &Server{cfg: cfg, db: db, startedAt: time.Now(), patchJobs: map[string]bool{}}
+	s := &Server{cfg: cfg, db: db, tlog: tl, startedAt: time.Now(), patchJobs: map[string]bool{}}
 	s.jobCtx, s.jobCancel = context.WithCancel(context.Background())
 	s.trustedProxies = parseTrustedProxies(cfg.TrustedProxies)
 	s.hub = newHub(s)

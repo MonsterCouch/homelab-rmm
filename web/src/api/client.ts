@@ -11,6 +11,7 @@ import type {
   Alert,
   AlertRule,
   AuditRow,
+  LogHead,
   AuthState,
   Automation,
   Baseline,
@@ -22,6 +23,7 @@ import type {
   BaselineRemediateResult,
   BaselineStatus,
   ApprovalPending,
+  SignObjectResult,
   ComplianceSummary,
   Dashboard,
   DiscoveredDevice,
@@ -67,6 +69,8 @@ import type {
   TrustProposalInput,
   UnsignedObject,
   UnsignedType,
+  UpdateAllResult,
+  UpdateBatchResult,
   User,
   WebAuthnCredential,
   WolResult,
@@ -272,6 +276,16 @@ interface Ok {
   ok: boolean;
 }
 
+/** The upload reply from a device that checks signatures: the bytes are staged
+ *  on the device, and moving them into place needs a signed commit. */
+interface StagedUpload {
+  staged: true;
+  commit_required: boolean;
+  upload_id: string;
+  bytes: number;
+  sha256: string;
+}
+
 // Go encodes a nil slice as null. Every list column on the server is
 // initialised to an empty slice, but a failed query or a hand-edited row can
 // still produce null, and `...a.tags` on null would take the whole page down.
@@ -335,8 +349,17 @@ export const api = {
   fsList: (id: string, path: string, signal?: AbortSignal) =>
     get<FsListResult>(`/api/agents/${enc(id)}/fs${qs({ path })}`, { signal }),
   fsDownloadURL: (id: string, path: string) => `/api/agents/${enc(id)}/fs/download${qs({ path })}`,
-  fsUpload: (id: string, path: string, file: File) =>
-    request<Ok>('POST', `/api/agents/${enc(id)}/fs/upload${qs({ path })}`, { raw: file }),
+  /** Uploads a file. To a device that checks signatures the bytes are staged
+   *  first, then a small commit naming their size and SHA-256 is sent through
+   *  the signing flow, so the file itself is never re-sent for a signature.
+   *  Resolves to ApprovalPending when more approvers are needed. */
+  fsUpload: async (id: string, path: string, file: File): Promise<Ok | ApprovalPending> => {
+    const r = await request<Ok | StagedUpload>('POST', `/api/agents/${enc(id)}/fs/upload${qs({ path })}`, { raw: file });
+    if ('commit_required' in r && r.commit_required) {
+      return post<Ok | ApprovalPending>(`/api/agents/${enc(id)}/fs/commit`, { upload_id: r.upload_id });
+    }
+    return r as Ok;
+  },
   fsDelete: (id: string, path: string) => post<Ok>(`/api/agents/${enc(id)}/fs/delete`, { path }),
   fsMkdir: (id: string, path: string) => post<Ok>(`/api/agents/${enc(id)}/fs/mkdir`, { path }),
   fsRename: (id: string, from: string, to: string) => post<Ok>(`/api/agents/${enc(id)}/fs/rename`, { from, to }),
@@ -535,6 +558,7 @@ export const api = {
     get<TrustInfo>(`/api/organizations/${enc(orgId)}/trust`).then((r) => ({ ...r, current: r.current ?? null, proposals: arr(r.proposals) })),
   createTrustProposal: (orgId: string, p: TrustProposalInput) =>
     post<TrustProposal>(`/api/organizations/${enc(orgId)}/trust/proposals`, p),
+  logHead: () => get<LogHead>('/api/log/head'),
   trustProposal: (pid: string) => get<TrustProposal>(`/api/trust/proposals/${enc(pid)}`),
   signTrustProposal: (pid: string, assertion: Assertion) =>
     post<ProposalSignResult>(`/api/trust/proposals/${enc(pid)}/sign`, { assertion }),
@@ -545,15 +569,22 @@ export const api = {
     post<ProposalSignResult | ApprovalPending>(`/api/approvals/${enc(manifestId)}/sign`, { assertion }),
   unsignedApprovals: (org: string) => list(get<UnsignedObject[] | null>(`/api/approvals/unsigned${qs({ org })}`)),
   // goes through the 428 flow itself: the standing manifest is built from the object's current content
-  signObject: (type: UnsignedType, id: string | number) =>
-    post<{ expires_at?: number } | ApprovalPending>(`/api/approvals/objects/${enc(type)}/${enc(String(id))}/sign`),
+  // org and purpose name one unit of the object; without them the server signs the first one that needs it
+  signObject: (type: UnsignedType, id: string | number, opts?: { org?: string; purpose?: string }) =>
+    post<SignObjectResult>(`/api/approvals/objects/${enc(type)}/${enc(String(id))}/sign${qs({ org: opts?.org, purpose: opts?.purpose })}`),
   grant: (agentId: string, ops: string[]) => post<GrantResult | ApprovalPending>(`/api/agents/${enc(agentId)}/grant`, { ops }),
 
   // ---- system & agent updates ----
   serverVersion: () => get<ServerVersionInfo>('/api/server/version'),
   updateServer: () => post<{ ok: boolean; message: string }>('/api/server/update'),
-  dispatchAgentUpdate: (agentId: string) => post<{ ok: boolean; message: string }>(`/api/agents/${enc(agentId)}/update`),
-  updateAllAgents: () => post<{ ok: boolean; dispatched_to: number; message: string }>('/api/agents/update-all'),
+  dispatchAgentUpdate: (agentId: string) => post<{ ok: boolean; message: string; installing?: boolean; up_to_date?: boolean }>(`/api/agents/${enc(agentId)}/update`),
+  /** Updates the devices of organizations that do not sign actions at once and
+   *  returns the rest as groups; lib/fleetUpdate.ts asks for one signature per
+   *  group through updateAgentBatch. */
+  updateAllAgents: () => post<UpdateAllResult>('/api/agents/update-all'),
+  /** One signed update for the devices of one group, through the signing flow.
+   *  Resolves to ApprovalPending when more approvers are needed. */
+  updateAgentBatch: (agentIds: string[]) => post<UpdateBatchResult | ApprovalPending>('/api/agents/update-batch', { agent_ids: agentIds }),
 };
 
 export type Api = typeof api;

@@ -50,6 +50,11 @@ var classes = map[string]Class{
 	"shell.resize": ClassRead,
 	"shell.close":  ClassRead,
 
+	// Staging an upload writes only into the agent's own staging area,
+	// which no request can read; the bytes reach a real path only through
+	// a signed fs.commit that names their size and SHA-256.
+	"fs.stage": ClassRead,
+
 	// config: intervals are unsigned; baseline specs need approvals
 	// (handled by FilterBaselines, not by Check).
 	"agent.config": ClassConfig,
@@ -68,6 +73,7 @@ var classes = map[string]Class{
 	"fs.delete":          ClassAction,
 	"fs.rename":          ClassAction,
 	"fs.mkdir":           ClassAction,
+	"fs.commit":          ClassAction,
 	"power":              ClassAction,
 	"updates.install":    ClassAction,
 	"baseline.remediate": ClassAction,

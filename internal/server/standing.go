@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"slices"
 	"sort"
@@ -166,10 +167,14 @@ type approvalRow struct {
 	CreatedBy string
 	CreatedAt int64
 	ExpiresAt int64
+	// LogIndex is the manifest's leaf in the transparency log, -1 when it was
+	// stored before the log existed or no log is attached. putApproval sets it;
+	// a value passed in is ignored.
+	LogIndex int64
 }
 
 func (d *DB) approvalsFor(org, typ, id string) []approvalRow {
-	rows, err := d.Query(`SELECT org_id, object_type, object_id, purpose, content_hash, manifest, sigs, need, created_by, created_at, expires_at
+	rows, err := d.Query(`SELECT org_id, object_type, object_id, purpose, content_hash, manifest, sigs, need, created_by, created_at, expires_at, log_index
 		FROM approvals WHERE org_id = ? AND object_type = ? AND object_id = ? ORDER BY purpose`, org, typ, id)
 	if err != nil {
 		return nil
@@ -179,7 +184,7 @@ func (d *DB) approvalsFor(org, typ, id string) []approvalRow {
 	for rows.Next() {
 		var a approvalRow
 		var sigs string
-		if rows.Scan(&a.Org, &a.Type, &a.ID, &a.Purpose, &a.Hash, &a.Manifest, &sigs, &a.Need, &a.CreatedBy, &a.CreatedAt, &a.ExpiresAt) != nil {
+		if rows.Scan(&a.Org, &a.Type, &a.ID, &a.Purpose, &a.Hash, &a.Manifest, &sigs, &a.Need, &a.CreatedBy, &a.CreatedAt, &a.ExpiresAt, &a.LogIndex) != nil {
 			continue
 		}
 		json.Unmarshal([]byte(sigs), &a.Sigs)
@@ -188,13 +193,54 @@ func (d *DB) approvalsFor(org, typ, id string) []approvalRow {
 	return out
 }
 
+// putApproval stores a standing approval and logs its manifest once, here,
+// so every dispatch of it can prove the leaf. Without a log attached the row
+// keeps log_index -1. A log that fails refuses the approval: storing it
+// would hand devices a manifest the log never saw.
 func (d *DB) putApproval(a approvalRow) error {
-	_, err := d.Exec(`INSERT INTO approvals(org_id, object_type, object_id, purpose, content_hash, manifest, sigs, need, created_by, created_at, expires_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?)
+	a.LogIndex = -1
+	if d.logAppend != nil {
+		leaf, err := actionauth.ManifestLeaf(&protocol.ActionAuth{M: actionauth.EncodeB64(a.Manifest), S: a.Sigs})
+		if err == nil {
+			a.LogIndex, err = d.logAppend("manifest", leaf)
+		}
+		if err != nil {
+			return fmt.Errorf("the transparency log could not record this approval, so it was not stored: %w", err)
+		}
+	}
+	_, err := d.Exec(`INSERT INTO approvals(org_id, object_type, object_id, purpose, content_hash, manifest, sigs, need, created_by, created_at, expires_at, log_index)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(org_id, object_type, object_id, purpose) DO UPDATE SET content_hash=excluded.content_hash, manifest=excluded.manifest,
-			sigs=excluded.sigs, need=excluded.need, created_by=excluded.created_by, created_at=excluded.created_at, expires_at=excluded.expires_at`,
-		a.Org, a.Type, a.ID, a.Purpose, a.Hash, a.Manifest, jsonText(nonNil(a.Sigs)), a.Need, a.CreatedBy, a.CreatedAt, a.ExpiresAt)
+			sigs=excluded.sigs, need=excluded.need, created_by=excluded.created_by, created_at=excluded.created_at, expires_at=excluded.expires_at,
+			log_index=excluded.log_index`,
+		a.Org, a.Type, a.ID, a.Purpose, a.Hash, a.Manifest, jsonText(nonNil(a.Sigs)), a.Need, a.CreatedBy, a.CreatedAt, a.ExpiresAt, a.LogIndex)
 	return err
+}
+
+// backfillApprovalLog logs the manifest of an approval stored before the
+// transparency log existed (log_index -1) the first time it is dispatched, and
+// remembers the leaf. Without this, turning on require_log_proof would stop
+// every scheduled task and automation until each one was signed again. It
+// returns -1 when no log is attached or the log could not take the leaf, in
+// which case the approval dispatches without a proof as before.
+func (d *DB) backfillApprovalLog(row approvalRow, a *protocol.ActionAuth) int64 {
+	if d.logAppend == nil {
+		return -1
+	}
+	leaf, err := actionauth.ManifestLeaf(a)
+	if err != nil {
+		return -1
+	}
+	idx, err := d.logAppend("manifest", leaf)
+	if err != nil {
+		slog.Warn("cannot log a standing approval that predates the transparency log", "type", row.Type, "id", row.ID, "err", err)
+		return -1
+	}
+	if _, err := d.Exec(`UPDATE approvals SET log_index = ? WHERE org_id = ? AND object_type = ? AND object_id = ? AND purpose = ? AND log_index < 0`,
+		idx, row.Org, row.Type, row.ID, row.Purpose); err != nil {
+		slog.Warn("cannot remember the log leaf of a standing approval", "type", row.Type, "id", row.ID, "err", err)
+	}
+	return idx
 }
 
 func (d *DB) bundleOrgIDs() []string {
@@ -234,7 +280,14 @@ func (s *Server) approvalAuth(org string, u approvalUnit) *protocol.ActionAuth {
 	}
 	for _, row := range s.db.approvalsFor(org, u.Type, u.ID) {
 		if row.Hash == u.Hash && row.usable(b) == "" {
-			return &protocol.ActionAuth{M: actionauth.EncodeB64(row.Manifest), S: row.Sigs}
+			a := &protocol.ActionAuth{M: actionauth.EncodeB64(row.Manifest), S: row.Sigs}
+			if row.LogIndex < 0 {
+				row.LogIndex = s.db.backfillApprovalLog(row, a)
+			}
+			if row.LogIndex >= 0 {
+				a.L = &protocol.LogProof{Index: row.LogIndex}
+			}
+			return a
 		}
 	}
 	return nil
@@ -472,45 +525,64 @@ func (s *Server) handleSignObject(w http.ResponseWriter, r *http.Request) {
 	me := userFrom(r.Context())
 	units := s.objectUnits(typ, id)
 	type cand struct {
-		org   string
-		unit  approvalUnit
-		state string
+		org     string
+		unit    approvalUnit
+		state   string
+		matched bool // passes the org and purpose the caller asked for
 	}
 	var cands []cand
+	anyMatch := false
 	for _, org := range s.signingOrgs(me, wantOrg) {
 		b := s.activeBundle(org)
 		for _, un := range units {
-			if un.appliesTo(org) && (wantPurpose == "" || un.Purpose == wantPurpose) {
-				cands = append(cands, cand{org, un, s.approvalState(org, un, b)})
+			if un.appliesTo(org) {
+				m := wantPurpose == "" || un.Purpose == wantPurpose
+				anyMatch = anyMatch || m
+				cands = append(cands, cand{org, un, s.approvalState(org, un, b), m})
 			}
 		}
 	}
-	if len(cands) == 0 {
+	if !anyMatch {
 		writeErr(w, http.StatusNotFound, "nothing to approve: the object does not exist, is disabled, or runs in no organization that signs actions")
 		return
 	}
-	pick, remaining := -1, 0
-	for i, c := range cands {
-		if c.state != "" || (wantOrg != "" && wantPurpose != "") {
-			if pick < 0 {
-				pick = i
-			} else {
-				remaining++
-			}
+	// remaining counts every other unit of the object that still needs a
+	// signature, whatever purpose was asked for, so a caller that signs one unit
+	// at a time knows whether to come back.
+	unsigned := 0
+	for _, c := range cands {
+		if c.state != "" {
+			unsigned++
 		}
+	}
+	// With both org and purpose the caller names one unit: signing an approved
+	// one again would only spend a key touch, so say it is done.
+	exact := wantOrg != "" && wantPurpose != ""
+	pick := -1
+	for i, c := range cands {
+		if c.matched && (c.state != "" || exact) {
+			pick = i
+			break
+		}
+	}
+	if pick >= 0 && exact && cands[pick].state == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"expires_at": s.soonestApproval(cands[pick].org, typ, id, cands[pick].unit.Purpose), "already_approved": true, "remaining": unsigned})
+		return
 	}
 	if pick < 0 {
 		var soonest int64
 		for _, c := range cands {
-			for _, row := range s.db.approvalsFor(c.org, typ, id) {
-				if row.Purpose == c.unit.Purpose && (soonest == 0 || row.ExpiresAt < soonest) {
-					soonest = row.ExpiresAt
-				}
+			if !c.matched {
+				continue
+			}
+			if e := s.soonestApproval(c.org, typ, id, c.unit.Purpose); e != 0 && (soonest == 0 || e < soonest) {
+				soonest = e
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"expires_at": soonest, "already_approved": true, "remaining": 0})
+		writeJSON(w, http.StatusOK, map[string]any{"expires_at": soonest, "already_approved": true, "remaining": unsigned})
 		return
 	}
+	remaining := unsigned - 1 // the unit being signed now is not "still" unsigned
 	c := cands[pick]
 	if c.unit.Err != "" {
 		writeErr(w, http.StatusBadRequest, c.unit.Err)
@@ -548,6 +620,18 @@ func (s *Server) handleSignObject(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]any{"expires_at": m.Exp, "org": org, "purpose": unit.Purpose, "remaining": remaining})
 		},
 	})
+}
+
+// soonestApproval is when the earliest-expiring approval of one purpose of an
+// object ends in org, or 0 when there is none.
+func (s *Server) soonestApproval(org, typ, id, purpose string) int64 {
+	var soonest int64
+	for _, row := range s.db.approvalsFor(org, typ, id) {
+		if row.Purpose == purpose && (soonest == 0 || row.ExpiresAt < soonest) {
+			soonest = row.ExpiresAt
+		}
+	}
+	return soonest
 }
 
 func standingSummary(u approvalUnit, org string) string {

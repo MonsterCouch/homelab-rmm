@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MonsterCouch/homelab-rmm/internal/actionauth"
 	_ "modernc.org/sqlite"
 )
 
@@ -33,6 +35,10 @@ func OpenDatabase(cfg Config) (*DB, error) {
 // enforced by SQLite itself; WAL mode lets readers proceed concurrently.
 type DB struct {
 	*sql.DB
+	// logAppend adds a leaf to the transparency log and returns its index.
+	// The server sets it once at startup; it stays nil for a command-line
+	// tool and in DB-only tests, where nothing is logged.
+	logAppend func(kind string, data []byte) (int64, error)
 }
 
 func openDB(path string) (*DB, error) {
@@ -46,7 +52,7 @@ func openDB(path string) (*DB, error) {
 	if err := db.Ping(); err != nil {
 		return nil, err
 	}
-	d := &DB{db}
+	d := &DB{DB: db}
 	if err := d.migrate(); err != nil {
 		return nil, err
 	}
@@ -662,6 +668,53 @@ CREATE TABLE IF NOT EXISTS approvals (
 	PRIMARY KEY (org_id, object_type, object_id, purpose)
 );
 `,
+	// 15: script_runs.standing.
+	//
+	// A run queued for an offline device used to keep only task_id, so an
+	// automation's standing approval was lost by the time the device
+	// connected. standing holds "<type>:<id>" of the object whose approval
+	// vouches for the run ("automation:12", "task:7"). Older rows have ''
+	// and fall back to task_id. ADD COLUMN is safe to replay: execMigration
+	// skips a column that already exists.
+	`ALTER TABLE script_runs ADD COLUMN standing TEXT NOT NULL DEFAULT ''`,
+	// 16: agents.binary_sha256 and binary_sha256_at.
+	//
+	// The agent sends the SHA-256 of its own binary with every update-check,
+	// and nothing kept it, so a device already on the pushed build still cost
+	// an operator a signature. binary_sha256 is the last digest it reported
+	// (lower-case hex, '' when unknown) and binary_sha256_at when, in unix
+	// seconds; a digest that is not recent is not trusted, because the device
+	// may have been updated by other means since. ADD COLUMN is safe to
+	// replay: execMigration skips a column that already exists.
+	`
+ALTER TABLE agents ADD COLUMN binary_sha256 TEXT NOT NULL DEFAULT '';
+ALTER TABLE agents ADD COLUMN binary_sha256_at INTEGER NOT NULL DEFAULT 0;
+`,
+	// 17: the transparency log (Phase 3C).
+	//
+	// tlog_leaves and tlog_hashes are the append-only Merkle log itself; the
+	// DDL repeats translog.Schema because a migration must not change when
+	// that constant does. audit.log_index and approvals.log_index are the leaf
+	// an audit row or a standing approval was logged as, -1 for rows from
+	// before the log or whose append failed. agents.executed_head is the head
+	// of the device's own hash-chained record of the manifests it ran, as it
+	// last reported. ADD COLUMN is safe to replay: execMigration skips a
+	// column that already exists.
+	`
+CREATE TABLE IF NOT EXISTS tlog_leaves (
+	idx  INTEGER PRIMARY KEY,
+	kind TEXT NOT NULL,
+	data BLOB NOT NULL,
+	ts   INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tlog_hashes (
+	idx  INTEGER PRIMARY KEY,
+	hash BLOB NOT NULL
+);
+ALTER TABLE audit ADD COLUMN log_index INTEGER NOT NULL DEFAULT -1;
+ALTER TABLE approvals ADD COLUMN log_index INTEGER NOT NULL DEFAULT -1;
+ALTER TABLE agents ADD COLUMN executed_head TEXT NOT NULL DEFAULT '';
+`,
 }
 
 // Close checkpoints the write-ahead log before closing, so a short-lived
@@ -794,11 +847,54 @@ func (d *DB) Audit(user, ip, action, target string, details any) {
 		b, _ := json.Marshal(v)
 		det = string(b)
 	}
-	if _, err := d.Exec(`INSERT INTO audit(ts, user, ip, action, target, details) VALUES(?,?,?,?,?,?)`,
-		now(), user, ip, action, target, det); err != nil {
+	ts := now()
+	res, err := d.Exec(`INSERT INTO audit(ts, user, ip, action, target, details) VALUES(?,?,?,?,?,?)`,
+		ts, user, ip, action, target, det)
+	if err != nil {
 		slog.Warn("audit write failed", "err", err)
+		return
+	}
+	if d.logAppend == nil {
+		return
+	}
+	// The row is already stored: a log that cannot be appended to must not
+	// cost the audit entry, so the failure is reported and the row keeps
+	// log_index -1. The insert has released the single connection before the
+	// log takes it for its own transaction.
+	id, err := res.LastInsertId()
+	if err != nil {
+		slog.Warn("audit entry was not added to the transparency log", "err", err)
+		return
+	}
+	idx, err := d.appendLeaf("audit", map[string]any{"kind": "audit", "id": id, "ts": ts, "user": user, "ip": ip,
+		"action": action, "target": target, "details": det})
+	if err != nil {
+		slog.Warn("audit entry was not added to the transparency log", "id", id, "err", err)
+		return
+	}
+	if _, err := d.Exec(`UPDATE audit SET log_index = ? WHERE id = ?`, idx, id); err != nil {
+		slog.Warn("audit entry was logged but its index was not stored", "id", id, "index", idx, "err", err)
 	}
 }
+
+// appendLeaf writes v as canonical JSON to the transparency log. With no log
+// attached it reports errNoLog.
+func (d *DB) appendLeaf(kind string, v any) (int64, error) {
+	if d.logAppend == nil {
+		return -1, errNoLog
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return -1, err
+	}
+	canon, err := actionauth.CanonicalizeJSON(raw)
+	if err != nil {
+		return -1, err
+	}
+	return d.logAppend(kind, canon)
+}
+
+var errNoLog = errors.New("this server has no transparency log")
 
 func now() int64 { return time.Now().Unix() }
 

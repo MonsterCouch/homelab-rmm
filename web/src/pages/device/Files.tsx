@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from 'react';
-import { api } from '../../api/client';
+import { api, isPending } from '../../api/client';
 import type { FsEntry } from '../../api/types';
 import { DataTable, textMatch, type Column } from '../../components/DataTable';
 import { IconDownload, IconFile, IconFolder, IconPlus, IconRefresh, IconUpload } from '../../components/Icons';
@@ -77,7 +77,10 @@ export function Files({ agent, canWrite }: TabProps) {
     const dest = join(cur, file.name);
     setUploading(file.name);
     try {
-      await api.fsUpload(agent.id, dest, file);
+      const res = await api.fsUpload(agent.id, dest, file);
+      // Waiting for other approvers: request() has already said so, and the
+      // file lands once the last one signs.
+      if (isPending(res)) return;
       toast.success('Uploaded', `${file.name} (${bytes(file.size)})`);
       void listing.reload();
     } catch (err) {

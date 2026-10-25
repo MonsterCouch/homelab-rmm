@@ -43,6 +43,9 @@ type Agent struct {
 	Isolated          bool                `json:"isolated"`
 	IsolatedAt        int64               `json:"isolated_at"`
 	IsolatedBy        string              `json:"isolated_by,omitempty"`
+	// ExecutedHead is the head of the device's hash-chained executed.log as it
+	// last reported it, for the console's Device logs table.
+	ExecutedHead string `json:"executed_head,omitempty"`
 }
 
 const agentCols = `a.id, a.hostname, a.display_name, a.os, a.platform, a.arch, a.version, a.group_id, COALESCE(g.name,''),
@@ -50,7 +53,8 @@ const agentCols = `a.id, a.hostname, a.display_name, a.os, a.platform, a.arch, a
 	a.tags, a.custom_fields, a.notes, a.last_ip, a.last_seen, a.online, a.monitored_services, a.maintenance_until, a.enrolled_at,
 	a.pending_reboot, a.isolated, a.isolated_at, a.isolated_by, a.last_metrics,
 	(SELECT COUNT(*) FROM alerts al WHERE al.agent_id = a.id AND al.status != 'resolved'),
-	(SELECT COUNT(*) FROM patches p WHERE p.agent_id = a.id AND p.status IN ('available','approved'))`
+	(SELECT COUNT(*) FROM patches p WHERE p.agent_id = a.id AND p.status IN ('available','approved')),
+	a.executed_head`
 
 func scanAgent(rows interface{ Scan(...any) error }, withInventory bool) (*Agent, error) {
 	var a Agent
@@ -60,7 +64,7 @@ func scanAgent(rows interface{ Scan(...any) error }, withInventory bool) (*Agent
 	dest := []any{&a.ID, &a.Hostname, &a.DisplayName, &a.OS, &a.Platform, &a.Arch, &a.Version, &gid, &a.GroupName,
 		&a.OrgID, &a.OrgName, &a.SiteID, &a.SiteName,
 		&tags, &cf, &a.Notes, &a.LastIP, &a.LastSeen, &a.Online, &ms, &a.MaintenanceUntil, &a.EnrolledAt,
-		&a.PendingReboot, &isoInt, &a.IsolatedAt, &a.IsolatedBy, &lm, &a.OpenAlerts, &a.PatchesAvailable}
+		&a.PendingReboot, &isoInt, &a.IsolatedAt, &a.IsolatedBy, &lm, &a.OpenAlerts, &a.PatchesAvailable, &a.ExecutedHead}
 	if withInventory {
 		dest = append(dest, &inv)
 	}
@@ -627,4 +631,3 @@ func (d *DB) SetAgentIsolated(id string, isolated bool, by string) error {
 	_, err := d.Exec(`UPDATE agents SET isolated = ?, isolated_at = ?, isolated_by = ? WHERE id = ?`, isoInt, isoAt, by, id)
 	return err
 }
-

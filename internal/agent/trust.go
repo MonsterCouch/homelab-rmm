@@ -35,6 +35,9 @@ type trustState struct {
 
 	reportMu sync.Mutex
 	reported map[string]bool
+
+	// logState is the Phase 3C log head and executed.log; see translog.go.
+	logState
 }
 
 func trustPath() string  { return filepath.Join(ConfigDir(), "trust.json") }
@@ -68,6 +71,8 @@ func loadTrust() *trustState {
 		slog.Error("TRUST BUNDLE UNUSABLE: refusing every action until it is re-pinned; delete trust.json on this device to re-pin",
 			"path", t.path, "err", t.failed)
 	}
+	t.loadLogHead()
+	t.loadExecuted()
 	ns, err := actionauth.OpenFileNonceStore(noncesPath())
 	if err != nil {
 		slog.Error("nonce store unusable: signed actions cannot be verified", "err", err)
@@ -180,8 +185,84 @@ func (a *Agent) authorize(c *conn, env protocol.Envelope) (protocol.Envelope, bo
 		}
 		return env, false
 	}
+	logIndex := int64(-1)
+	if failed == nil && dec.Allow && dec.Mode != actionauth.ModeOff &&
+		dec.Class != actionauth.ClassRead && dec.Class != actionauth.ClassConfig && env.T != protocol.ReqTrustUpdate {
+		// A manifest that did not verify (audit mode) has nothing to prove;
+		// the damaged-head rule still applies to the request itself.
+		var auth *protocol.ActionAuth
+		if dec.Verified {
+			auth = env.A
+		}
+		idx, lerr := t.checkLogProof(v.Bundle, auth)
+		if lerr != nil {
+			allow := dec.Mode != actionauth.ModeEnforce
+			if !allow || t.once("logproof/"+dec.ManifestID+"/"+lerr.Error()) {
+				msg := "log proof for " + env.T + " refused"
+				if allow {
+					msg = "log proof for " + env.T + " failed, executed anyway (audit mode)"
+				}
+				a.securityEvent(env.T, dec.Mode, allow, "log proof: "+lerr.Error(), dec.ManifestID, msg)
+			}
+			if !allow {
+				if env.ID != "" {
+					c.replyErr(env.ID, errors.New("refused: log proof: "+lerr.Error()))
+				}
+				return env, false
+			}
+		} else {
+			logIndex = idx
+		}
+	}
+	if dec.ManifestID != "" {
+		t.recordExecuted(dec.ManifestID, env.T, logIndex)
+	}
 	env.D = dec.Payload
 	return env, true
+}
+
+// autoUpdateAllowed gates the unattended update poll, the one path that
+// installs a server-supplied binary without passing authorize. The chore
+// carries no signature, so it is judged as the unsigned agent.update it is:
+// audit mode installs it and reports it, enforce refuses it and reports it
+// (the build is pushed from the console as a signed agent.update instead), and
+// a damaged trust.json refuses it like every other protected request. The poll
+// repeats every few minutes, so each advertised binary is reported once per
+// process and mode.
+func (a *Agent) autoUpdateAllowed(req protocol.AgentUpdate) bool {
+	t := a.trust
+	if t == nil {
+		return true
+	}
+	v, failed := t.verifier(a.agentID())
+	var dec actionauth.Decision
+	if failed != nil {
+		dec = actionauth.Decision{
+			Op: protocol.ReqAgentUpdate, Class: actionauth.ClassOf(protocol.ReqAgentUpdate),
+			Mode: actionauth.ModeEnforce, Allow: false,
+			Err: fmt.Errorf("%w; delete trust.json on the device to re-pin", failed),
+		}
+	} else {
+		dec = v.Check(protocol.ReqAgentUpdate, protocol.Must(req), nil)
+	}
+	if !dec.Report() {
+		return dec.Allow
+	}
+	if t.once("autoupdate/" + strings.ToLower(req.SHA256) + "/" + dec.Mode) {
+		// The alert the server raises shows the reason, not the message, so
+		// the reason says which path this was: an operator reading that
+		// agent.update was refused must be able to tell the unattended poll
+		// from a push somebody forged.
+		reason := "unattended update check: " + dec.Err.Error()
+		msg := "unattended agent.update refused: this organization signs actions, so new builds are pushed from the console"
+		if dec.Allow {
+			msg = "unattended agent.update executed unsigned (audit mode)"
+		} else {
+			reason += "; push this build from the console"
+		}
+		a.securityEvent(protocol.ReqAgentUpdate, dec.Mode, dec.Allow, reason, "", msg)
+	}
+	return dec.Allow
 }
 
 // trustUpdate handles trust.update: first-use pinning or a signed rotation.

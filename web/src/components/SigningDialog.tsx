@@ -176,7 +176,19 @@ function ManifestDetails({ m, bytes }: { m: ManifestView; bytes: Uint8Array<Arra
   }, [isScript, body]);
 
   const args = Array.isArray(m.payload?.args) ? (m.payload?.args as unknown[]).map(String) : [];
-  const otherPayload = m.payload && !isScript ? JSON.stringify(m.payload, null, 2) : '';
+  const isUpdate = m.op === 'agent.update' && !!m.payload;
+  // A field as the signed bytes carry it: text as is, anything else as JSON, so
+  // a malformed update shows up as what it is rather than as a blank.
+  const updateField = (k: string): string => {
+    const v = m.payload?.[k];
+    if (v === undefined || v === '') return '—';
+    return typeof v === 'string' ? v : JSON.stringify(v);
+  };
+  // The update view names the fields a device reads. A payload that carries
+  // anything else is still signed whole, so it is shown whole as well.
+  const updateKeys = ['version', 'sha256', 'url'];
+  const updateHasMore = isUpdate && Object.keys(m.payload ?? {}).some((k) => !updateKeys.includes(k));
+  const otherPayload = m.payload && !isScript && (!isUpdate || updateHasMore) ? JSON.stringify(m.payload, null, 2) : '';
 
   return (
     <div className="stack" style={{ gap: 10 }}>
@@ -236,6 +248,25 @@ function ManifestDetails({ m, bytes }: { m: ManifestView; bytes: Uint8Array<Arra
           <div className="code-block" style={{ maxHeight: 240, whiteSpace: 'pre', wordBreak: 'normal' }} tabIndex={0} aria-label="Script body">
             {body || '(empty script)'}
           </div>
+        </>
+      )}
+      {isUpdate && (
+        <>
+          <dl className="kv">
+            <dt>Version</dt>
+            <dd>{updateField('version')}</dd>
+            <dt>Binary SHA-256</dt>
+            <dd className="mono small" style={{ wordBreak: 'break-all' }}>
+              {updateField('sha256')}
+            </dd>
+            <dt>Download URL</dt>
+            <dd className="mono small" style={{ wordBreak: 'break-all' }}>
+              {updateField('url')}
+            </dd>
+          </dl>
+          <p className="muted small" style={{ margin: 0 }}>
+            Each device downloads this binary and installs it only if its SHA-256 matches.
+          </p>
         </>
       )}
       {otherPayload && (

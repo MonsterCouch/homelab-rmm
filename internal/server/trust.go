@@ -201,11 +201,16 @@ type trustRecoveryIn struct {
 // trustProposalIn describes the whole desired bundle, not a delta against the
 // current one: what the operator sees in the console is what is signed.
 type trustProposalIn struct {
-	Mode            string          `json:"mode"`
-	RequireUV       bool            `json:"require_uv"`
-	HighThreshold   int             `json:"high_threshold"`
-	BundleThreshold int             `json:"bundle_threshold"`
-	BulkLimit       int             `json:"bulk_limit"`
+	Mode            string `json:"mode"`
+	RequireUV       bool   `json:"require_uv"`
+	HighThreshold   int    `json:"high_threshold"`
+	BundleThreshold int    `json:"bundle_threshold"`
+	BulkLimit       int    `json:"bulk_limit"`
+	// RequireLogProof makes devices refuse a protected request that carries no
+	// transparency log proof. LogKey is optional: the bundle always pins this
+	// server's log key, and a different one is refused.
+	RequireLogProof bool            `json:"require_log_proof"`
+	LogKey          string          `json:"log_key"`
 	Signers         []trustSignerIn `json:"signers"`
 	// Recovery lists keys to ADD. The console only ever holds the key it just
 	// generated (the trust state exposes recovery IDs, not public keys), so
@@ -227,6 +232,15 @@ func (s *Server) buildTrustBundle(orgID string, in trustProposalIn, cur *trustRo
 	b := actionauth.Bundle{V: 1, Epoch: 1, Org: orgID, RPID: rpID, Origins: origins, Policy: actionauth.Policy{
 		Mode: in.Mode, RequireUV: in.RequireUV, HighThreshold: in.HighThreshold, BundleThreshold: in.BundleThreshold, BulkLimit: in.BulkLimit,
 	}}
+	if s.tlog != nil {
+		b.LogKey = s.tlog.VerifierKey()
+	}
+	b.Policy.RequireLogProof = in.RequireLogProof
+	if in.LogKey != "" {
+		// Checked against what the bundle will carry, so a key typed or pasted
+		// from another server is caught here and not at the device.
+		b.LogKey = in.LogKey
+	}
 	if cur != nil {
 		b.Epoch, b.Prev = cur.Epoch+1, cur.Hash
 	}
@@ -321,7 +335,26 @@ func (s *Server) buildTrustBundle(orgID string, in trustProposalIn, cur *trustRo
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := s.checkLogBinding(nb); err != nil {
+		return nil, nil, err
+	}
 	return canon, nb, nil
+}
+
+// checkLogBinding refuses a bundle whose log settings could never work: a
+// policy that demands log proofs without naming the log that makes them, or
+// one that pins some other server's log, whose heads this server cannot sign.
+func (s *Server) checkLogBinding(b *actionauth.Bundle) error {
+	if b.Policy.RequireLogProof && b.LogKey == "" {
+		return errors.New("require_log_proof needs the bundle to pin the server's log key (log_key), and this bundle pins none")
+	}
+	if s.tlog == nil || b.LogKey == "" {
+		return nil
+	}
+	if own := s.tlog.VerifierKey(); b.LogKey != own {
+		return fmt.Errorf("the bundle pins log key %q but this server's transparency log is %q; devices would reject every head it signs", b.LogKey, own)
+	}
+	return nil
 }
 
 func curHasRecovery(cur *trustRow, id string) bool {
@@ -414,6 +447,10 @@ func (s *Server) loadProposalContext(w http.ResponseWriter, pid string) (*propos
 		fail(w, err)
 		return nil, false
 	}
+	if err := s.checkLogBinding(prop); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return nil, false
+	}
 	return &proposalContext{p: p, cur: cur, prop: prop}, true
 }
 
@@ -436,8 +473,15 @@ func (s *Server) activateTrust(r *http.Request, c *proposalContext) error {
 	if err != nil {
 		return err
 	}
+	// The bundle is in force now, so a log that cannot take its leaf is
+	// reported rather than undone; the audit row below says which index it got.
+	logIndex, lerr := s.db.appendLeaf("bundle", map[string]any{"kind": "bundle", "org": p.OrgID, "epoch": p.Epoch,
+		"bundle": actionauth.EncodeB64(p.Bundle), "sigs": nonNil(p.Sigs), "recovery_sigs": nonNilR(p.RSigs)})
+	if lerr != nil && !errors.Is(lerr, errNoLog) {
+		slog.Error("trust bundle was activated but not added to the transparency log", "org", p.OrgID, "epoch", p.Epoch, "err", lerr)
+	}
 	s.audit(r, "trust.activate", p.OrgID, map[string]any{"epoch": p.Epoch, "hash": c.prop.Hash(), "mode": c.prop.Mode(),
-		"owners": c.prop.Owners(), "recovery": len(p.RSigs) > 0})
+		"owners": c.prop.Owners(), "recovery": len(p.RSigs) > 0, "log_index": logIndex})
 	s.pushTrust(p.OrgID)
 	return nil
 }
@@ -800,7 +844,7 @@ func (s *Server) handleGetOrgTrust(w http.ResponseWriter, r *http.Request) {
 		}
 		current = map[string]any{
 			"epoch": row.Epoch, "hash": row.Hash, "mode": cur.Mode(), "policy": cur.Policy,
-			"signers": cur.Signers, "recovery_ids": rids, "rp_id": cur.RPID, "origins": cur.Origins,
+			"signers": cur.Signers, "recovery_ids": rids, "rp_id": cur.RPID, "origins": cur.Origins, "log_key": cur.LogKey,
 			"activated_by": row.ActivatedBy, "activated_at": row.ActivatedAt,
 		}
 	}

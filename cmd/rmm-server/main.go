@@ -36,6 +36,10 @@ Usage:
   rmm-server user list
   rmm-server trust sign-bundle --key FILE --bundle FILE [--out FILE]
                                     sign a trust-bundle proposal with the offline recovery key
+  rmm-server log head --server URL  print the transparency log's size, head hash and key
+  rmm-server log verify --server URL --key VERIFIER_KEY [--state FILE]
+                                    check the log only grew since the last run; --state defaults
+                                    to log-verify.json in the current directory
   rmm-server version
 
 Flags for run/install:
@@ -358,6 +362,8 @@ func run(args []string) int {
 		}
 	case "user":
 		return runUser(args)
+	case "log":
+		return runLog(args)
 	case "trust":
 		return runTrust(args)
 	case "setup-code":

@@ -38,6 +38,7 @@ export function Audit() {
     { key: 'ip', header: 'IP', sort: (r) => r.ip, render: (r) => <span className="mono muted">{r.ip}</span> },
     { key: 'action', header: 'Action', sort: (r) => r.action, render: (r) => <span className="chip outline mono" style={{ fontWeight: 400 }}>{r.action}</span> },
     { key: 'target', header: 'Target', sort: (r) => r.target, render: (r) => <span className="mono small truncate" style={{ maxWidth: 240, display: 'inline-block' }} title={r.target}>{r.target}</span> },
+    { key: 'log', header: 'Log #', sort: (r) => r.log_index ?? -1, csv: (r) => (r.log_index != null && r.log_index >= 0 ? String(r.log_index) : ''), render: (r) => <span className="mono small muted" title="Position of this entry in the transparency log">{r.log_index != null && r.log_index >= 0 ? r.log_index : '-'}</span>, width: 80 },
     { key: 'details', header: 'Details', csv: (r) => prettyDetails(r.details), render: (r) => <span className="muted small mono truncate" style={{ maxWidth: 420, display: 'inline-block' }} title={r.details}>{prettyDetails(r.details)}</span> },
   ];
 

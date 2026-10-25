@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
+	"github.com/MonsterCouch/homelab-rmm/internal/translog"
 )
 
 // Hub owns every live agent socket. It is the single place that knows how to
@@ -50,6 +52,18 @@ type agentConn struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 	lastPong  atomic.Int64 // unix nanos of the last PONG from the agent
+	// tl is the server's transparency log (nil in a bare test connection) and
+	// logSize the size of the newest head this device says it holds: from its
+	// hello, raised by every reply that carries Envelope.Log. send completes a
+	// log proof from them.
+	tl      *translog.Log
+	logSize atomic.Int64
+	// logSent is the largest log head this connection has been sent. Requests
+	// to one device are written back to back, before the first reply can raise
+	// logSize, and the device checks them in arrival order, so each consistency
+	// proof starts where the previous one ended rather than where the last
+	// reply said the device was. A refused proof resets it (see readLoop).
+	logSent atomic.Int64
 	// ingest is the bounded queue between the read loop and the goroutine
 	// that writes inventory/metrics/events to SQLite. Without it a device
 	// that talks fast enough monopolises the single database connection from
@@ -202,6 +216,9 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		pending: map[string]chan protocol.Envelope{}, streams: map[string]func(protocol.Envelope){},
 		connected: time.Now(), closed: make(chan struct{}), ingest: make(chan protocol.Envelope, ingestQueue),
 	}
+	ac.tl = h.s.tlog
+	ac.logSize.Store(max(hello.LogSize, 0))
+	ac.logSent.Store(max(hello.LogSize, 0))
 	ac.lastPong.Store(time.Now().UnixNano())
 
 	// welcome: identity (for a new enrollment) + config
@@ -232,6 +249,7 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 
 	h.s.db.markOnline(agentID, hello, ip, true)
 	h.s.db.setAgentTrust(agentID, hello.TrustEpoch, hello.TrustHash)
+	h.s.db.setExecutedHead(agentID, hello.ExecutedHead)
 	slog.Info("agent connected", "id", agentID, "host", hello.Hostname, "ip", ip, "version", hello.Version)
 	h.broadcast(hubEvent{Kind: "agent_online", AgentID: agentID})
 	h.s.onAgentOnline(agentID)
@@ -304,6 +322,14 @@ func (h *Hub) readLoop(ac *agentConn) {
 		if err := json.Unmarshal(data, &env); err != nil {
 			slog.Warn("bad frame from agent", "id", ac.id, "err", err)
 			continue
+		}
+		if env.Log > 0 {
+			ac.noteLogSize(env.Log)
+			if env.Err != "" && strings.Contains(env.Err, "log proof") {
+				// The device refused a proof, so it did not move to the head
+				// that was sent: start the next proof from what it holds.
+				ac.logSent.Store(env.Log)
+			}
 		}
 		switch env.T {
 		case protocol.TypePong:
@@ -380,6 +406,7 @@ func (h *Hub) ingestLoop(ac *agentConn) {
 		case protocol.TypeInventory:
 			var inv protocol.Inventory
 			if err := json.Unmarshal(env.D, &inv); err == nil {
+				h.s.db.setExecutedHead(ac.id, inv.ExecutedHead)
 				h.s.onInventory(ac.id, &inv)
 			}
 		case protocol.TypeMetrics:
@@ -420,9 +447,94 @@ func (h *Hub) ingestLoop(ac *agentConn) {
 	}
 }
 
+// noteLogSize raises the size of the log head the device holds. It never
+// lowers it: replies can arrive out of order, and a consistency proof from an
+// older size than the device now holds would be refused by it.
+func (ac *agentConn) noteLogSize(n int64) {
+	for {
+		cur := ac.logSize.Load()
+		if n <= cur || ac.logSize.CompareAndSwap(cur, n) {
+			return
+		}
+	}
+}
+
+// setExecutedHead stores the head of the device's executed.log as it last
+// reported it. An empty value (an older agent, or a device that has run
+// nothing) leaves the stored one alone.
+func (d *DB) setExecutedHead(agentID, head string) {
+	if head == "" {
+		return
+	}
+	// A genuine head is the base64 of a SHA-256 digest. Anything else is a
+	// confused or hostile device and must not grow its row.
+	if raw, err := base64.StdEncoding.DecodeString(head); err != nil || len(raw) != sha256.Size {
+		slog.Warn("ignored a malformed executed-log head from a device", "agent", agentID, "length", len(head))
+		return
+	}
+	var old string
+	d.QueryRow(`SELECT executed_head FROM agents WHERE id = ?`, agentID).Scan(&old)
+	if old == head {
+		return
+	}
+	if _, err := d.Exec(`UPDATE agents SET executed_head = ? WHERE id = ?`, head, agentID); err != nil {
+		slog.Warn("cannot store the device's executed-log head", "agent", agentID, "err", err)
+		return
+	}
+	// The server cannot check that a head extends the previous one, but the
+	// change is recorded: a device whose executed.log was wiped starts a new
+	// chain, and the operator can see that in the audit log as a head that
+	// stops following the ones before it.
+	if old != "" {
+		d.Audit("system", "", "device.executed_head", agentID, map[string]string{"from": old, "to": head})
+	}
+}
+
+// withLogProof returns env with the transparency log proof completed for this
+// connection. The handler only names the manifest's leaf; the head and the
+// proofs depend on what the device already holds, so they are made per send.
+// The ActionAuth and LogProof are copied: the originals are shared by every
+// device of one dispatch (and by a cached grant) and must not be written to.
+func (ac *agentConn) withLogProof(env protocol.Envelope) (protocol.Envelope, error) {
+	if ac.tl == nil || env.A == nil || env.A.L == nil {
+		return env, nil
+	}
+	l := *env.A.L
+	a := *env.A
+	a.L = &l
+	env.A = &a
+	tree, note, err := ac.tl.Head()
+	if err != nil {
+		return env, fmt.Errorf("transparency log head: %w", err)
+	}
+	inc, err := ac.tl.ProveInclusion(l.Index, tree.N)
+	if err != nil {
+		return env, fmt.Errorf("transparency log inclusion proof: %w", err)
+	}
+	l.Head = base64.StdEncoding.EncodeToString(note)
+	l.Proof = translog.EncodeProof(inc)
+	l.From, l.Consistency = 0, nil
+	from := max(ac.logSize.Load(), ac.logSent.Load())
+	if from > 0 && from < tree.N {
+		cons, err := ac.tl.ProveConsistency(from, tree.N)
+		if err != nil {
+			return env, fmt.Errorf("transparency log consistency proof: %w", err)
+		}
+		l.From, l.Consistency = from, translog.EncodeProof(cons)
+	}
+	if tree.N > ac.logSent.Load() {
+		ac.logSent.Store(tree.N)
+	}
+	return env, nil
+}
+
 func (ac *agentConn) send(env protocol.Envelope) error {
 	ac.writeMu.Lock()
 	defer ac.writeMu.Unlock()
+	env, err := ac.withLogProof(env)
+	if err != nil {
+		return err
+	}
 	ac.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	return ac.conn.WriteJSON(env)
 }

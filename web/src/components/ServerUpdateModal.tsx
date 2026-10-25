@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useSyncExternalStore } from 'react';
 import { api } from '../api/client';
 import type { ServerVersionInfo } from '../api/types';
+import { fleetUpdateRunning, fleetUpdateTone, subscribeFleetUpdate, summarizeFleetUpdate, updateFleet } from '../lib/fleetUpdate';
 import { Modal } from './Modal';
 import { Button, ErrorBox } from './ui';
 import { IconCheck, IconDownload, IconRefresh, IconUpload } from './Icons';
@@ -23,6 +24,10 @@ export function ServerUpdateModal({ onClose }: ServerUpdateModalProps) {
 
   const [updatingAgents, setUpdatingAgents] = useState(false);
   const [agentResult, setAgentResult] = useState<string | null>(null);
+  // The run itself, not just the click that started it here: this modal is
+  // unmounted when it is closed, and a run started from the Devices page is
+  // going on as well, so a flag of its own would let a second run be joined.
+  const fleetBusy = useSyncExternalStore(subscribeFleetUpdate, fleetUpdateRunning);
 
   const loadInfo = async () => {
     setLoading(true);
@@ -85,9 +90,10 @@ export function ServerUpdateModal({ onClose }: ServerUpdateModalProps) {
     setUpdatingAgents(true);
     setAgentResult(null);
     try {
-      const res = await api.updateAllAgents();
-      setAgentResult(res.message);
-      toast.info(res.message);
+      const s = await updateFleet();
+      const text = summarizeFleetUpdate(s);
+      setAgentResult(text);
+      toast.push(fleetUpdateTone(s), text);
     } catch (err) {
       toast.error(errMsg(err));
     } finally {
@@ -207,14 +213,14 @@ export function ServerUpdateModal({ onClose }: ServerUpdateModalProps) {
                 <span className="chip outline">Auto-Chore Active</span>
               </div>
               <p className="muted small" style={{ margin: '0 0 12px 0' }}>
-                Agents execute an automatic update chore every 5 minutes: they query the server for the current binary hash, download updates in-place if newer, and cleanly restart the agent service. You can also broadcast an immediate update to all online agents below.
+                Agents execute an automatic update chore every 5 minutes: they query the server for the current binary hash, download updates in-place if newer, and cleanly restart the agent service. Devices in organizations that enforce signed actions are not updated by the chore; they install only updates signed from here, one signature per organization and build. You can also broadcast an immediate update to all online agents below.
               </p>
 
               <div className="row" style={{ gap: 10, alignItems: 'center' }}>
                 <Button
                   onClick={handleUpdateAllAgents}
-                  busy={updatingAgents}
-                  disabled={updatingAgents || restarting}
+                  busy={updatingAgents || fleetBusy}
+                  disabled={updatingAgents || fleetBusy || restarting}
                 >
                   <IconDownload /> Broadcast Update to All Online Agents
                 </Button>

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/MonsterCouch/homelab-rmm/internal/actionauth"
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
 )
 
@@ -516,41 +514,13 @@ func (s *Server) handleFsUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "path required")
 		return
 	}
-	body := io.Reader(r.Body)
-	if b := s.activeBundle(a.OrgID); b != nil {
-		// A signed fs.write carries its bytes inside the manifest (the agent
-		// writes what was signed), so a signed upload is a single small
-		// write. A bigger file cannot be signed: refused where signatures are
-		// enforced, sent unsigned (and reported by the agent) in audit mode.
-		head, err := io.ReadAll(io.LimitReader(r.Body, maxSignedUploadSize+1))
-		if err != nil {
-			fail(w, err)
-			return
-		}
-		if len(head) <= maxSignedUploadSize {
-			payload := protocol.FsWrite{Path: dest, Data: head}
-			s.runSigned(w, r, signedAction{
-				Org: a.OrgID, Op: protocol.ReqFsWrite, Targets: []string{id}, Payload: payload,
-				Summary: fmt.Sprintf("Write %d bytes to %s on %s", len(head), dest, agentLabel(a)),
-				Run: func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth) {
-					ctx, cancel := context.WithTimeout(r.Context(), longTimeout)
-					defer cancel()
-					if err := s.hub.RequestA(ctx, id, protocol.ReqFsWrite, payload, nil, auth); err != nil {
-						fail(w, err)
-						return
-					}
-					s.audit(r, "file.upload", id, map[string]any{"path": dest, "bytes": len(head)})
-					writeJSON(w, 200, map[string]any{"ok": true, "bytes": len(head)})
-				},
-			})
-			return
-		}
-		if b.Mode() == actionauth.ModeEnforce {
-			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("this organization enforces signed actions, and a signed upload is limited to %d KiB; use a script or a smaller file", maxSignedUploadSize>>10))
-			return
-		}
-		body = io.MultiReader(bytes.NewReader(head), r.Body)
+	if s.activeBundle(a.OrgID) != nil {
+		// Devices in this organisation check signatures: stage the bytes and
+		// have the operator sign the commit (uploads.go).
+		s.stageUpload(w, r, a, dest)
+		return
 	}
+	body := io.Reader(r.Body)
 	ctx, cancel := context.WithTimeout(r.Context(), longTimeout)
 	defer cancel()
 	buf := make([]byte, fsChunk)

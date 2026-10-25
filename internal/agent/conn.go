@@ -57,11 +57,19 @@ func Dial(ctx context.Context, url, fingerprint string, hdr http.Header) (*webso
 type conn struct {
 	ws *websocket.Conn
 	mu sync.Mutex
+	// logSize, when set, reports the size of the transparency log head the
+	// device holds; every frame carries it (a script or shell session can run
+	// for hours without replying) so the hub can send consistency proofs from
+	// the right place.
+	logSize func() int64
 }
 
 func (c *conn) send(env protocol.Envelope) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if env.Log == 0 && c.logSize != nil {
+		env.Log = c.logSize()
+	}
 	c.ws.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	return c.ws.WriteJSON(env)
 }

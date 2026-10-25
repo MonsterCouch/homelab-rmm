@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"slices"
 	"sort"
@@ -30,14 +31,13 @@ import (
 // and the retry must still describe the same action or it is refused.
 
 const (
-	actionManifestTTL   = 5 * time.Minute
-	multiSignManifest   = 10 * time.Minute // the ceiling for an action; more approvers need longer
-	grantTTL            = 15 * time.Minute
-	standingTTL         = 180 * 24 * time.Hour
-	standingPendingTTL  = time.Hour // how long a half-signed standing approval stays open
-	maxPendingPerUser   = 200
-	maxSignedUploadSize = 1 << 20 // fs.write payloads travel inside the manifest
-	headerActionAuth    = "X-Action-Auth"
+	actionManifestTTL  = 5 * time.Minute
+	multiSignManifest  = 10 * time.Minute // the ceiling for an action; more approvers need longer
+	grantTTL           = 15 * time.Minute
+	standingTTL        = 180 * 24 * time.Hour
+	standingPendingTTL = time.Hour // how long a half-signed standing approval stays open
+	maxPendingPerUser  = 200
+	headerActionAuth   = "X-Action-Auth"
 )
 
 // signedAction describes one protected request.
@@ -63,6 +63,7 @@ type pendingManifest struct {
 	id          string
 	org         string
 	user        *User
+	from        string // where user asked from: what the action's own audit entry names
 	kind        string
 	op          string
 	ops         []string
@@ -74,7 +75,11 @@ type pendingManifest struct {
 	expiresAt   int64 // when this entry is dropped (the manifest may live longer)
 	sigs        []protocol.Assertion
 	done        bool
-	run         func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth)
+	// logIndex is the leaf the released manifest has in the transparency log;
+	// logged says it was set (index 0 is a real leaf).
+	logIndex int64
+	logged   bool
+	run      func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth)
 }
 
 type cachedGrant struct {
@@ -94,10 +99,16 @@ type signingState struct {
 	mu      sync.Mutex
 	pending map[string]*pendingManifest
 	grants  map[grantKey][]cachedGrant
+	staged  map[string]*stagedUpload // uploads staged on an agent, awaiting a signed fs.commit
 }
 
 func (st *signingState) sweepLocked() {
 	t := now()
+	for id, u := range st.staged {
+		if u.expiresAt <= t {
+			delete(st.staged, id)
+		}
+	}
 	for id, p := range st.pending {
 		if p.expiresAt <= t {
 			delete(st.pending, id)
@@ -264,11 +275,24 @@ func ownerCredentialIDs(b *actionauth.Bundle, owner string) []string {
 	return out
 }
 
-func withIssuer(r *http.Request, u *User) *http.Request {
-	if u == nil {
-		return r
+// issuerAddrKey marks, on a request that runs a signed action, the address the
+// operator asked for the action from.
+type issuerAddrKey struct{}
+
+// withIssuer makes r speak for the operator who asked for the action: the
+// pending entry's user, and the address they asked from. The closure that runs
+// the action is reached by whoever adds the last signature, in an organization
+// with several signers another operator at another address, and what it audits
+// must name the one who asked.
+func withIssuer(r *http.Request, p *pendingManifest) *http.Request {
+	ctx := r.Context()
+	if p.user != nil {
+		ctx = context.WithValue(ctx, userKey, p.user)
 	}
-	return r.WithContext(context.WithValue(r.Context(), userKey, u))
+	if p.from != "" {
+		ctx = context.WithValue(ctx, issuerAddrKey{}, p.from)
+	}
+	return r.WithContext(ctx)
 }
 
 func describeAuthHeader(h string) (id string, a protocol.Assertion, err error) {
@@ -401,7 +425,7 @@ func (s *Server) challenge(w http.ResponseWriter, r *http.Request, u *User, b *a
 		return
 	}
 	p := &pendingManifest{
-		id: m.ID, org: sa.Org, user: u, kind: sa.Kind, op: sa.Op, ops: m.Ops, targets: sa.Targets, fingerprint: fp,
+		id: m.ID, org: sa.Org, user: u, from: s.clientIP(r), kind: sa.Kind, op: sa.Op, ops: m.Ops, targets: sa.Targets, fingerprint: fp,
 		manifest: raw, summary: sa.Summary, createdAt: t, expiresAt: m.Exp, run: sa.Run,
 	}
 	if sa.Kind == actionauth.KindStanding && p.expiresAt > t+int64(standingPendingTTL/time.Second) {
@@ -500,8 +524,35 @@ func (s *Server) noteSigned(r *http.Request, p *pendingManifest, a protocol.Asse
 	s.audit(r, "action.sign", p.org, map[string]any{"manifest": p.id, "kind": p.kind, "op": p.op, "ops": p.ops, "targets": len(p.targets), "signer": owner, "have": have, "need": need})
 }
 
+// auth is the ActionAuth the device receives. When the manifest was logged at
+// release it names its leaf; the hub fills in the proof for each send.
 func (p *pendingManifest) auth() *protocol.ActionAuth {
-	return &protocol.ActionAuth{M: actionauth.EncodeB64(p.manifest), S: slices.Clone(p.sigs)}
+	a := &protocol.ActionAuth{M: actionauth.EncodeB64(p.manifest), S: slices.Clone(p.sigs)}
+	if p.logged {
+		a.L = &protocol.LogProof{Index: p.logIndex}
+	}
+	return a
+}
+
+// release logs the finished manifest, once, and returns what to send. It is
+// the one place both dispatch sites pass through before p.auth(). A log that
+// cannot take the entry stops the dispatch: running a signed action that no
+// one can later prove was relayed is the thing the log exists to prevent.
+func (s *Server) release(w http.ResponseWriter, p *pendingManifest) (*protocol.ActionAuth, bool) {
+	if s.tlog != nil && !p.logged {
+		leaf, err := actionauth.ManifestLeaf(&protocol.ActionAuth{M: actionauth.EncodeB64(p.manifest), S: slices.Clone(p.sigs)})
+		var idx int64
+		if err == nil {
+			idx, err = s.tlog.Append("manifest", leaf)
+		}
+		if err != nil {
+			slog.Error("manifest was not added to the transparency log", "manifest", p.id, "err", err)
+			writeErr(w, http.StatusInternalServerError, "the transparency log could not record this action, so nothing was sent; try again, and check the server log if it keeps failing")
+			return nil, false
+		}
+		p.logIndex, p.logged = idx, true
+	}
+	return p.auth(), true
 }
 
 func pendingBody(p *pendingManifest, have, need int) map[string]any {
@@ -536,7 +587,11 @@ func (s *Server) countersign(w http.ResponseWriter, r *http.Request, u *User, b 
 	}
 	// The stored closure carries this request's own parameters, but dispatch
 	// what was signed: the pending entry's closure, not a fresh one.
-	p.run(w, withIssuer(r, p.user), p.auth())
+	auth, ok := s.release(w, p)
+	if !ok {
+		return
+	}
+	p.run(w, withIssuer(r, p), auth)
 }
 
 // ---- approvals queue ----
@@ -606,7 +661,11 @@ func (s *Server) handleSignApproval(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusAccepted, pendingBody(p, have, need))
 		return
 	}
-	p.run(w, withIssuer(r, p.user), p.auth())
+	auth, ok := s.release(w, p)
+	if !ok {
+		return
+	}
+	p.run(w, withIssuer(r, p), auth)
 }
 
 // ---- grants ----
