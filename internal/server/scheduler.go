@@ -339,7 +339,9 @@ func (sc *scheduler) purge() {
 	day := int64(86400)
 	// The two big append-only tables are deleted in bounded time slices so a
 	// single statement never holds the one SQLite connection for long.
-	sc.s.db.purgeByTS("metrics", "ts", now()-int64(ret.MetricsDays)*day)
+	if err := sc.s.db.telemetry.Purge(now() - int64(ret.MetricsDays)*day); err != nil {
+		slog.Warn("purging telemetry", "err", err)
+	}
 	sc.s.db.purgeByTS("agent_events", "ts", now()-int64(ret.EventsDays)*day)
 	// Drift history follows the events retention, as docs/BASELINES.md says.
 	sc.s.db.purgeByTS("baseline_history", "ts", now()-int64(ret.EventsDays)*day)
@@ -360,6 +362,7 @@ func (sc *scheduler) purge() {
 	sc.s.db.Exec(`DELETE FROM enroll_tokens WHERE expires_at < ?`, now()-day)
 	sc.s.db.purgeSessions()
 	// runs stuck in 'running' after a server restart can never finish
+	sc.s.db.failStaleServicing(int64(servicingRequestTimeout / time.Second))
 	sc.s.db.Exec(`UPDATE script_runs SET status='failed', stderr='server restarted while the script was running', finished_at=? WHERE status='running' AND started_at < ?`, now(), now()-6*3600)
 }
 

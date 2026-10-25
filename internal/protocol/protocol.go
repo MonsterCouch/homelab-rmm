@@ -39,7 +39,36 @@ const (
 	TypeStream    = "stream"    // chunk of a long-running request (shell, script)
 	TypeEvent     = "event"     // unsolicited notification (service change, reboot required)
 	TypePong      = "pong"
+	// TypeAuth is the agent's first frame on a QUIC control stream, ahead of
+	// hello. It carries the credentials the WebSocket path sends as HTTP
+	// headers, because a QUIC stream has no headers to put them in.
+	TypeAuth = "auth"
 )
+
+// QUICALPN is the TLS application protocol both ends must name for the agent
+// transport; a server that does not see it refuses the handshake, so a stray
+// HTTP/3 client never reaches the agent endpoint.
+const QUICALPN = "homelab-rmm-agent/1"
+
+// Refusal sentences the server puts in the Err of an "error" frame when it
+// turns an agent away during authentication. They are the same text the
+// WebSocket path returns in its 401 body, and an agent matches on them to tell
+// a rejected key (re-enroll, never a transport failure) from a transport fault.
+const (
+	ErrUnknownAgentKey    = "unknown agent key"
+	ErrMissingCredentials = "missing credentials"
+	// ErrEnrollmentRefused prefixes the reason an enrollment token was refused.
+	ErrEnrollmentRefused = "enrollment refused: "
+)
+
+// Auth is the payload of a TypeAuth frame: an enrolled device's key, or the
+// enrollment token of a first contact. When both are set the key is used, the
+// same precedence the WebSocket path gives the Authorization header. Neither is
+// ever logged or stored by the server.
+type Auth struct {
+	Key   string `json:"key,omitempty"`
+	Token string `json:"token,omitempty"`
+}
 
 // Message types sent by the server. Each is a request the agent answers with a
 // TypeReply carrying the same ID (or a sequence of TypeStream then TypeReply).
@@ -79,6 +108,7 @@ const (
 	ReqTrustUpdate       = "trust.update"       // replace the agent's trust bundle (signed by the current bundle's signers or a recovery key)
 	ReqFsStage           = "fs.stage"           // append a chunk of an upload to an agent-private staging file; nothing reads it until fs.commit
 	ReqFsCommit          = "fs.commit"          // move a staged upload into place once its size and SHA-256 match
+	ReqServicingRepair   = "servicing.repair"   // Windows only: DISM, SFC and Windows Update component reset; reply ServicingRepairResult
 )
 
 // TypeBaseline is sent by the agent after every evaluation pass (scheduled,
@@ -104,6 +134,12 @@ type Hello struct {
 	// hash-chained executed.log.
 	LogSize      int64  `json:"log_size,omitempty"`
 	ExecutedHead string `json:"executed_head,omitempty"`
+	// CacheCapable says the agent has a cache directory and could bind the
+	// subnet cache port, so the server may make it a leader; CacheFingerprint
+	// is the SHA-256 of the self-signed certificate it would serve with, which
+	// members pin (docs/plans/2026-10-24-phase4b-mesh-cache.md).
+	CacheCapable     bool   `json:"cache_capable,omitempty"`
+	CacheFingerprint string `json:"cache_fingerprint,omitempty"`
 }
 
 // AgentConfig is pushed by the server after hello and whenever settings change.
@@ -120,6 +156,42 @@ type AgentConfig struct {
 	// ID in decimal. An agent holding a trust bundle keeps only the specs
 	// whose approval verifies (in enforce mode; audit keeps and reports).
 	BaselineAuth map[string]*ActionAuth `json:"baseline_auth,omitempty"`
+	// QUIC and QUICPort advertise the server's optional QUIC agent transport
+	// (docs/plans/2026-10-24-phase3e-quic.md). QUICPort is the UDP port on the
+	// host the agent already uses; zero or QUIC false means the server only
+	// speaks WebSocket.
+	QUIC     bool `json:"quic,omitempty"`
+	QUICPort int  `json:"quic_port,omitempty"`
+	// Cache assigns the device its subnet cache role; nil means no cache, and
+	// a device that had one stops serving and fetching through it.
+	Cache *CacheConfig `json:"cache,omitempty"`
+}
+
+// CacheConfig is a device's place in its subnet's artifact cache. Every member
+// gets the leader's address, certificate pin and the day's token; the leader
+// also gets Serve, the port to bind and its storage budget.
+type CacheConfig struct {
+	LeaderAddr  string `json:"leader_addr"` // host:port the members dial
+	LeaderID    string `json:"leader_id"`
+	Fingerprint string `json:"fingerprint"` // SHA-256 of the leader certificate, hex
+	Token       string `json:"token"`       // daily bearer token; the leader checks it on every request
+	Serve       bool   `json:"serve,omitempty"`
+	Port        int    `json:"port,omitempty"`
+	MaxBytes    int64  `json:"max_bytes,omitempty"`
+}
+
+// CacheStats is what the agent reports about its cache role in inventory.
+type CacheStats struct {
+	Role        string `json:"role"` // "leader", "member" or "" when off
+	Hits        int64  `json:"hits"`
+	Misses      int64  `json:"misses"`
+	BytesServed int64  `json:"bytes_served"`
+	BytesStored int64  `json:"bytes_stored"`
+	// Serving is true while the device really listens as a leader. ServeFailed
+	// says the server assigned it to lead and it could not (port taken, store
+	// unusable), so the planner should choose another leader.
+	Serving     bool `json:"serving,omitempty"`
+	ServeFailed bool `json:"serve_failed,omitempty"`
 }
 
 // Inventory is the full description of a device.
@@ -157,6 +229,9 @@ type Inventory struct {
 	AgentPath     string `json:"agent_path"`
 	CollectedAt   int64  `json:"collected_at"`
 	Extra         Extra  `json:"extra,omitempty"`
+	// Cache is the device's subnet cache role and counters; nil when the
+	// feature is off for it.
+	Cache *CacheStats `json:"cache,omitempty"`
 }
 
 // Extra holds free-form platform specifics.
@@ -353,6 +428,51 @@ type UpdatesInstallResult struct {
 	Failed    map[string]string `json:"failed"`
 	RebootReq bool              `json:"reboot_required"`
 	Log       string            `json:"log"`
+}
+
+// ---- Servicing repair ----
+
+// Servicing repair step names, in the order a technician would run them.
+const (
+	ServicingDismRestore     = "dism_restore"
+	ServicingSFC             = "sfc"
+	ServicingResetComponents = "reset_components"
+	ServicingAddPackage      = "add_package"
+	ServicingRescan          = "rescan"
+)
+
+// ServicingPackage is a .cab or .msu the agent fetches (through the subnet
+// cache when it has a leader) and adds with DISM; SHA256 is mandatory.
+type ServicingPackage struct {
+	URL    string `json:"url"`
+	SHA256 string `json:"sha256"`
+}
+
+// ServicingRepair is the payload of servicing.repair. Empty Steps means the
+// default set (dism_restore, reset_components, rescan). Reboot is "never"
+// (default) or "if_required".
+type ServicingRepair struct {
+	Steps   []string          `json:"steps"`
+	Package *ServicingPackage `json:"package,omitempty"`
+	Reboot  string            `json:"reboot,omitempty"`
+}
+
+// ServicingStep is one step's outcome. Status is ok, failed or skipped; Tail
+// keeps the end of the command's output.
+type ServicingStep struct {
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	ExitCode   int    `json:"exit_code"`
+	DurationMS int64  `json:"duration_ms"`
+	Tail       string `json:"tail,omitempty"`
+}
+
+// ServicingRepairResult is the reply: every step that ran or was skipped, and
+// the ordinary update scan taken at the end (nil when rescan was not run).
+type ServicingRepairResult struct {
+	Steps          []ServicingStep    `json:"steps"`
+	RebootRequired bool               `json:"reboot_required"`
+	Scan           *UpdatesScanResult `json:"scan,omitempty"`
 }
 
 // ---- Event log ----

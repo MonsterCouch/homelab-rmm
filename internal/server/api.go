@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/MonsterCouch/homelab-rmm/internal/telemetry"
 )
 
 // routes builds the HTTP mux. Everything under /api requires a session
@@ -96,6 +98,8 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("GET /api/agents/{id}/patches", s.handleAgentPatches)
 	api.HandleFunc("POST /api/agents/{id}/patches/scan", s.requireWrite(s.handlePatchScan))
 	api.HandleFunc("POST /api/agents/{id}/patches/install", s.requireWrite(s.handlePatchInstall))
+	api.HandleFunc("GET /api/agents/{id}/servicing", s.handleListServicing)
+	api.HandleFunc("POST /api/agents/{id}/servicing/repair", s.requireWrite(s.handleServicingRepair))
 	api.HandleFunc("GET /ws/shell/{id}", s.requireWrite(s.handleShellWS))
 	api.HandleFunc("GET /ws/desktop/{id}", s.requireWrite(s.handleDesktopViewerWS))
 
@@ -127,6 +131,7 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("GET /api/approvals", s.handleListApprovals)
 	api.HandleFunc("GET /api/approvals/unsigned", s.handleUnsignedApprovals)
 	api.HandleFunc("POST /api/approvals/objects/{type}/{id}/sign", s.requireWrite(s.handleSignObject))
+	api.HandleFunc("GET /api/approvals/{manifest_id}", s.handleGetApproval)
 	api.HandleFunc("POST /api/approvals/{manifest_id}/sign", s.requireWrite(s.handleSignApproval))
 	api.HandleFunc("POST /api/agents/{id}/grant", s.requireWrite(s.handleGrant))
 
@@ -747,8 +752,19 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 	var dbSize int64
 	s.db.QueryRow(`SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()`).Scan(&dbSize)
+	// The metrics series may live outside rmm.db, so its engine and size are
+	// reported next to the database's. telemetry_bytes is -1 when the engine
+	// cannot say (SQLite builds without the dbstat table).
+	engine, teleBytes := s.cfg.TelemetryEngine(), int64(-1)
+	if in, ok := s.db.telemetry.(telemetry.Inspector); ok {
+		engine = in.Engine()
+		if n, err := in.SizeBytes(); err == nil {
+			teleBytes = n
+		}
+	}
 	writeJSON(w, 200, map[string]any{
 		"version": Version, "public_url": s.PublicURL(), "fingerprint": s.Fingerprint(), "pin_fingerprint": s.PinFingerprint(),
+		"telemetry_engine": engine, "telemetry_bytes": teleBytes,
 		"data_dir": s.cfg.DataDir, "db_bytes": dbSize, "uptime": int64(time.Since(s.startedAt).Seconds()),
 		"agents_connected": len(s.hub.OnlineIDs()),
 		// "" unless the certificate does not cover public_url, in which case

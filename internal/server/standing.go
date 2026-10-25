@@ -421,14 +421,21 @@ func (s *Server) objectUnits(typ, id string) []approvalUnit {
 		pols, _ := s.db.ListPatchPolicies()
 		for i := range pols {
 			p := &pols[i]
-			if !p.Enabled || p.InstallSchedule == "" || !want(approvalPatchPolicy, strconv.FormatInt(p.ID, 10)) {
+			if !p.Enabled || !want(approvalPatchPolicy, strconv.FormatInt(p.ID, 10)) {
 				continue
 			}
 			orgs := orgsMatching(loadAgents(), p.Targets)
-			inst, reb := policyUnits(p)
-			add(inst, orgs)
-			if reb != nil {
-				add(*reb, orgs)
+			if p.InstallSchedule != "" {
+				inst, reb := policyUnits(p)
+				add(inst, orgs)
+				if reb != nil {
+					add(*reb, orgs)
+				}
+			}
+			// An automatic servicing repair runs unattended whatever the
+			// install schedule is, so it is its own unit.
+			if p.Repair == "auto" {
+				add(repairUnit(p), orgs)
 			}
 		}
 	}
@@ -647,6 +654,8 @@ func standingSummary(u approvalUnit, org string) string {
 		detail = "reboot only"
 	case protocol.ReqUpdatesInstall:
 		detail = "install OS updates"
+	case protocol.ReqServicingRepair:
+		detail = fmt.Sprintf("repair Windows servicing with only these steps: %s (reboot: %s)", strings.Join(u.Cons.Steps, ", "), u.Cons.Reboot)
 	case actionauth.SpecOp:
 		detail = fmt.Sprintf("hold exactly this baseline definition (SHA-256 %s)", clip(u.Cons.SpecSHA256, 16))
 	}

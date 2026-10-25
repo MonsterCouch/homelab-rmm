@@ -76,6 +76,7 @@ var classes = map[string]Class{
 	"fs.commit":          ClassAction,
 	"power":              ClassAction,
 	"updates.install":    ClassAction,
+	"servicing.repair":   ClassAction,
 	"baseline.remediate": ClassAction,
 	"baseline.preview":   ClassAction, // runs the unsaved spec's check scripts
 	"device.isolate":     ClassAction,

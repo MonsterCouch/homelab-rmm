@@ -350,7 +350,7 @@ neither the script nor the download.
 
 Once an organisation has a **trust bundle**, its devices stop taking the server's word for
 destructive requests. Running a script, killing a process, changing a service, writing or
-deleting files, rebooting, isolating, installing updates or a new agent build, opening a shell or
+deleting files, rebooting, isolating, installing updates or a new agent build, repairing Windows servicing, opening a shell or
 the remote desktop, and browsing files all need an operator's **security key** (or passkey). The
 key must have signed that exact request for that device. The device checks the signature against
 the bundle it pinned, so a request the server altered, invented or replayed is refused there. The
@@ -368,11 +368,42 @@ None of them can make a device do anything, because they never touch an operator
 - **A fully compromised server can still trick you.** The console's JavaScript comes from the
   server, and security keys do not display what they sign. A tampered console could show one
   action and sign another. The signing dialog decodes the exact bytes your key signs, but that
-  dialog is also served by the server. A signer that runs outside the browser is planned (3D).
+  dialog is also served by the server. Signing with `rmm-signer` (below) removes this for the
+  operator who uses it; the browser path stays exposed.
 - **Keystrokes into a session that is already open.** Signing covers opening a shell or remote
   desktop, not each keystroke. Grants last 15 minutes and cover one device.
 - **Denial of service and telemetry.** A compromised server can still refuse to relay anything,
   and it still sees what devices report.
+
+**Signing outside the browser (`rmm-signer`).** `rmm-signer.exe` (Windows, built by `make signer`)
+fetches a pending manifest, decodes and prints it itself (kind, organization, issuer, expiry, targets,
+and the payload in full: a script's whole body and environment, an update's url and sha256), asks
+`Sign? [y/N]`, and signs the exact bytes with Windows Hello or a security key through the native
+WebAuthn API. A compromised server or console can no longer show one action and have you sign
+another, because the server serves nothing you read. It only supplies the list and the device names,
+which are printed marked as the server's. The credentials are the ones registered under **Account →
+Security keys**; the signature is checked by the devices as for a browser signature.
+
+```
+rmm-signer login --server https://rmm.example.net     password, and the TOTP code when asked
+rmm-signer list  --server https://rmm.example.net     what waits for your signature
+rmm-signer show  ID                                   print one manifest, sign nothing
+rmm-signer sign  ID                                   print, confirm, sign, post (or: sign --all)
+rmm-signer logout
+```
+
+In the console, **Sign with rmm-signer** in the signing dialog (or **Copy rmm-signer command** on
+Approvals) gives the id; the request waits until it expires. The tool signs only when `--server`'s
+origin is one of the bundle's origins, and refuses an entry whose manifest carries another id than
+the one listed. `login` keeps the session cookie in `%APPDATA%\homelab-rmm\signer.json` (mode 0600,
+written through a temporary file); it has the power of a logged-in browser until it expires, and
+`rmm-signer logout` deletes it and ends the session on the server. A session saved for another
+server is never sent, and redirects are never followed.
+
+What it does **not** protect against: a compromised operator machine (malware there can read the
+session file, replace the tool or press the confirmation for you; Windows Hello or the key touch is
+the only barrier), a manifest you approve without reading it, and a server that invents manifests
+for you to sign (it can only ask; you decide). It has not yet been run against a real authenticator.
 
 **Before you start:**
 - The console must be reached by a **DNS name**. Browsers do not offer security keys to a site
@@ -470,6 +501,17 @@ means the server cannot release or rewrite anything quietly. It does not protect
   `log verify` from another host so that a rebuilt log fails its consistency check, and guard `log.key`;
 - a log that nobody checks: devices verify proofs only when the bundle pins `log_key`, and the command
   only when someone runs it.
+
+### Servicing repair and the update cache
+
+`servicing.repair` is a `ClassAction` in `internal/actionauth/policy.go`, so a manual repair is signed like `script.run`: the manifest names the device and the exact steps, package and reboot mode, and the agent refuses it in enforce mode without a valid signature. An automatic repair by a patch policy runs under a **standing approval unit** (purpose `repair`, constraints `{op: servicing.repair, steps, reboot}`). The unit binds the steps (`dism_restore`, `reset_components`, `rescan`) and the reboot mode (`if_required` or `never`), and `Constraints.check` refuses any payload that carries a package, so an unattended repair cannot be pointed at a download. Editing the policy's repair or reboot setting makes the unit unsigned until it is re-signed. The agent runs only fixed executables by absolute path under `%SystemRoot%\System32`, hidden, and renames the two catalog directories instead of deleting them. A package, when one is signed for, must be https on the server's own host and match its SHA-256.
+
+The subnet update cache (see OPERATIONS) does not widen what a device trusts:
+- **Integrity does not depend on the leader.** A member verifies each 2 MiB chunk against the leader's index, then the whole file against the SHA-256 the server named, which in a signing organization is inside the signed manifest. A leader that serves consistent but wrong bytes is rejected, and the member falls back to the origin.
+- **Who may use a leader.** Requests carry a bearer token, an HMAC of the organization and the UTC date under a server-held secret (`mesh_cache_secret`); the leader accepts today's and yesterday's. The member pins the leader's self-signed certificate by the SHA-256 fingerprint the server delivered in its config, so another host on the subnet cannot impersonate a leader. The token is not a secret from the organization's own devices.
+- **The leader is not a proxy.** It fills a miss only from a URL with the same scheme and host as its configured `server_url`, refuses redirects off that host, and keeps a download only if its hash equals the one asked for (otherwise 502).
+- **What leaks.** The cached artifacts are things the server serves without authentication anyway (agent binaries). The leader listens on every interface; restrict the port to the subnet with the firewall. The Windows agent's own rule uses `remoteip=LocalSubnet`.
+- **Grouping is by organization,** and a group only forms inside one organization and subnet, so devices of one tenant never fetch through another tenant's device.
 
 ## What is not protected
 

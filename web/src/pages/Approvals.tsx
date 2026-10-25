@@ -1,12 +1,12 @@
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, isPending } from '../api/client';
+import { announceParked, api, isPending } from '../api/client';
 import type { PendingApproval, UnsignedObject, UnsignedType } from '../api/types';
 import { Button, Chip, Empty, ErrorBox, Loading, Tabs } from '../components/ui';
 import { useAsync, useInterval } from '../hooks/useAsync';
 import { dateTime, relTime } from '../lib/format';
 import { decodeManifest } from '../lib/manifest';
-import { requestSigning, SigningCancelled } from '../lib/signing';
+import { requestSigning, signerCommand, SigningCancelled } from '../lib/signing';
 import { signAll, signAllTone, summarizeSignAll, unitLabel } from '../lib/signAll';
 import { isWebAuthnUsable } from '../lib/webauthn';
 import { errMsg, useToast } from '../state/toast';
@@ -86,7 +86,11 @@ function PendingTab({ canSign }: { canSign: boolean }) {
     }
     setBusy(a.manifest_id);
     try {
-      const d = await requestSigning({ docKind: 'manifest', doc: a.manifest, summary: a.summary, required: true, title: 'Approve a pending request' });
+      const d = await requestSigning({ docKind: 'manifest', doc: a.manifest, summary: a.summary, required: true, title: 'Approve a pending request', manifestId: a.manifest_id, rpId: a.rp_id, allowCredentials: a.allow_credentials, userVerification: a.user_verification });
+      if (d.kind === 'park') {
+        announceParked(a.manifest_id);
+        return;
+      }
       if (d.kind !== 'sign') return;
       const r = await api.signApproval(a.manifest_id, d.assertion);
       if (isPending(r) || r.have < r.need) toast.success('Signature added', `${r.have} of ${r.need} signatures.`);
@@ -132,11 +136,14 @@ function PendingTab({ canSign }: { canSign: boolean }) {
                       <Chip tone={a.have >= a.need ? 'ok' : 'info'}>
                         {a.have} / {a.need}
                       </Chip>
+                      {a.have === 0 && <div className="muted small">Waiting for your signature, 0 of {a.need}</div>}
+                      {a.signers && a.signers.length > 0 && <div className="muted small">signed by {a.signers.join(', ')}</div>}
                     </td>
                     <td className="muted" title={a.expires_at ? dateTime(a.expires_at) : undefined}>
                       {a.expires_at ? relTime(a.expires_at) : '—'}
                     </td>
                     <td>
+                      <CopyCommand text={signerCommand(a.manifest_id)} />{' '}
                       <Button size="sm" variant="primary" busy={busy === a.manifest_id} disabled={!canSign} onClick={() => sign(a)}>
                         Review &amp; sign
                       </Button>
@@ -149,6 +156,21 @@ function PendingTab({ canSign }: { canSign: boolean }) {
         )}
       </div>
     </div>
+  );
+}
+
+function CopyCommand({ text }: { text: string }) {
+  const toast = useToast();
+  const copy = () => {
+    void navigator.clipboard?.writeText(text).then(
+      () => toast.success('Command copied', text),
+      () => toast.error('Could not copy', 'Select the command and copy it by hand.'),
+    );
+  };
+  return (
+    <Button size="sm" onClick={copy} title={text}>
+      Copy rmm-signer command
+    </Button>
   );
 }
 

@@ -303,6 +303,22 @@ func (c *Constraints) check(d json.RawMessage) error {
 		// The agent installs only through the OS update service, so the
 		// update IDs cannot carry code; the approval is the decision to
 		// patch at all.
+	case protocol.ReqServicingRepair:
+		// The approval names the exact steps and the reboot setting. A
+		// package is never covered: an unattended repair repairs from the
+		// device's own component store and cannot be pointed at a download.
+		var rep protocol.ServicingRepair
+		if err := json.Unmarshal(d, &rep); err != nil {
+			return fmt.Errorf("%w: unreadable servicing payload", ErrScope)
+		}
+		switch {
+		case len(c.Steps) == 0 || !slices.Equal(c.Steps, rep.Steps):
+			return fmt.Errorf("%w: the repair steps are not the approved ones", ErrScope)
+		case rep.Package != nil:
+			return fmt.Errorf("%w: an unattended repair cannot add a package", ErrScope)
+		case c.Reboot != rep.Reboot:
+			return fmt.Errorf("%w: the reboot setting is not the approved one", ErrScope)
+		}
 	case SpecOp:
 		canon, err := CanonicalizeJSON(d)
 		if err != nil {

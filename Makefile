@@ -4,6 +4,7 @@
 #   make web       npm ci && npm run build in web/ (the server embeds web/dist)
 #   make server    rmm-server for windows/amd64, windows/arm64, linux/amd64, linux/arm64
 #   make agents    rmm-agent for those four plus linux/arm (GOARM=7)
+#   make signer    rmm-signer (out-of-band approval signer) for windows/amd64 and windows/arm64
 #   make test      go vet, go test, and a TypeScript/Vite build of the UI
 #   make package   dist/homelab-rmm-<os>-<arch>.zip per server platform (+ .tar.gz on
 #                  linux), each with the server, every agent binary, docs and SHA256SUMS.
@@ -25,11 +26,16 @@ MODULE  := github.com/MonsterCouch/homelab-rmm
 DIST    ?= dist
 
 # -s -w strips symbols and DWARF; the two -X flags stamp the version each
-# binary prints and reports (server.Version, agent.Version).
-LDFLAGS := -s -w -X $(MODULE)/internal/server.Version=$(VERSION) -X $(MODULE)/internal/agent.Version=$(VERSION)
+# binary prints and reports (server.Version, agent.Version), and main.Version is
+# the one rmm-signer prints (it must not import the server or agent packages just
+# for a string; -X on a symbol a binary does not have is silently ignored).
+LDFLAGS := -s -w -X $(MODULE)/internal/server.Version=$(VERSION) -X $(MODULE)/internal/agent.Version=$(VERSION) -X main.Version=$(VERSION)
 
 SERVER_PLATFORMS := windows/amd64 windows/arm64 linux/amd64 linux/arm64
 AGENT_PLATFORMS  := windows/amd64 windows/arm64 linux/amd64 linux/arm64 linux/arm
+# rmm-signer signs with the Windows WebAuthn API, so only Windows gets a binary here;
+# other platforms can still `go build ./cmd/rmm-signer` (sign then says it needs Windows).
+SIGNER_PLATFORMS := windows/amd64 windows/arm64
 
 # rmm-server embeds web/dist (web/embed.go, `go:embed all:dist`), and web/dist is
 # gitignored apart from .gitkeep: on a fresh clone the embed quietly succeeds with
@@ -44,10 +50,10 @@ WEB_GUARD = @test -n "$(ALLOW_EMPTY_WEB)" || test -f web/dist/index.html || { \
 
 export VERSION GO NPM DIST
 
-.PHONY: all web server agents test package checksums clean help fmt vet FORCE
+.PHONY: all web server agents signer test package checksums clean help fmt vet FORCE
 
 all: web
-	$(MAKE) server agents
+	$(MAKE) server agents signer
 
 web:
 	cd web && $(NPM) ci && $(NPM) run build
@@ -71,12 +77,15 @@ binary  = $(DIST)/$(1)-$(subst /,-,$(2))$(if $(filter windows,$(call os_of,$(2))
 
 $(foreach p,$(SERVER_PLATFORMS),$(eval $(call build_rule,rmm-server,$(call os_of,$(p)),$(call arch_of,$(p)),)))
 $(foreach p,$(AGENT_PLATFORMS),$(eval $(call build_rule,rmm-agent,$(call os_of,$(p)),$(call arch_of,$(p)),$(if $(filter arm,$(call arch_of,$(p))),GOARM=7,))))
+$(foreach p,$(SIGNER_PLATFORMS),$(eval $(call build_rule,rmm-signer,$(call os_of,$(p)),$(call arch_of,$(p)),)))
 
 SERVER_BINS := $(foreach p,$(SERVER_PLATFORMS),$(call binary,rmm-server,$(p)))
 AGENT_BINS  := $(foreach p,$(AGENT_PLATFORMS),$(call binary,rmm-agent,$(p)))
+SIGNER_BINS := $(foreach p,$(SIGNER_PLATFORMS),$(call binary,rmm-signer,$(p)))
 
 server: $(SERVER_BINS)
 agents: $(AGENT_BINS)
+signer: $(SIGNER_BINS)
 
 FORCE:
 
@@ -97,7 +106,7 @@ vet:
 # The archive layout is what the quick start expects: rmm-server(.exe) at the
 # root, agents/ beside it (the server serves them from there), README, docs.
 
-package: server agents
+package: server agents signer
 	tools/build.sh package
 
 checksums:
@@ -108,4 +117,4 @@ clean:
 	find web/dist -mindepth 1 ! -name .gitkeep -delete 2>/dev/null || true
 
 help:
-	@sed -n '2,17p' $(MAKEFILE_LIST)
+	@sed -n '2,18p' $(MAKEFILE_LIST)

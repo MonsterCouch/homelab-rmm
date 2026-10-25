@@ -90,6 +90,7 @@ export interface Inventory {
   agent_path: string;
   collected_at: number;
   extra?: Record<string, string>;
+  cache?: CacheStats;
 }
 
 export interface DiskUsage {
@@ -213,6 +214,8 @@ export interface Agent {
   last_ip: string;
   last_seen: number;
   online: boolean;
+  /** Which agent transport the live connection uses; absent while offline. */
+  transport?: 'websocket' | 'quic';
   monitored_services: string[];
   maintenance_until: number;
   enrolled_at: number;
@@ -520,6 +523,8 @@ export interface PatchPolicy {
   mode: 'approved' | 'all' | 'security' | string;
   reboot: 'never' | 'if_required' | 'always' | string;
   enabled: boolean;
+  /** off, or auto: a scan or install that reports a servicing error code starts one repair. */
+  repair?: 'off' | 'auto' | string;
   created_at: number;
 }
 
@@ -553,6 +558,57 @@ export interface Settings {
   smtp: MailSettings;
   agent_defaults: AgentConfig;
   retention: Retention;
+  /** Absent from an older server; a save that omits it keeps the current value. */
+  mesh_cache?: MeshCacheSettings;
+}
+
+export interface MeshCacheSettings {
+  enabled: boolean;
+  port: number;
+  max_bytes: number;
+}
+
+export interface CacheStats {
+  /** leader, member, or empty when the device is not in a cache group */
+  role: string;
+  hits: number;
+  misses: number;
+  bytes_served: number;
+  bytes_stored: number;
+}
+
+export interface ServicingStep {
+  name: string;
+  status: 'ok' | 'failed' | 'skipped' | string;
+  exit_code: number;
+  duration_ms: number;
+  tail?: string;
+}
+
+/** What the agent replied. A record whose repair never started carries only error. */
+export interface ServicingResult {
+  steps?: ServicingStep[] | null;
+  reboot_required?: boolean;
+  error?: string;
+}
+
+export interface ServicingRecord {
+  id: number;
+  agent_id: string;
+  policy_id: number | null;
+  trigger: 'manual' | 'auto' | string;
+  code: string;
+  why?: string;
+  started_at: number;
+  finished_at: number;
+  status: 'running' | 'ok' | 'failed' | string;
+  result: ServicingResult | null;
+  by: string;
+}
+
+export interface ServicingRepairRequest {
+  steps: string[];
+  reboot: 'never' | 'if_required';
 }
 
 export interface SystemInfo {
@@ -561,6 +617,10 @@ export interface SystemInfo {
   fingerprint: string;
   data_dir: string;
   db_bytes: number;
+  /** sqlite, pebble or clickhouse; absent from an older server */
+  telemetry_engine?: string;
+  /** -1 when the engine cannot report a size */
+  telemetry_bytes?: number;
   uptime: number;
   agents_connected: number;
 }
@@ -1273,6 +1333,18 @@ export interface PendingApproval {
   need: number;
   created_at?: number;
   expires_at?: number;
+  kind?: string;
+  op?: string;
+  ops?: string[];
+  targets?: string[];
+  /** device id to display name, for the ids the caller may see */
+  target_names?: Record<string, string>;
+  rp_id?: string;
+  origins?: string[];
+  allow_credentials?: string[];
+  user_verification?: 'required' | 'preferred' | 'discouraged';
+  /** owner names that have signed so far */
+  signers?: string[];
 }
 
 export type UnsignedType = 'task' | 'automation' | 'patch_policy' | 'catalog_item' | 'baseline';

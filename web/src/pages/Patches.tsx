@@ -216,7 +216,7 @@ function PatchList() {
   );
 }
 
-const blankPolicy = (): PatchPolicy => ({ id: 0, name: '', targets: EMPTY_TARGETS, scan_schedule: '0 */6 * * *', install_schedule: '', mode: 'approved', reboot: 'never', enabled: true, created_at: 0 });
+const blankPolicy = (): PatchPolicy => ({ id: 0, name: '', targets: EMPTY_TARGETS, scan_schedule: '0 */6 * * *', install_schedule: '', mode: 'approved', reboot: 'never', enabled: true, repair: 'off', created_at: 0 });
 
 function PolicyList() {
   const { canWrite } = useAuth();
@@ -372,6 +372,12 @@ function PolicyEditor({ policy, onClose, onSaved }: { policy: PatchPolicy; onClo
           </select>
         </Field>
       </div>
+      <Field label="Repair Windows servicing" hint="With Automatic, a scan or install that fails with a known Windows Update servicing error starts one repair on that device (DISM restore, component reset, rescan), at most once a day. Repairs run under this policy's standing approval.">
+        <select value={form.repair ?? 'off'} onChange={(e) => upd({ repair: e.target.value })}>
+          <option value="off">Off</option>
+          <option value="auto">Automatic</option>
+        </select>
+      </Field>
       <Switch checked={form.enabled} onChange={(enabled) => upd({ enabled })} label="Enabled" />
     </Modal>
   );

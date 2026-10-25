@@ -35,6 +35,8 @@ export function Settings() {
   };
   const smtp = (patch: Partial<SettingsT['smtp']>) => upd({ smtp: { ...form.smtp, ...patch } });
   const agent = (patch: Partial<SettingsT['agent_defaults']>) => upd({ agent_defaults: { ...form.agent_defaults, ...patch } });
+  const mesh = form.mesh_cache ?? { enabled: false, port: 7443, max_bytes: 2 * 1024 ** 3 };
+  const setMesh = (patch: Partial<NonNullable<SettingsT['mesh_cache']>>) => upd({ mesh_cache: { ...mesh, ...patch } });
   const ret = (patch: Partial<SettingsT['retention']>) => upd({ retention: { ...form.retention, ...patch } });
 
   const save = async () => {
@@ -180,6 +182,23 @@ export function Settings() {
             </div>
           </div>
           <div className="card">
+            <div className="card-head">Update cache</div>
+            <div className="card-body">
+              <p className="muted small" style={{ marginTop: 0 }}>
+                One device per subnet downloads an agent update once and shares it with its neighbours over the local network, so a hundred devices do not each pull it from the internet. Devices fall back to the server whenever the cache is unavailable, and every download is checked against its hash.
+              </p>
+              <Switch checked={mesh.enabled} onChange={(enabled) => setMesh({ enabled })} label="Share updates between devices on the same subnet" />
+              <div className="form-row">
+                <Field label="Port" hint="TCP and UDP, 1024 or higher. Devices open it to the local subnet only.">
+                  <input type="number" min={1024} max={65535} value={mesh.port} disabled={!mesh.enabled} onChange={(e) => setMesh({ port: +e.target.value || 7443 })} />
+                </Field>
+                <Field label="Cache size per leader (MiB)" hint="Minimum 64.">
+                  <input type="number" min={64} value={Math.round(mesh.max_bytes / 1048576)} disabled={!mesh.enabled} onChange={(e) => setMesh({ max_bytes: (+e.target.value || 2048) * 1048576 })} />
+                </Field>
+              </div>
+            </div>
+          </div>
+          <div className="card">
             <div className="card-head">System</div>
             <div className="card-body">
               {system.data ? (
@@ -208,6 +227,16 @@ export function Settings() {
                   <dd className="mono">{system.data.data_dir}</dd>
                   <dt>Database size</dt>
                   <dd>{bytes(system.data.db_bytes)}</dd>
+                  {system.data.telemetry_engine && (
+                    <>
+                      <dt>Metrics storage</dt>
+                      <dd>
+                        {system.data.telemetry_engine}
+                        {typeof system.data.telemetry_bytes === 'number' && system.data.telemetry_bytes >= 0 ? `, ${bytes(system.data.telemetry_bytes)}` : ''}
+                        <span className="muted small"> (set with the server's --telemetry flag, not here)</span>
+                      </dd>
+                    </>
+                  )}
                   <dt>Uptime</dt>
                   <dd>{duration(system.data.uptime)}</dd>
                   <dt>Agents connected</dt>

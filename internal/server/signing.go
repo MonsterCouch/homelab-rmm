@@ -596,6 +596,73 @@ func (s *Server) countersign(w http.ResponseWriter, r *http.Request, u *User, b 
 
 // ---- approvals queue ----
 
+// approvalEntry is one waiting manifest as the caller may see it, or false
+// when it is not theirs to sign. Other people's entries appear once someone has
+// signed them (before that only the operator who asked can know the id), the
+// caller's own appear from the start so a challenge chosen for out-of-band
+// signing is reachable, and an entry the caller already signed, or that has all
+// the signatures it needs, is not waiting for them.
+func (s *Server) approvalEntry(u *User, p *pendingManifest, bundles map[string]*actionauth.Bundle) (map[string]any, bool) {
+	st := &s.signing
+	st.mu.Lock()
+	done := p.done
+	sigs := slices.Clone(p.sigs)
+	st.mu.Unlock()
+	if done || p.expiresAt <= now() || !s.canAccessAgent(u, p.org) {
+		return nil, false
+	}
+	if len(sigs) == 0 && (p.user == nil || p.user.ID != u.ID) {
+		return nil, false
+	}
+	b, ok := bundles[p.org]
+	if !ok {
+		b = s.activeBundle(p.org)
+		bundles[p.org] = b
+	}
+	if b == nil {
+		return nil, false
+	}
+	owners, _ := actionauth.Signers(p.manifest, sigs, b)
+	need := needSigners(b, p.kind, p.op, p.ops, p.targets)
+	if len(owners) >= need || slices.Contains(owners, u.Username) {
+		return nil, false
+	}
+	// Names are a convenience for the screen reading them, limited to devices
+	// the caller may reach; what is signed is the ids in the manifest.
+	names := map[string]string{}
+	for _, id := range p.targets {
+		if id == "*" || !s.canAccessAgent(u, s.agentOrgID(id)) {
+			continue
+		}
+		if a, err := s.db.GetAgent(id); err == nil && a != nil {
+			names[id] = agentLabel(a)
+		}
+	}
+	uv := "preferred"
+	if b.Policy.RequireUV {
+		uv = "required"
+	}
+	issuer := ""
+	if p.user != nil {
+		issuer = p.user.Username
+	}
+	return map[string]any{
+		"manifest_id": p.id, "manifest": actionauth.EncodeB64(p.manifest), "summary": p.summary,
+		"have": len(owners), "need": need, "created_by": issuer, "issuer": issuer,
+		"org": p.org, "created_at": p.createdAt, "expires_at": p.expiresAt,
+		"kind": p.kind, "op": p.op, "ops": strs(p.ops), "targets": strs(p.targets), "target_names": names,
+		"rp_id": b.RPID, "origins": strs(b.Origins), "allow_credentials": ownerCredentialIDs(b, u.Username),
+		"user_verification": uv, "signers": strs(owners),
+	}, true
+}
+
+func strs(in []string) []string {
+	if in == nil {
+		return []string{}
+	}
+	return in
+}
+
 func (s *Server) handleListApprovals(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r.Context())
 	st := &s.signing
@@ -603,38 +670,32 @@ func (s *Server) handleListApprovals(w http.ResponseWriter, r *http.Request) {
 	st.sweepLocked()
 	var list []*pendingManifest
 	for _, p := range st.pending {
-		if !p.done && len(p.sigs) > 0 && s.canAccessAgent(u, p.org) {
-			list = append(list, p)
-		}
+		list = append(list, p)
 	}
 	st.mu.Unlock()
 	sort.Slice(list, func(i, j int) bool { return list[i].createdAt < list[j].createdAt })
 	out := []map[string]any{}
 	bundles := map[string]*actionauth.Bundle{}
 	for _, p := range list {
-		b, ok := bundles[p.org]
-		if !ok {
-			b = s.activeBundle(p.org)
-			bundles[p.org] = b
+		if e, ok := s.approvalEntry(u, p, bundles); ok {
+			out = append(out, e)
 		}
-		if b == nil {
-			continue
-		}
-		st.mu.Lock()
-		sigs := slices.Clone(p.sigs)
-		st.mu.Unlock()
-		owners, _ := actionauth.Signers(p.manifest, sigs, b)
-		need := needSigners(b, p.kind, p.op, p.ops, p.targets)
-		if len(owners) >= need || slices.Contains(owners, u.Username) {
-			continue
-		}
-		out = append(out, map[string]any{
-			"manifest_id": p.id, "manifest": actionauth.EncodeB64(p.manifest), "summary": p.summary,
-			"have": len(owners), "need": need, "created_by": p.user.Username, "issuer": p.user.Username,
-			"org": p.org, "created_at": p.createdAt, "expires_at": p.expiresAt,
-		})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// handleGetApproval answers one entry in the shape of the list, so a signer
+// program given an id needs no listing. Anything the caller may not sign is a
+// 404 whatever the reason, so ids do not leak across organizations.
+func (s *Server) handleGetApproval(w http.ResponseWriter, r *http.Request) {
+	u := userFrom(r.Context())
+	if p := s.takePending(r.PathValue("manifest_id")); p != nil {
+		if e, ok := s.approvalEntry(u, p, map[string]*actionauth.Bundle{}); ok {
+			writeJSON(w, http.StatusOK, e)
+			return
+		}
+	}
+	writeErr(w, http.StatusNotFound, "no signing request with this id is waiting for your signature; it may have expired, been completed, or already carry your signature")
 }
 
 func (s *Server) handleSignApproval(w http.ResponseWriter, r *http.Request) {

@@ -126,6 +126,23 @@ func (s *Server) canAccessTargets(u *User, t Targets) bool {
 	return s.validateTargetsScope(u, t) == nil
 }
 
+// agentRow is a device as the device list and detail endpoints return it: the
+// stored Agent plus how it is connected right now. Transport is only the hub's
+// to know, so it is stamped here rather than stored; it is absent for a device
+// that is offline.
+type agentRow struct {
+	*Agent
+	Transport string `json:"transport,omitempty"` // "websocket" or "quic"
+}
+
+func (s *Server) agentRowFor(a *Agent) agentRow {
+	row := agentRow{Agent: a}
+	if ac, ok := s.hub.get(a.ID); ok {
+		row.Transport = ac.transportName()
+	}
+	return row
+}
+
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	agents, err := s.agentsWithLiveness()
 	if err != nil {
@@ -149,7 +166,11 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 		}
 		filtered = append(filtered, a)
 	}
-	writeJSON(w, 200, filtered)
+	rows := make([]agentRow, len(filtered))
+	for i, a := range filtered {
+		rows[i] = s.agentRowFor(a)
+	}
+	writeJSON(w, 200, rows)
 }
 
 func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
@@ -158,7 +179,7 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.Online = s.hub.IsOnline(a.ID)
-	writeJSON(w, 200, a)
+	writeJSON(w, 200, s.agentRowFor(a))
 }
 
 func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {

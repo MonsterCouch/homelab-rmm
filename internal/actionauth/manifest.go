@@ -67,6 +67,8 @@ type Constraints struct {
 	Args        []string `json:"args,omitempty"`         // script.run: exact args
 	PowerAction string   `json:"power_action,omitempty"` // power: e.g. "reboot"
 	SpecSHA256  string   `json:"spec_sha256,omitempty"`  // baseline spec: hex SHA-256 of its canonical JSON
+	Steps       []string `json:"steps,omitempty"`        // servicing.repair: exact step list
+	Reboot      string   `json:"reboot,omitempty"`       // servicing.repair: "never" or "if_required"
 }
 
 // ParseManifest decodes and structurally validates manifest bytes. It does

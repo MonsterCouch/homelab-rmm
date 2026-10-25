@@ -34,17 +34,21 @@ when the two disagree.
 ```
 cmd/rmm-server, cmd/rmm-agent   server and agent entry points, flag parsing, service specs
 cmd/rmm-desktop                 Windows desktop client companion (WebView2 + system tray)
+cmd/rmm-signer                  out-of-band approval signer for operators (Windows; list, show, sign)
 internal/protocol               wire types (envelope, requests, replies)
 internal/baselines              desired-state param types, validation and limits, shared by both sides
 internal/portalpipe             Windows Named Pipe IPC for client portal communication
 internal/netscan                network discovery ARP sweeps, ICMP ping sweeps, SNMP querying
 internal/winsec                 Windows security descriptors, DACL helpers, and token inspection
+internal/winwebauthn            pure-Go syscalls into webauthn.dll: GetAssertion, client data, selftest
 internal/server                 config, TLS, db + migrations, auth, hub, api_*.go, orgs, tickets,
                                 software_catalog, discovery, snmp, portal, portal_auth, runs,
                                 alerts, scheduler, patches, baselines, mail, relay, update, install
 internal/agent                  agent core (agent.go, conn.go, config.go), per-feature files with
                                 _windows.go / _linux.go implementations; platform_other.go contract
 internal/agent/desktop          capture, tiling, input injection, display selection, privacy banner
+internal/telemetry              metrics store: SQLite, Pebble and ClickHouse engines, lock, migration copy
+internal/agent/cache            subnet update cache: certificate, content-addressable store, leader server, client
 internal/svc                    service manager wrapper
 web/                            SPA source; web/dist is embedded
 tools/                          build.sh, build.ps1
@@ -57,6 +61,8 @@ docs/                           this folder
 **Outbound only.** The agent dials `wss://<public-url>/ws/agent`; the server never connects to a
 device. The public URL comes from `--public-url` / `RMM_PUBLIC_URL`, else the `public_url`
 setting, else `https://<hostname>:<port>` (`Server.PublicURL`).
+
+**Transports.** WebSocket is the default. With `--quic` the server also listens on UDP and an agent that learns the port from `welcome` uses QUIC from its next session (ALPN `homelab-rmm-agent/1`, TLS 1.3, same certificate and pin). Frames are a `uint32` length plus the same JSON `Envelope`. The first stream is the control stream (auth, hello, welcome, pings and every frame without a request id); each `RequestA`/`StreamA` gets its own stream, so a stalled transfer cannot hold up a shell. The hub talks to either through the `agentTransport` interface (`transport.go`, `hub_quic.go`; agent side `conn_quic.go`), and an agent that cannot reach UDP falls back to WebSocket. Design: `docs/plans/2026-10-24-phase3e-quic.md`.
 
 **Certificate pinning.** On first start the server writes a self-signed ECDSA P-256 certificate
 (`server.crt`/`server.key`, 10-year validity, SANs: hostname, LAN IPv4 addresses, `localhost`,
@@ -381,6 +387,26 @@ would mean the seeds never appeared on upgrade. Both ship disabled *and* unenfor
 destructive check in them (`group_members`, the SMB1 registry value, service start-type changes,
 `reboot_pending`) ships `remediate = 0`.
 
+### Telemetry store (`internal/telemetry`, `cmd/rmm-server/telemetry.go`)
+`telemetry.Store` (`WriteMetrics`, `MetricHistory`, `Purge`, `DeleteAgent`, `Close`) is the whole surface the server uses for the metrics series, with optional `BatchWriter`, `Inspector` and `Counter`. `OpenSQLite` is the original table and query, `OpenPebble` keeps `m` + agent + ts samples and `r` + agent + bucket 5-minute rollups updated on ingest (history over 6 hours reads rollups; purge is one `DeleteRange` per prefix), and `OpenClickHouse` speaks the HTTP interface with typed parameters and batched, retried inserts. `DB.telemetry` holds the active store (the SQLite one by default), `server.MetricRow` aliases `telemetry.MetricRow`, and `agents.last_metrics` stays in SQLite. `Run` takes `<data dir>/rmm.lock` so `rmm-server telemetry migrate` and `drop-sqlite` can refuse while the server runs; `closeStorage()` closes telemetry, the database and the lock in that order. Design and deviations: `docs/plans/2026-10-24-phase4a-telemetry-store.md`.
+
+### Update cache (`internal/agent/cache`, `internal/agent/mesh*.go`, `cache_assign.go`)
+The server assigns, the agents serve. `cache_assign.go` groups online devices by organization and IPv4 subnet (virtual adapters ignored), picks the longest-online `cache_capable` device as leader, derives the daily token, and every 60 s and after each online/offline event pushes `AgentConfig.Cache` to the devices whose section changed. On the agent, `cache.OpenStore` is the content-addressable store (LRU eviction, in-use artifacts pinned, single-flight fills), `cache.NewServer` serves `/cas/{sha}`, `/index` and `/chunk/{i}` over HTTPS and HTTP/3 on one port, and `(*Client).Fetch` tries h3 then HTTPS to the leader, verifies chunks and the whole hash, resumes, and falls back to the origin. `selfUpdate` goes through it, and the agent reports `Inventory.Cache` stats. Design and deviations: `docs/plans/2026-10-24-phase4b-mesh-cache.md`.
+
+### Servicing repair (`servicing.go`, `internal/agent/servicing_*.go`)
+`servicing.repair` runs the step sequence on the agent under `pkgOpMutex` through the same hidden-process path as winget, with an injectable executor for tests. On the server, `servicing.go` holds the error-code table (one sentence per code), `parseServicingCode`, the `servicing_repairs` table (migration 18) and `autoRepairAfter`, which `patchScanLocked` and `patchInstallLocked` call: it checks the policy's `repair` flag, the 24-hour cooldown and any running record, then runs the repair in `goJob` after claiming the device's patch job. `objectUnits` adds the repair standing unit for each enabled automatic policy. Design and deviations: `docs/plans/2026-10-24-phase4c-servicing-repair.md`.
+
+### Out-of-band signer (`cmd/rmm-signer`, `internal/winwebauthn`)
+`rmm-signer` is a client of the same approvals API as the console: `GET /api/approvals[/{id}]` for the
+entries (each carries the manifest bytes, the RP ID, the bundle's origins and the caller's credential
+ids), `POST /api/approvals/{id}/sign` for the assertion. It logs in with the console's password and TOTP
+flow and keeps the cookie in `%APPDATA%\homelab-rmm\signer.json`. It decodes and prints the manifest
+bytes itself, then signs `actionauth.Challenge(bytes)` (their SHA-256, as the verifier requires) through
+`internal/winwebauthn`, which calls `WebAuthNAuthenticatorGetAssertion` with hand-laid-out structs (sizes
+and offsets pinned by layout tests) and cancels through `WebAuthNCancelCurrentOperation`. The tool
+builds clientDataJSON itself with the server's origin, so an origin the bundle does not trust is
+refused before anything is printed. `sign` needs Windows; `list` and `show` build everywhere.
+
 ### Transparency log (`internal/translog`, `log_api.go`)
 `internal/translog` wraps `golang.org/x/mod/sumdb/tlog` and `note` into a `Log` over a `Storage`
 (`SQLStorage` on the server's database, `MemStorage` in tests) with tables `tlog_leaves(idx, kind, data,
@@ -431,7 +457,11 @@ slice in `db.go`, applied in order and tracked in `PRAGMA user_version`.
 | `baseline_history` | every state transition | denormalised `check_name`; `agent_id` and `check_id` carry **no** FK, so history outlives a deleted device or check |
 
 Metric queries bucket by time in SQL (`MetricsRange`) so a 30-day chart never ships a million
-rows.
+rows. The `metrics` table is the SQLite engine of `internal/telemetry`; with `--telemetry pebble`
+or `clickhouse` the series lives there instead and the table stays empty. `servicing_repairs`
+(migration 18: `agent_id` with `ON DELETE CASCADE`, `policy_id`, `trigger`, `code`, `started_at`,
+`finished_at`, `status`, `result` JSON, `"by"`) records each repair, and `patch_policies.repair`
+is `off` or `auto`.
 
 ## 6. Agent internals
 

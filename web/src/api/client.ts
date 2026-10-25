@@ -1,6 +1,6 @@
 import { b64urlEncode, utf8 } from '../lib/webauthn';
-import { requestSigning, SigningCancelled } from '../lib/signing';
-import { toast } from '../state/toast';
+import { requestSigning, SigningCancelled, signerCommand } from '../lib/signing';
+import { PARKED_MESSAGE, toast } from '../state/toast';
 import type {
   Agent,
   AgentBaselineHistory,
@@ -41,6 +41,8 @@ import type {
   Organization,
   Patch,
   PatchPolicy,
+  ServicingRecord,
+  ServicingRepairRequest,
   PendingApproval,
   PortalConfig,
   PortalSoftwareActionReq,
@@ -84,6 +86,16 @@ export class ApiError extends Error {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+  }
+}
+
+/** A 428 the operator parked for rmm-signer: a cancel as far as loops are concerned, so it is a 428 too. */
+export class SigningParkedError extends ApiError {
+  readonly manifestId: string;
+  constructor(manifestId: string) {
+    super(428, PARKED_MESSAGE);
+    this.name = 'SigningParkedError';
+    this.manifestId = manifestId;
   }
 }
 
@@ -193,6 +205,7 @@ async function signHeaders(ch: Challenge428, signal?: AbortSignal): Promise<Reco
       {
         docKind: 'manifest',
         doc: ch.manifest,
+        manifestId: ch.manifest_id,
         summary: ch.summary,
         required: ch.required !== false,
         rpId: ch.rp_id,
@@ -208,8 +221,24 @@ async function signHeaders(ch: Challenge428, signal?: AbortSignal): Promise<Reco
     }
     throw err;
   }
+  if (decision.kind === 'park') {
+    announceParked(ch.manifest_id);
+    throw new SigningParkedError(ch.manifest_id);
+  }
   if (decision.kind === 'skip') return { 'X-Action-Auth': 'skip' };
   return { 'X-Action-Auth': b64urlEncode(utf8(JSON.stringify({ manifest_id: ch.manifest_id, assertion: decision.assertion }))) };
+}
+
+/** Tell the operator how to finish a parked manifest; it stays until dismissed because the id is needed later. */
+export function announceParked(manifestId: string): void {
+  try {
+    toast().push('info', 'Waiting for rmm-signer', 'Nothing was sent. The request waits until it expires; sign it with rmm-signer or from the Approvals page.', {
+      sticky: true,
+      copy: signerCommand(manifestId),
+    });
+  } catch {
+    /* no toast host (tests) */
+  }
 }
 
 async function request<T>(method: Method, url: string, opts: RequestOptions = {}): Promise<T> {
@@ -373,6 +402,8 @@ export const api = {
   patchScan: (id: string) => post<AgentPatches>(`/api/agents/${enc(id)}/patches/scan`).then((r) => ({ ...r, patches: arr(r.patches).map((p) => ({ ...p, categories: arr(p.categories) })) })),
   patchInstall: (id: string, body: { ids?: string[]; all?: boolean; reboot_if_required: boolean }) =>
     post<Ok>(`/api/agents/${enc(id)}/patches/install`, body),
+  servicingRecords: (id: string, limit = 20) => list(get<ServicingRecord[] | null>(`/api/agents/${enc(id)}/servicing?limit=${limit}`)),
+  servicingRepair: (id: string, body: ServicingRepairRequest) => post<Ok & { id: number }>(`/api/agents/${enc(id)}/servicing/repair`, body),
 
   // ---- organizations & sites ----
   organizations: () => list(get<Organization[] | null>('/api/organizations')),

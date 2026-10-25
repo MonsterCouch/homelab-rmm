@@ -60,8 +60,8 @@ technicians never receive telemetry or state changes for devices outside their s
 
 See `routes()` in `internal/server/api.go`. Highlights:
 
-- Devices: `GET /api/agents`, `GET /api/agents/{id}` (includes `inventory` and `last_metrics`),
-  `PATCH /api/agents/{id}` (`AgentUpdate`), `DELETE`, `GET /api/agents/{id}/metrics?from=&to=&points=`,
+- Devices: `GET /api/agents`, `GET /api/agents/{id}` (includes `inventory` and `last_metrics`; an online device also carries `transport`, `"websocket"` or `"quic"`, the transport of its live connection),
+  `PATCH /api/agents/{id}` (`AgentUpdate`), `DELETE`, `GET /api/agents/{id}/metrics?from=&to=&points=` (the same on every telemetry engine),
   `POST /api/agents/{id}/refresh`, `GET .../processes`, `POST .../processes/kill {pid}`,
   `GET .../services`, `POST .../services/action {name, action}`,
   `GET .../eventlog?log=System&level=error&limit=200&search=&since=` (contract in
@@ -83,6 +83,16 @@ See `routes()` in `internal/server/api.go`. Highlights:
   wrong during the last scan, `""` when it was clean: a scan whose update source failed still
   answers 200 and still refreshes `last_scan`, so this is the only signal that the list is stale),
   `POST .../patches/scan`,
+  `GET .../servicing?limit=` (default 20) → bare array of repair records, newest first
+  `{id, agent_id, policy_id, trigger: manual|auto, code, why, started_at, finished_at, status, result, by}`
+  (`why` is the sentence for the error `code`; `result` is `{steps: [{name, status: ok|failed|skipped,
+  exit_code, duration_ms, tail}], reboot_required, scan}`),
+  `POST .../servicing/repair {steps?, package?: {url, sha256}, reboot?: never|if_required}` (Windows
+  only, signed like `script.run`; 202 `{ok, id}`; empty `steps` become `dism_restore`,
+  `reset_components`, `rescan` and empty `reboot` `never` before signing; steps are `dism_restore`,
+  `sfc`, `reset_components`, `add_package`, `rescan`; a package must be https, `.cab` or `.msu`, carry a
+  64-hex `sha256` and goes with `add_package`; 400 on a non-Windows device or a bad value, 409 while a
+  patch job holds the device),
   `POST .../patches/install {ids | all:true, reboot_if_required}` (202, follow `patches` events),
   `GET .../events` (agent event log).
 - Terminal: WebSocket `/ws/shell/{id}`. Send `{"t":"open","shell":"powershell|cmd|bash|sh|","cols","rows"}`,
@@ -132,6 +142,21 @@ See `routes()` in `internal/server/api.go`. Highlights:
   `{expires_at, org, purpose, remaining}`, where `remaining` counts the other units of the object
   that still need a signature, or `{already_approved: true, expires_at, remaining}` when the unit
   needs none (no signature is asked for).
+- Pending approvals (the signing queue): `GET /api/approvals` lists what the caller may still sign;
+  `GET /api/approvals/{manifest_id}` returns one entry in the same shape, or 404 when the caller may
+  not sign it (unknown, expired, done, another organization, or already signed by the caller).
+  An entry is listed when it is neither done nor expired, the caller may access its organization,
+  it has a signature already or the caller issued it, and the caller has not signed it. So the
+  caller's own challenge shows up with `have: 0`, which is what `rmm-signer` signs out of band.
+  `POST /api/approvals/{manifest_id}/sign {assertion}` is unchanged. Entry:
+  `{manifest_id, manifest (base64url of the exact bytes), summary, have, need, created_by, issuer,
+  org, created_at, expires_at, kind (action|grant|standing), op, ops[], targets[], target_names{},
+  rp_id, origins[], allow_credentials[], user_verification (required|preferred), signers[]}`.
+  The arrays are never null. `target_names` maps agent ids to display names, only for agents the
+  caller may access. `allow_credentials` is the caller's own credential ids in the organization's
+  bundle; `user_verification` is `required` when the bundle sets `require_uv`. `signers` names the
+  owners who have signed so far. `summary` and `target_names` are the server's words; `manifest`
+  is what a signature covers.
   A run's `status` is `queued|running|done|failed|timeout|cancelled` — a cancel is not a failure
   and raises no `script_failed` alert. `exit_code` is the interpreter's, sign-extended on Windows
   (`exit -1` reads `-1`, not `4294967295`), or `-1` when the run never produced one.
@@ -265,8 +290,8 @@ See `routes()` in `internal/server/api.go`. Highlights:
   device refuses an unsigned update by itself in any case. `os` must be `windows` or `linux` and
   `arch` one of `amd64`, `arm64`, `arm` or `386`: the server looks a build up by that name only, so
   any other value gets `update_available: false`).
-- Admin: `/api/settings` (GET/PUT `Settings`), `POST /api/settings/test-mail`,
-  `/api/users` (manage accounts, roles, and `org_scope`), `GET /api/audit?limit=` (rows carry `log_index`, the entry's leaf in the transparency log, -1 for one that was never logged), `GET /api/system`, `GET /api/dashboard`.
+- Admin: `/api/settings` (GET/PUT `Settings`; `mesh_cache: {enabled, port, max_bytes}` is the subnet update cache, off by default, with a port of at least 1024 and `max_bytes` of at least 64 MiB or 400, and unchanged by a PUT that omits it), `POST /api/settings/test-mail`,
+  `/api/users` (manage accounts, roles, and `org_scope`), `GET /api/audit?limit=` (rows carry `log_index`, the entry's leaf in the transparency log, -1 for one that was never logged), `GET /api/system` (also `telemetry_engine` and `telemetry_bytes`, -1 when the engine cannot report a size), `GET /api/dashboard`.
 
 ## Event log
 

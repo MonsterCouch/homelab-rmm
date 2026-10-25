@@ -53,9 +53,12 @@ func Dial(ctx context.Context, url, fingerprint string, hdr http.Header) (*webso
 	return d.DialContext(ctx, url, hdr)
 }
 
-// conn is one live socket to the server with a serialised writer.
+// conn is one live connection to the server with a serialised writer. It is
+// either a WebSocket (ws) or a QUIC connection (q); exactly one is set, and
+// everything above send neither knows nor cares which.
 type conn struct {
 	ws *websocket.Conn
+	q  *quicLink
 	mu sync.Mutex
 	// logSize, when set, reports the size of the transparency log head the
 	// device holds; every frame carries it (a script or shell session can run
@@ -65,6 +68,15 @@ type conn struct {
 }
 
 func (c *conn) send(env protocol.Envelope) error {
+	if c.q != nil {
+		// QUIC writes are serialised per stream inside the link, not here: one
+		// lock around every write would let a stalled shell stream hold up a
+		// reply on another, which is what the transport exists to prevent.
+		if env.Log == 0 && c.logSize != nil {
+			env.Log = c.logSize()
+		}
+		return c.q.send(env)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if env.Log == 0 && c.logSize != nil {

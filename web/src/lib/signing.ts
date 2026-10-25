@@ -20,6 +20,8 @@ export interface SigningChallenge {
   required: boolean;
   /** shown in the dialog title/context, e.g. "Approve a pending request" */
   title?: string;
+  /** the pending manifest's id; present when the entry exists on the server, which is what lets the operator park it for rmm-signer */
+  manifestId?: string;
   /** RP ID for navigator.credentials.get (default: location.hostname) */
   rpId?: string;
   /** base64url credential IDs allowed to sign (default: any) */
@@ -29,7 +31,9 @@ export interface SigningChallenge {
   currentBundle?: BundleView | null;
 }
 
-export type SigningDecision = { kind: 'sign'; assertion: Assertion } | { kind: 'skip' };
+export type SigningDecision = { kind: 'sign'; assertion: Assertion } | { kind: 'skip' }
+  /** the operator will sign out of band (rmm-signer or the Approvals page); nothing is sent now */
+  | { kind: 'park' };
 
 /** Rejection reason when the operator closes the dialog, or the caller goes away. */
 export class SigningCancelled extends Error {
@@ -37,6 +41,27 @@ export class SigningCancelled extends Error {
     super(message);
     this.name = 'SigningCancelled';
   }
+}
+
+/**
+ * The operator chose to sign elsewhere. It is a cancel as far as every caller
+ * is concerned (nothing was sent), so existing SigningCancelled handling covers it.
+ */
+export class SigningParked extends SigningCancelled {
+  manifestId: string;
+  constructor(manifestId: string) {
+    super('signing was parked for rmm-signer');
+    this.name = 'SigningParked';
+    this.manifestId = manifestId;
+  }
+}
+
+/** The command that signs a pending manifest from a terminal. */
+export function signerCommand(manifestId: string): string {
+  // The id comes from the server, and this text is pasted into a terminal, so
+  // anything but hex gets a harmless hint instead of a command.
+  if (!/^[0-9A-Fa-f]{1,64}$/.test(manifestId)) return 'rmm-signer list';
+  return `rmm-signer sign --server '${window.location.origin}' ${manifestId}`;
 }
 
 export interface QueuedSigning {

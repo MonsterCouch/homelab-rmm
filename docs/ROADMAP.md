@@ -8,7 +8,7 @@ This document tracks the strategic architectural roadmap to transform **Homelab 
 
 | Subsystem | Decision | Rationale |
 | :--- | :--- | :--- |
-| **Server Topology & Storage** | **Single Binary with Embedded Dual-Engine** (SQLite for OLTP + embedded columnar/TSDB like DuckDB for metrics), with optional external PostgreSQL/ClickHouse drivers for enterprise deployments. | Retains zero-external-dependency simplicity for homelabs and small/medium MSPs while eliminating SQLite single-writer bottlenecks. |
+| **Server Topology & Storage** | **Single Binary with Embedded Dual-Engine** (SQLite for OLTP + an embedded Pebble LSM for metrics, or ClickHouse for enterprise deployments). Built in Phase 4; an external PostgreSQL driver was not. | Retains zero-external-dependency simplicity for homelabs and small/medium MSPs while eliminating SQLite single-writer bottlenecks. |
 | **Remote Desktop & Streaming** | **Hybrid Pipeline**: DirectX (DXGI) Desktop Duplication for GPU VRAM capture + WebRTC (Pion) P2P UDP for sub-20ms 60 FPS, with automatic fallback to server-relayed WebSockets through restrictive firewalls. | Maximizes visual fluidness and minimizes server bandwidth while guaranteeing 100% firewall traversal reliability. |
 | **Zero-Trust Security (E2E-CAA)** | **Tiered & Configurable**: Optional "Zero-Trust Fleet Signing" policy requiring Ed25519/FIDO2 cryptographic Action Manifest signatures on bulk/fleet-wide scripts and destructive actions, while interactive live shells run under standard session auth. | Delivers enterprise supply-chain immunity (mitigating Kaseya-style server compromises) without introducing friction to everyday homelab terminal administration. |
 | **Agent Resilience & Supervisor** | **Unified Executable with Supervisor Mode**: `rmm-agent supervisor` manages dual A/B execution slots (`slot_a` / `slot_b`), monitors worker IPC heartbeats, and triggers a 60-second post-update rollback circuit on connection failure. | Keeps distribution down to one binary per platform; eliminates bricked agent scenarios during auto-updates. |
@@ -22,8 +22,8 @@ This document tracks the strategic architectural roadmap to transform **Homelab 
 flowchart TD
     P1["Phase 1: Resilience & Hardening<br/>(Supervisor Mode, A/B Updates, Job Object Caps)"]
     P2["Phase 2: Remote Control Overhaul<br/>(DXGI Capture, WebRTC Pion, Backstage Desktop)"]
-    P3["Phase 3: Signed Actions & Audit<br/>(WebAuthn-Signed Manifests, Merkle Log; QUIC deferred)"]
-    P4["Phase 4: Data Scaling & P2P Mesh<br/>(DB Decoupling, Subnet P2P Patch Cache)"]
+    P3["Phase 3: Signed Actions & Audit<br/>(WebAuthn-Signed Manifests, Merkle Log, QUIC transport)"]
+    P4["Phase 4: Data Scaling & P2P Mesh<br/>(Telemetry Store, Subnet Update Cache, Servicing Repair)"]
 
     P1 --> P2 --> P3 --> P4
 ```
@@ -58,25 +58,29 @@ Plan: [`docs/plans/2026-10-01-phase2-remote-desktop-webrtc.md`](plans/2026-10-01
   - Done: `/dev/uinput` input injection and the XDG ScreenCast portal negotiation with a persisted restore token.
   - Open: PipeWire frame ingestion needs a PipeWire client (libpipewire, i.e. CGO), so Wayland sessions still capture through the X11 / screenshot-portal path.
 
-### Phase 3: Signed Actions & Tamper-Evident Audit *(In progress)*
-Plan: [`docs/plans/2026-10-06-phase3-signed-actions.md`](plans/2026-10-06-phase3-signed-actions.md). Re-scoped on 2026-10-06: browser WebAuthn signing first and an out-of-band signer later; a local Merkle log instead of Sigstore Rekor; QUIC deferred.
+### Phase 3: Signed Actions & Tamper-Evident Audit *(Completed)*
+Plan: [`docs/plans/2026-10-06-phase3-signed-actions.md`](plans/2026-10-06-phase3-signed-actions.md). Re-scoped on 2026-10-06: browser WebAuthn signing first and an out-of-band signer later; a local Merkle log instead of Sigstore Rekor; QUIC delivered last as an agent-only transport.
 - [x] **3A Signed actions** *(implemented; not yet exercised with a real browser and security key)*: operator-signed manifests (WebAuthn: ES256/EdDSA/RS256) verified by the agent before any destructive action, shell/desktop session, or update; pinned trust bundle with quorum rotation and an offline recovery key; off → audit → enforce rollout; anti-replay by nonce, expiry and target binding. A failed check rejects and alerts, never isolates.
 - [x] **3B Standing approvals:** signed, content-hash-bound approvals for unattended runs (scheduled tasks, automations, patch policies, software catalog and client portal).
-- [ ] **3C Transparency log:** embedded RFC 6962-style Merkle log (`golang.org/x/mod/sumdb/tlog`) with signed tree heads; agents verify inclusion and consistency and keep their own executed-action log.
-- [ ] **3D Out-of-band signer & M-of-N:** a signer the server does not serve (native WebAuthn on Windows, or a native Android approval screen), closing the blind-signing gap against a fully compromised server.
-- [ ] **3E QUIC / HTTP/3 (deferred):** opt-in, with WebSocket fallback and per-request streams to remove head-of-line blocking.
+- [x] **3C Transparency log** *(implemented 2026-10-24; plan [`docs/plans/2026-10-24-phase3c-transparency-log.md`](plans/2026-10-24-phase3c-transparency-log.md))*: embedded RFC 6962-style Merkle log (`golang.org/x/mod/sumdb/tlog`) with signed tree heads pinned in the trust bundle; agents verify inclusion and consistency on every protected request and keep their own executed-action log; `rmm-server log verify` checks from outside.
+- [x] **3D Out-of-band signer & M-of-N** *(implemented 2026-10-24 as `rmm-signer`, native WebAuthn on Windows, not yet run against a real authenticator; plan [`docs/plans/2026-10-24-phase3d-out-of-band-signer.md`](plans/2026-10-24-phase3d-out-of-band-signer.md))*: a signer the server does not serve, closing the blind-signing gap against a fully compromised server. The native Android approval screen stays open.
+- [x] **3E QUIC agent transport** *(implemented 2026-10-24; plan [`docs/plans/2026-10-24-phase3e-quic.md`](plans/2026-10-24-phase3e-quic.md))*: opt-in (`--quic`), a QUIC stream per server request to remove head-of-line blocking, automatic WebSocket fallback.
 
-### Phase 4: Data Scaling & Local Mesh Distribution
-- [ ] **Embedded Dual-Engine Storage:**
-  - Integrate embedded columnar/time-series store (DuckDB / Pebble) for high-frequency agent telemetry, freeing SQLite for transactional OLTP.
-  - Provide optional external PostgreSQL and ClickHouse drivers for enterprise deployments.
-- [ ] **Local Subnet P2P Mesh Caching:**
-  - LAN discovery via mDNS / UDP multicast for managed agents on the same subnet.
-  - Dynamic subnet leader election to download OS updates and software packages once across the WAN.
-  - Content-Addressable Storage (CAS) with 2 MB chunks verified by Merkle trees, shared locally over HTTP/3.
-- [ ] **Autonomous Windows Servicing Repair:**
-  - Auto-remediation on catalog corruption (`0x80240020`): automated `DismRestoreHealth`, `catroot2` / `SoftwareDistribution` purges.
-  - Direct CBS store package injection via `DismAddPackage` to bypass damaged WUA engines.
+### Phase 4: Data Scaling & Local Mesh Distribution *(Completed, with the exceptions below)*
+Plans: [`4A`](plans/2026-10-24-phase4a-telemetry-store.md), [`4B`](plans/2026-10-24-phase4b-mesh-cache.md), [`4C`](plans/2026-10-24-phase4c-servicing-repair.md), all implemented 2026-10-24. Not built, on purpose: multicast/mDNS discovery and an external PostgreSQL driver. ClickHouse was verified against a fake of its HTTP protocol only. None of it has run on a production fleet.
+- [x] **4A Embedded Dual-Engine Storage** *(DuckDB not used; PostgreSQL not built)*:
+  - `internal/telemetry`: the metrics series lives in SQLite (default), an embedded Pebble LSM (`<data dir>/telemetry`, rollups kept on ingest) or ClickHouse over its HTTP interface. `--telemetry` / `RMM_TELEMETRY`, `rmm-server telemetry migrate` and `drop-sqlite`, with a data-directory lock so the migration never races a running server. Pebble was chosen over DuckDB because it is pure Go and keeps `CGO_ENABLED=0` cross-compilation.
+  - **No PostgreSQL:** the server has several hundred statements in SQLite's dialect (`INSERT OR REPLACE`, `PRAGMA`, `datetime()` arithmetic, `last_insert_rowid`), so a second OLTP engine is a rewrite of the data layer, not a driver. It is its own future phase.
+  - **ClickHouse is verified against a protocol fake only** (an httptest server that checks the SQL and parameters it receives), never a real ClickHouse. Its plain MergeTree also keeps duplicate samples at one timestamp.
+- [x] **4B Local Subnet Cache** *(no multicast or mDNS)*:
+  - The server assigns the roles instead of the agents electing them. It already holds every device's LAN addresses and online state, and a multicast election would add a discovery protocol, a second trust problem and a failure mode on networks that block multicast. One leader per organization and subnet, re-assigned every 60 s and on every online/offline event.
+  - The leader keeps a content-addressable store (2 MiB chunks, each verified against an index) and serves it over HTTPS and HTTP/3 behind a daily HMAC token and a pinned certificate. Members verify the whole file against the SHA-256 the server named and fall back to the origin. Today it carries the agent binary through `selfUpdate`. The chunks are checked against an index the leader serves, not a Merkle tree; the whole-file hash is what the trust rests on.
+  - Windows updates and winget downloads are out of scope: they come from Microsoft's CDN, where Delivery Optimization already peers on the LAN.
+  - The settings switch is global, not per organization; the update source reaches the agent log but not yet the console (`update.go` discards the reply).
+- [x] **4C Autonomous Windows Servicing Repair:**
+  - `servicing.repair` is a signed `ClassAction` running `dism_restore`, `sfc`, `reset_components`, `add_package` and `rescan` in canonical order, each hidden, timed out and tailed. `reset_components` renames `SoftwareDistribution` and `catroot2` instead of deleting them.
+  - `patch_policies.repair = auto` starts one repair per device per 24 hours when a scan or install carries one of the known servicing codes, under a standing approval unit (purpose `repair`) that binds the steps and the reboot mode and never covers a package. Records, audit rows and `event` alerts included; the device page can run it by hand.
+  - CBS package injection (`add_package`) is manual only. The repair commands were tested through a fake executor, not on a damaged machine.
 
 ---
 

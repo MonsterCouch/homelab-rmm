@@ -148,6 +148,69 @@ Docker: back up the `rmm-data` volume (`docker run --rm -v rmm-data:/data -v "$P
 alpine tar czf /backup/rmm-data.tgz -C /data .`) with the container stopped, or run the
 `sqlite3 .backup` inside a helper container.
 
+## QUIC transport (optional)
+
+By default agents talk to the server over WebSocket on the HTTPS port. QUIC is an opt-in second transport that gives each server request its own stream, so a stalled file transfer no longer delays a shell, and it survives an address change without reconnecting.
+
+- **Enable:** start the server with `--quic` (or `RMM_QUIC=1`). `rmm-server install` passes the flag through. The UDP port is the HTTPS port unless you set `--quic-port N` (`RMM_QUIC_PORT`); the host is the one in `--listen`. Environment variables override flags.
+- **Firewall:** allow inbound UDP on that port in addition to TCP. Agents never need an inbound port.
+- **Not with `--insecure`, and not behind a reverse proxy:** QUIC always carries TLS 1.3 straight to the server, so the server refuses `--quic --insecure` at start, and Caddy or nginx in front of it cannot carry the UDP traffic. Such deployments stay on WebSocket.
+- **Rollout:** an agent learns the port from the WebSocket `welcome`, stores it as `quic_port` in `agent.json`, and uses QUIC from its next session. The device header and `GET /api/agents` show the transport in use.
+- **Fallback:** in the default `auto` mode, if the QUIC handshake fails (UDP blocked, no answer in 4 s) the agent falls back to WebSocket at once, records `quic_failed_at`, and does not try UDP again for 10 minutes. A refusal sent by the server (for example an unknown key) is not a transport failure and never triggers a fallback.
+- **Agent override:** `RMM_TRANSPORT=websocket|quic|auto` (or `transport` in `agent.json`) wins over the default. `websocket` never dials UDP; `quic` always dials and never falls back, which is useful for testing. An unrecognised value logs a warning and means `auto`.
+- **Notes:** devices connecting by QUIC are recorded with their UDP peer address, not an `X-Forwarded-For` value.
+
+## Metrics storage (telemetry engines)
+
+The per-device metrics series is the one table that grows by every device every few seconds, so it can live outside the SQLite file. Everything else (devices, alerts, audit, settings) always stays in `rmm.db`.
+
+| Engine | Flag | Where | Use it when |
+|---|---|---|---|
+| `sqlite` | default | the `metrics` table in `rmm.db` | a homelab or a few hundred devices; nothing changes |
+| `pebble` | `--telemetry pebble` | `<data dir>/telemetry/`, embedded, no second process | thousands of devices on one server; charts over 30 days stay fast |
+| `clickhouse` | `--telemetry clickhouse --telemetry-dsn http://host:8123` | an existing ClickHouse server, over its HTTP interface | you already run ClickHouse, or want the series off the server's disk |
+
+Environment variables win over flags, as for `run`: `RMM_TELEMETRY`, `RMM_TELEMETRY_DSN`, `RMM_TELEMETRY_USER`, `RMM_TELEMETRY_PASSWORD`. `rmm-server install` carries the engine, DSN and user into the service command line. The password never goes on the command line: `install` writes it (from `RMM_TELEMETRY_PASSWORD` or the DSN's `user:password@` part) to `<data>/telemetry.pass` in the restricted data directory, and the server reads that file at start unless `RMM_TELEMETRY_PASSWORD` is set. Reinstalling without a password keeps the stored file. An unknown engine, or ClickHouse without a DSN, is refused at start, and so is an unreachable ClickHouse. *Settings -> System* shows the engine and its size (`telemetry_engine`, `telemetry_bytes` on `GET /api/system`).
+
+**Switching engines.** Stop the server first; the server now holds `<data dir>/rmm.lock` and both subcommands refuse with "stop the server first" while it is held.
+
+```
+rmm-server telemetry migrate --to pebble [--data DIR]
+rmm-server telemetry migrate --to clickhouse --telemetry-dsn http://user:pass@clickhouse:8123 [--data DIR]
+```
+
+`migrate` copies every sample in time order in batches of 5000, prints progress every 50,000, and ends with the flags to start the server with. It never deletes the SQLite rows, so switching back is just removing the flag (samples written meanwhile stay in the other engine). Running it twice on Pebble is safe; ClickHouse must start empty and the command refuses a table that already holds rows. After you have run on the new engine for a while:
+
+```
+rmm-server telemetry drop-sqlite --telemetry pebble [--data DIR]
+```
+
+It refuses unless `--telemetry` or `RMM_TELEMETRY` names a non-SQLite engine, deletes in chunks, and leaves the `VACUUM` to you (`sqlite3 rmm.db VACUUM`, server stopped) because only that returns the space.
+
+**ClickHouse setup.** Create a user that can create and write one table; the server creates `rmm_metrics` (`MergeTree`, ordered by agent and time) on first start. Use `http://` only on a trusted network, or `https://` with a certificate the server's system trust store accepts. Samples are batched (500 rows or one second) and retried, with up to 50,000 held in memory while ClickHouse is unreachable; retention runs as `ALTER TABLE ... DELETE` with `mutations_sync=1`. A plain MergeTree keeps a duplicate if two samples share an agent and timestamp. **This engine was tested against a fake of the HTTP protocol, not a live ClickHouse**, so try it on a copy first.
+
+Backup: with `pebble`, copy `<data dir>/telemetry/` along with `rmm.db` while the server is stopped (section 4); ClickHouse is backed up by ClickHouse. PostgreSQL is not supported as the main database.
+
+## Update cache (subnet mesh)
+
+Devices on one subnet can fetch an agent update once across the WAN and share it over the LAN. Off by default. Enable it in *Settings -> Update cache* (admin): the switch, a port (default 7443, minimum 1024) and a cache size per leader (default 2 GiB, minimum 64 MiB). The setting is global; devices are still only ever grouped within one organization.
+
+- **Who leads.** Devices of one organization sharing an IPv4 subnet (a /24 when the interface prefix is wider than /22) form a group of at least two. The server picks the longest-online device that reports it can serve (a writable cache directory and a bindable port) and re-checks every 60 s and on every online/offline event. Docker, WSL, Hyper-V and tunnel adapters are ignored. No multicast or mDNS is used.
+- **What is cached.** Agent binaries, which is what `agent.update` fetches. Windows updates and winget packages are not: they come from Microsoft, where Delivery Optimization already shares on the LAN.
+- **Firewall.** The leader listens on TCP and UDP (HTTP/3) on the port, on every interface. Allow that port inbound from the subnet only. The Windows agent adds its own rules (`remoteip=LocalSubnet`, through a hidden `netsh`) when it becomes leader and removes them when it stops; on Linux add the rule yourself.
+- **Seeing it work.** A device's Overview shows an *Update cache* line with its role, hits and misses (a leader also shows bytes served and stored). The agent log and the `agent.update` reply say `cache <id> over h3`, `origin`, or `origin (the cache failed: ...)`; the console does not show the reply yet.
+- **When it fails.** The member falls back to the server on any error, so a dead leader costs a retry, not an update. Switching the feature off clears every assignment. The leader keeps `cache.crt`, `cache.key` and the store in the agent's config directory; deleting the store only costs a refill.
+
+## Windows servicing repair
+
+When Windows Update fails because the servicing stack or update catalog is damaged, an operator or a patch policy can run a repair (Windows only). The steps, in this fixed order: `dism_restore` (`DISM /Online /Cleanup-Image /RestoreHealth`, 60 min), `sfc` (`sfc /scannow`, 30 min, advisory), `reset_components` (stops `wuauserv`, `bits`, `cryptsvc`, `msiserver`, renames `SoftwareDistribution` and `catroot2` to `.bak.<time>`, restarts the services), `add_package` (a `.cab` or `.msu` with a SHA-256, through `DISM /Add-Package`; API only) and `rescan`. A failed step stops the rest, except `sfc`. Exit 3010 means a reboot is needed.
+
+- **By hand:** device page -> *Patches* -> *Repair Windows servicing*. It goes through the signing flow in a signing organization. The last repair, with each step's result, shows below the patch list; `GET /api/agents/{id}/servicing` lists the history.
+- **Automatically:** *Patches -> policy -> Repair Windows servicing = Automatic*. When a scan or install on a device under that policy returns a known servicing code (`0x80240020`, `0x80073712`, `0x800F081F`, `0x800F0922`, `0x800F0831`, `0x8024A105`, `0x80240034`, `0x80244022`, `0x8007000E`, `0x80070020`, and `0x80070002`/`0x80070003` from a Windows Update operation), the server runs `dism_restore`, `reset_components` and `rescan` once, waiting for the device's patch job. The limit is one automatic repair per device per 24 hours, and none while one runs. winget errors never start one.
+- **Reboot:** a policy reboot of `if_required` or `always` becomes `if_required`; `never` stays `never`.
+- **Signing organizations:** each enabled automatic policy adds a standing-approval unit (purpose `repair`) to *Review & sign*. Without a valid approval the agent refuses in enforce mode, the attempt is recorded as failed, and the cooldown is spent, so sign it before turning the policy on.
+- **Alerts and audit:** an automatic repair raises `event` alerts (`servicing_started`, `servicing_finished`), writes an `agent_events` row, and audits `servicing.repair.auto` and `servicing.repair` under `policy:<name>`. It restarts the Windows Update services, so keep policy schedules outside the hours users are mid-update.
+
 ## 5. Reverse proxy (`--insecure` behind Caddy or nginx)
 
 You may prefer your own TLS termination (Let's Encrypt, an internal CA, one wildcard for the
@@ -378,7 +441,8 @@ and the Android app care about.
   events (30). Resolved alerts follow the audit setting, and baseline drift history follows the
   agent-events setting. Purge runs hourly. Shrinking retention
   does not shrink `rmm.db` on disk until you `VACUUM` it (`sqlite3 rmm.db VACUUM` with the server
-  stopped).
+  stopped). With `--telemetry pebble` or `clickhouse` the metrics retention is applied to that
+  engine instead (see Metrics storage).
 
 Per device (*Overview → Edit*): display name, group, tags, custom fields, notes, monitored
 services (state pushed with every metrics sample and alertable), **maintenance mode** until a

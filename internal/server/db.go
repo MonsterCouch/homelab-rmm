@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/actionauth"
+	"github.com/MonsterCouch/homelab-rmm/internal/telemetry"
 	_ "modernc.org/sqlite"
 )
 
@@ -39,6 +40,13 @@ type DB struct {
 	// The server sets it once at startup; it stays nil for a command-line
 	// tool and in DB-only tests, where nothing is logged.
 	logAppend func(kind string, data []byte) (int64, error)
+	// telemetry keeps the metrics series. openDB sets the SQLite engine over
+	// this same handle; New replaces it when another engine is configured.
+	telemetry telemetry.Store
+	// unlock releases the data directory lock New took before opening this
+	// database; Close calls it last, so the directory stays claimed for as long
+	// as the file is open. Nil for a command-line tool, which locks on its own.
+	unlock func()
 }
 
 func openDB(path string) (*DB, error) {
@@ -53,6 +61,7 @@ func openDB(path string) (*DB, error) {
 		return nil, err
 	}
 	d := &DB{DB: db}
+	d.telemetry = telemetry.OpenSQLite(db)
 	if err := d.migrate(); err != nil {
 		return nil, err
 	}
@@ -715,6 +724,31 @@ ALTER TABLE audit ADD COLUMN log_index INTEGER NOT NULL DEFAULT -1;
 ALTER TABLE approvals ADD COLUMN log_index INTEGER NOT NULL DEFAULT -1;
 ALTER TABLE agents ADD COLUMN executed_head TEXT NOT NULL DEFAULT '';
 `,
+	// 18: Windows servicing repair (Phase 4C).
+	//
+	// patch_policies.repair is 'off' or 'auto': with 'auto' the server starts
+	// one servicing.repair on a device under the policy when a scan or an
+	// install reports a servicing error code. servicing_repairs is the record
+	// of every repair, manual or automatic: it is also what the 24-hour
+	// per-device cooldown reads. result holds the agent's step list as JSON
+	// ({"error": ...} when the request itself failed). ADD COLUMN is safe to
+	// replay: execMigration skips a column that already exists.
+	`
+ALTER TABLE patch_policies ADD COLUMN repair TEXT NOT NULL DEFAULT 'off';
+CREATE TABLE IF NOT EXISTS servicing_repairs (
+	id INTEGER PRIMARY KEY,
+	agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+	policy_id INTEGER,
+	trigger TEXT NOT NULL,           -- manual, auto
+	code TEXT NOT NULL DEFAULT '',   -- the servicing error code that started an automatic repair
+	started_at INTEGER NOT NULL,
+	finished_at INTEGER NOT NULL DEFAULT 0,
+	status TEXT NOT NULL DEFAULT 'running', -- running, ok, failed
+	result TEXT NOT NULL DEFAULT '{}',
+	"by" TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_servicing_repairs_agent ON servicing_repairs(agent_id, started_at DESC);
+`,
 }
 
 // Close checkpoints the write-ahead log before closing, so a short-lived
@@ -723,7 +757,12 @@ ALTER TABLE agents ADD COLUMN executed_head TEXT NOT NULL DEFAULT '';
 // that only exists while the server is running.
 func (d *DB) Close() error {
 	d.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
-	return d.DB.Close()
+	err := d.DB.Close()
+	if d.unlock != nil {
+		d.unlock()
+		d.unlock = nil
+	}
+	return err
 }
 
 var alterAddColRe = regexp.MustCompile(`(?i)^\s*ALTER\s+TABLE\s+([a-zA-Z0-9_]+)\s+ADD\s+(?:COLUMN\s+)?([a-zA-Z0-9_]+)`)

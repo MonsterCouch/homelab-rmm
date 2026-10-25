@@ -1,7 +1,7 @@
 # Phase 3 Implementation Plan: Signed Actions & Tamper-Evident Audit
 
 **Document:** `docs/plans/2026-10-06-phase3-signed-actions.md`
-**Status:** 3A, 3B and 3C implemented (2026-10-24); 3D, 3E open. See §8.
+**Status:** 3A-3E implemented (2026-10-24). See §8.
 **Supersedes:** the Phase 3 sections of `docs/ROADMAP.md` (as of 2026-10-05) and `docs/MASTER_TRANSFORMATION_HANDOFF.md`
 **Goal:** An agent never runs a destructive action, opens a shell or desktop, or installs an update unless an operator's hardware key signed that exact action for that exact device. A stolen session, a tampered database or a compromised server process can no longer turn the RMM into a fleet-wide ransomware launcher (the Kaseya VSA 2021 failure model).
 
@@ -21,7 +21,7 @@
 | :--- | :--- | :--- |
 | T1 | Stolen operator session: cookie theft, phished password + TOTP | **Defeated.** Every protected action needs a fresh touch of the operator's key. |
 | T2 | Database compromise: SQL injection, stolen backup, insider with DB write access, edited scripts or schedules | **Defeated.** The agent runs only content whose hash an operator signed. |
-| T3 | Full server compromise (RCE, replaced binary) | **Partly mitigated.** The attacker cannot act on their own, but the console's JavaScript comes from the server, so a modified console can show one action and have the key sign another. Security keys do not display what they sign. This closes in **3D** (a signer the server does not serve). The attacker can still deny service and read telemetry. |
+| T3 | Full server compromise (RCE, replaced binary) | **Partly mitigated.** The attacker cannot act on their own, but the console's JavaScript comes from the server, so a modified console can show one action and have the key sign another. Security keys do not display what they sign. This closes in **3D** (a signer the server does not serve): `rmm-signer` is built, and its first run against a real authenticator is still to be done. The attacker can still deny service and read telemetry. |
 | T4 | Replay of a captured signed action | **Defeated.** Nonce, expiry, and binding to a target agent and organisation. |
 | T5 | Local administrator on the endpoint | Out of scope (they already own the machine). |
 
@@ -219,7 +219,9 @@ Signed tree heads use a server log key (Ed25519, kept in the data directory). It
 - When `policy.require_log_proof` is set, a protected action arrives with an inclusion proof and a tree head. The agent verifies both, plus consistency with the last head it accepted. The server cannot run something without logging it, and cannot rewrite history without agents noticing.
 - Each agent keeps its own hash-chained `executed.log` of the manifests it ran and reports the head in inventory. The server cannot quietly drop an entry.
 
-### 3.9 Out-of-band signer (3D, design deferred)
+### 3.9 Out-of-band signer (3D, built)
+
+Designed and built in `docs/plans/2026-10-24-phase3d-out-of-band-signer.md`, which wins over the candidates below (candidates 1 and 3 became one tool, `rmm-signer`).
 
 A signer whose code the server does not serve. It renders the manifest itself, so you can see what you sign (closes T3). Candidates:
 1. A Windows desktop signer using the native WebAuthn API (`webauthn.dll`, pure-Go syscalls, works with Windows Hello and security keys).
@@ -228,7 +230,9 @@ A signer whose code the server does not serve. It renders the manifest itself, s
 
 3D also adds the M-of-N approval queue.
 
-### 3.10 QUIC / HTTP/3 (3E, deferred)
+### 3.10 QUIC / HTTP/3 (3E, implemented, see docs/plans/2026-10-24-phase3e-quic.md)
+
+Implemented: see `docs/plans/2026-10-24-phase3e-quic.md`. The notes below are the original planning notes.
 
 Notes for when this is picked up:
 - The real benefit is removing head-of-line blocking between shell, file transfer and telemetry. That requires mapping requests to separate QUIC streams, not just swapping the transport under `Envelope`.
@@ -340,7 +344,7 @@ Constraint checking on the agent. Signing on create or edit for the scheduler, a
 ### 3C — Transparency log
 The `tlog`-backed log, tree heads, proof endpoints, agent proof verification and consistency tracking, `executed.log`, and the audit-row leaves.
 
-### 3D — Out-of-band signer and M-of-N (design first)
+### 3D — Out-of-band signer and M-of-N (built, see the 3D plan)
 ### 3E — QUIC (deferred)
 
 ---
@@ -362,7 +366,7 @@ The `tlog`-backed log, tree heads, proof endpoints, agent proof verification and
 | **WebAuthn needs a hostname.** An IP address is not a valid RP ID, so a console opened at `https://192.168.1.10:8443` cannot register or use keys | The Security keys page detects this and explains it; use a DNS / MagicDNS name (e.g. with `tailscale cert`) |
 | **WebAuthn needs a trusted certificate.** Chromium refuses WebAuthn on pages with certificate errors, which includes the default self-signed certificate until it is trusted (to be confirmed in 3A.4) | Detected and explained in the console (`isSecureContext`, availability probe); trust the server certificate on operator machines, or use an operator-supplied or Tailscale certificate |
 | Trust-on-first-use windows at enrollment and the first bundle | Documented; optional `--trust-pin`; security event logged |
-| Blind signing until 3D | Documented in the console's signing dialog and in `docs/SECURITY.md` |
+| Blind signing in the browser (T3) | Closed for operators who sign with `rmm-signer` (3D), which prints the manifest bytes itself; the browser path stays blind to a compromised server, and the console's signing dialog and `docs/SECURITY.md` say so. `GetAssertion` has not yet run against a real authenticator |
 | Lockout | Enforce requires a recovery key; the console nags until each signer has two credentials |
 | Agent clock skew | 5 min tolerance; explicit error; the skew is visible in inventory |
 | Keystrokes injected into an already-open shell or desktop | Grants are short and per-agent; end-to-end session encryption is a later item |
@@ -406,4 +410,5 @@ The `tlog`-backed log, tree heads, proof endpoints, agent proof verification and
 3. ~~**Runs queued for an offline device** are released after their 5-minute manifest has expired.~~ **Fixed.** A signed run is never queued: in an org with a bundle, `planRuns` and `startOneRun` answer a library script for an offline device with `ErrSignedRunOffline` (409 from the single-device handler, `error: ...` in the per-device outcomes) before any signature is asked for, and ad hoc bodies keep `ErrAgentOffline`. `runTracker.Start` repeats the check when `req.Auth` is set, because the device can drop between the challenge and the last signature. Unattended runs still queue, and now keep their standing reference: migration 15 adds `script_runs.standing` (`<type>:<id>`), and `releaseQueued` re-derives the approval from it, falling back to `task_id` for older rows. That fallback never worked before, because `releaseQueued` scanned `task_id` into a throwaway variable (`internal/server/runs.go`, `internal/server/api_scripts.go`). Fleet updates deliberately include online devices only, so this concerned runs, not updates.
 4. ~~**Review & sign signs one approval per click.**~~ **Fixed.** A patch policy that reboots, or a catalog item, holds several approvals. `GET /api/approvals/unsigned` rows now carry `org` and `purpose`, and the row button signs exactly its own unit (`signObject(type, id, {org, purpose})`); signing a unit that is already approved answers `already_approved` without asking for a signature. **Sign all** walks the listed rows one dialog at a time, stops when a dialog is cancelled, and reports signed, pending and failed in one toast (`web/src/lib/signAll.ts`, `web/src/pages/Approvals.tsx`). `remaining` used to count only units of the asked purpose, so it was always 0 when a purpose was given; it now counts every other unit of the object that still needs a signature (`internal/server/standing.go`).
 5. ~~**3C transparency log**~~ **Built.** `internal/translog` (a `tlog` Merkle log with Ed25519 signed heads, SQLite tables `tlog_leaves` and `tlog_hashes`, migration 17) records every released manifest, every activated bundle and every audit row. The hub completes an inclusion proof and a consistency proof per send; the agent verifies them in `authorize`, pins the head in `log_head.json` and keeps the hash-chained `executed.log` (`internal/agent/translog.go`, `trust.go`), whose head rides in hello and inventory. `policy.require_log_proof` and the bundle's `log_key` are validated by the server (`checkLogBinding`). `GET /api/log/head|proof|consistency` need no session, `GET /api/log/entries/{index}` needs an admin. `rmm-server log head|verify` checks from outside (`cmd/rmm-server/log.go`), and the console has the log card, the **Require log proofs** switch, the device log heads and the audit **Log #** column. Design and status: `docs/plans/2026-10-24-phase3c-transparency-log.md`.
-6. **3D out-of-band signer and M-of-N UX, 3E QUIC**, as planned.
+6. ~~**3D out-of-band signer and M-of-N UX**~~ **Built.** `cmd/rmm-signer`, `internal/winwebauthn`, the own-unsigned entries and `GET /api/approvals/{id}`, and the console's "Sign with rmm-signer". Design and status: `docs/plans/2026-10-24-phase3d-out-of-band-signer.md`.
+7. ~~**3E QUIC**~~ **Built.** Opt-in agent transport with per-request streams and WebSocket fallback. Design and status: `docs/plans/2026-10-24-phase3e-quic.md`.

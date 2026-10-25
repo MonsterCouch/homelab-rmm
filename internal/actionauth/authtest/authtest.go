@@ -79,6 +79,10 @@ type SignOpts struct {
 	NoUP        bool // clear the user-present flag
 	UV          bool // set the user-verified flag
 	Challenge   []byte
+	// ClientData, when set, is signed as the clientDataJSON instead of the one
+	// Sign builds, so a test can check bytes another client produced (the
+	// native Windows signer) against the verifier.
+	ClientData []byte
 }
 
 // Sign produces an assertion over doc (challenge = SHA-256(doc)).
@@ -96,9 +100,12 @@ func (k *Key) Sign(doc []byte, o SignOpts) protocol.Assertion {
 	if chal == nil {
 		chal = actionauth.Challenge(doc)
 	}
-	cd, _ := json.Marshal(map[string]any{
-		"type": o.Type, "challenge": actionauth.EncodeB64(chal), "origin": o.Origin, "crossOrigin": o.CrossOrigin,
-	})
+	cd := o.ClientData
+	if cd == nil {
+		cd, _ = json.Marshal(map[string]any{
+			"type": o.Type, "challenge": actionauth.EncodeB64(chal), "origin": o.Origin, "crossOrigin": o.CrossOrigin,
+		})
+	}
 	rp := sha256.Sum256([]byte(o.RPID))
 	flags := byte(0x01)
 	if o.NoUP {

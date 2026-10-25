@@ -11,8 +11,10 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -20,6 +22,7 @@ import (
 
 	"github.com/MonsterCouch/homelab-rmm/internal/server"
 	"github.com/MonsterCouch/homelab-rmm/internal/svc"
+	"github.com/MonsterCouch/homelab-rmm/internal/winsec"
 )
 
 const serviceName = "HomelabRMMServer"
@@ -40,6 +43,12 @@ Usage:
   rmm-server log verify --server URL --key VERIFIER_KEY [--state FILE]
                                     check the log only grew since the last run; --state defaults
                                     to log-verify.json in the current directory
+  rmm-server telemetry migrate --to pebble|clickhouse [--data DIR] [--telemetry-dsn URL]
+                                    copy the metrics series out of rmm.db into another engine
+                                    (the server must be stopped; nothing is deleted)
+  rmm-server telemetry drop-sqlite --telemetry pebble|clickhouse [--data DIR]
+                                    delete the old metrics rows from rmm.db once the server
+                                    runs on the new engine
   rmm-server version
 
 Flags for run/install:
@@ -50,6 +59,12 @@ Flags for run/install:
                       saved in Settings wins and this flag is only the fallback.
   --cert FILE --key FILE   use your own certificate instead of the generated one
   --insecure          plain HTTP (only behind a TLS-terminating reverse proxy)
+  --quic              also accept agents over QUIC on UDP (same certificate; WebSocket stays the
+                      fallback). Not usable with --insecure, and not through a reverse proxy.
+  --quic-port N       UDP port for --quic (default: the same number as the HTTPS port)
+  --telemetry ENGINE  where the metrics series is kept: sqlite (default, inside rmm.db), pebble
+                      (embedded, <data dir>/telemetry) or clickhouse (over its HTTP interface)
+  --telemetry-dsn URL ClickHouse address, e.g. http://clickhouse:8123 (may carry user:password@)
   --trusted-proxies   comma-separated IPs/CIDRs whose X-Forwarded-For header is trusted (the reverse proxy)
   --dev-web DIR       serve the UI from a directory instead of the embedded build
 
@@ -57,7 +72,8 @@ install resolves --data, --cert, --key and --dev-web to absolute paths before st
 in the service definition, because the service manager runs from a different directory.
 
 Environment: RMM_DATA_DIR, RMM_LISTEN, RMM_PUBLIC_URL, RMM_CERT_FILE, RMM_KEY_FILE, RMM_INSECURE,
-             RMM_TRUSTED_PROXIES, RMM_DEV_WEB_DIR, RMM_DEBUG,
+             RMM_TRUSTED_PROXIES, RMM_DEV_WEB_DIR, RMM_DEBUG, RMM_QUIC, RMM_QUIC_PORT,
+             RMM_TELEMETRY, RMM_TELEMETRY_DSN, RMM_TELEMETRY_USER, RMM_TELEMETRY_PASSWORD,
              RMM_WEBAUTHN_RP_ID, RMM_WEBAUTHN_ORIGINS (comma-separated; default: derived from the public URL)
 
 First run: with no users yet, navigate to the web console in your browser (e.g.
@@ -78,6 +94,10 @@ func newFlagSet(name string) (*flag.FlagSet, *server.Config, *string) {
 		"get the certificate from `tailscale cert` and keep it renewed (needs HTTPS certificates enabled for the tailnet)")
 	fs.BoolVar(&cfg.Insecure, "insecure", false, "serve plain HTTP (only behind a TLS-terminating reverse proxy)")
 	fs.StringVar(&cfg.DevWebDir, "dev-web", "", "serve the UI from this directory instead of the embedded build")
+	fs.BoolVar(&cfg.QUIC, "quic", false, "also accept agents over QUIC on UDP, with the same certificate (WebSocket stays the fallback)")
+	fs.IntVar(&cfg.QUICPort, "quic-port", 0, "UDP port for --quic (default: the HTTPS port number)")
+	fs.StringVar(&cfg.Telemetry, "telemetry", "", "metrics engine: sqlite (default), pebble or clickhouse")
+	fs.StringVar(&cfg.TelemetryDSN, "telemetry-dsn", "", "ClickHouse HTTP address for --telemetry clickhouse, e.g. http://clickhouse:8123")
 	proxies := fs.String("trusted-proxies", "", "comma-separated IPs/CIDRs whose X-Forwarded-For header is trusted")
 	return fs, cfg, proxies
 }
@@ -88,7 +108,31 @@ func parseFlags(args []string) server.Config {
 	if *proxies != "" {
 		cfg.TrustedProxies = strings.Split(*proxies, ",")
 	}
-	return cfg.FromEnv()
+	return quicEnv(cfg.FromEnv())
+}
+
+// quicEnv applies RMM_QUIC and RMM_QUIC_PORT on top of cfg, the way
+// Config.FromEnv does for the other settings: the environment wins over the
+// flag. A value that does not parse is ignored rather than silently turning
+// QUIC on or off, and the mistake is logged because the alternative is a server
+// that quietly stays on WebSocket while the operator believes QUIC is running.
+// A port that parses but is out of range is left for validation to report.
+func quicEnv(cfg server.Config) server.Config {
+	if v := os.Getenv("RMM_QUIC"); v != "" {
+		if on, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			cfg.QUIC = on
+		} else {
+			slog.Warn("RMM_QUIC is not a boolean (use true or false) and was ignored", "value", v)
+		}
+	}
+	if v := os.Getenv("RMM_QUIC_PORT"); v != "" {
+		if p, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			cfg.QUICPort = p
+		} else {
+			slog.Warn("RMM_QUIC_PORT is not a number and was ignored", "value", v)
+		}
+	}
+	return cfg
 }
 
 // setupLogging installs the process-wide slog handler over stderr and
@@ -171,6 +215,18 @@ func installArgs(cfg server.Config) []string {
 	if cfg.Insecure {
 		args = append(args, "--insecure")
 	}
+	if cfg.QUIC {
+		args = append(args, "--quic")
+		if cfg.QUICPort != 0 {
+			args = append(args, "--quic-port", strconv.Itoa(cfg.QUICPort))
+		}
+	}
+	if e := cfg.TelemetryEngine(); e != "sqlite" {
+		args = append(args, "--telemetry", e)
+		if cfg.TelemetryDSN != "" {
+			args = append(args, "--telemetry-dsn", dsnWithoutSecret(cfg))
+		}
+	}
 	if cfg.DevWebDir != "" {
 		args = append(args, "--dev-web", cfg.DevWebDir)
 	}
@@ -178,6 +234,59 @@ func installArgs(cfg server.Config) []string {
 		args = append(args, "--trusted-proxies", strings.Join(cfg.TrustedProxies, ","))
 	}
 	return args
+}
+
+// dsnWithoutSecret is the DSN a service is installed with: RMM_TELEMETRY_USER
+// goes into it, because a service started by the manager does not inherit the
+// installing shell's environment, but a password never does. Service
+// arguments are readable by other local users (the Windows service ImagePath,
+// a systemd unit file), so the password travels in a file in the data
+// directory instead (see installTelemetryPassword).
+func dsnWithoutSecret(cfg server.Config) string {
+	u, err := url.Parse(cfg.TelemetryDSN)
+	if err != nil {
+		// Not parseable, so the secret cannot be told apart from the rest. The
+		// install check (server.CheckTelemetryConfig) is what rejects it.
+		return cfg.TelemetryDSN
+	}
+	switch {
+	case u.User != nil:
+		u.User = url.User(u.User.Username())
+	case cfg.TelemetryUser != "":
+		u.User = url.User(cfg.TelemetryUser)
+	default:
+		return cfg.TelemetryDSN
+	}
+	return u.String()
+}
+
+// installTelemetryPassword stores the ClickHouse password, from
+// RMM_TELEMETRY_PASSWORD or from the --telemetry-dsn userinfo, in the data
+// directory at mode 0600 for the service to read. With no password given it
+// leaves an earlier file alone, so reinstalling to change another flag keeps
+// working.
+func installTelemetryPassword(cfg server.Config) error {
+	if cfg.TelemetryEngine() != "clickhouse" {
+		return nil
+	}
+	pw := cfg.TelemetryPassword
+	if pw == "" {
+		if u, err := url.Parse(cfg.TelemetryDSN); err == nil && u.User != nil {
+			pw, _ = u.User.Password()
+		}
+	}
+	if pw == "" {
+		return nil
+	}
+	// The data directory may be new, and on Windows the mode below means
+	// nothing: the directory's access list is what keeps other accounts out.
+	if err := winsec.SecureDir(cfg.DataDir); err != nil {
+		return fmt.Errorf("cannot restrict permissions on %s, so the ClickHouse password was not stored there: %w", cfg.DataDir, err)
+	}
+	if err := os.WriteFile(server.TelemetryPasswordFile(cfg), []byte(pw), 0o600); err != nil {
+		return fmt.Errorf("cannot store the ClickHouse password: %w", err)
+	}
+	return nil
 }
 
 // validateConfig checks what `install` can check without touching the
@@ -198,6 +307,12 @@ func validateConfig(cfg server.Config) error {
 	}
 	f.Close()
 	os.Remove(probe)
+	if err := server.CheckQUICConfig(cfg); err != nil {
+		return err
+	}
+	if err := server.CheckTelemetryConfig(cfg); err != nil {
+		return err
+	}
 	if (cfg.CertFile == "") != (cfg.KeyFile == "") {
 		return errors.New("--cert and --key must be given together")
 	}
@@ -349,6 +464,10 @@ func run(args []string) int {
 			fmt.Fprintln(os.Stderr, "configuration check failed:", err)
 			return 1
 		}
+		if err := installTelemetryPassword(cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "service install failed:", err)
+			return 1
+		}
 		sp := spec(installArgs(cfg))
 		if err := svc.Control(sp, "install"); err != nil {
 			fmt.Fprintln(os.Stderr, "service install failed:", err)
@@ -366,6 +485,8 @@ func run(args []string) int {
 		return runLog(args)
 	case "trust":
 		return runTrust(args)
+	case "telemetry":
+		return runTelemetry(args)
 	case "setup-code":
 		return runSetupCode(args)
 	default:

@@ -36,6 +36,9 @@ type Agent struct {
 	cmu    sync.RWMutex
 	remote protocol.AgentConfig
 	rmu    sync.RWMutex
+	// qmu guards the QUIC fields of cfg (QUICPort, QUICFailedAt): the session
+	// reads them while a config push on a reader goroutine may rewrite them.
+	qmu    sync.Mutex
 	shells *shellManager
 	runs   *scriptRunner
 	// baselines is the desired-state engine: its own goroutine, its own
@@ -43,6 +46,8 @@ type Agent struct {
 	baselines *baselineEngine
 	// trust is the pinned trust bundle and nonce store (Phase 3); see trust.go.
 	trust *trustState
+	// mesh is the subnet cache role (Phase 4B); see mesh.go.
+	mesh *meshState
 	// wake is signalled when the config changes so tickers restart
 	wake chan struct{}
 
@@ -79,6 +84,7 @@ func New(cfg *Config) *Agent {
 	a.runs = newScriptRunner()
 	a.baselines = newBaselineEngine(a)
 	a.trust = loadTrust()
+	a.mesh = &meshState{}
 	a.remote = protocol.AgentConfig{MetricsIntervalSec: 30, InventoryIntervalSec: 3600, PatchScanIntervalSec: 6 * 3600}
 	return a
 }
@@ -92,6 +98,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	// the socket comes back.
 	a.baselines.start(ctx)
 	a.startPortalPipe(ctx)
+	// A leader's listeners and Windows firewall rules go with the process.
+	defer a.mesh.stop()
 
 	// Supervisor IPC integration (Milestone 6)
 	a.initSupervisorIPC(ctx)
@@ -130,17 +138,131 @@ func (a *Agent) hello() protocol.Hello {
 		h.TrustEpoch, h.TrustHash = a.trust.epochHash()
 		h.LogSize, h.ExecutedHead = a.trust.logSize(), a.trust.executedHead()
 	}
+	if a.mesh != nil {
+		h.CacheCapable, h.CacheFingerprint = a.mesh.identity()
+	}
 	return h
 }
 
+// transportMode is how this process was asked to reach the server:
+// RMM_TRANSPORT wins over the config file, and anything unrecognised means
+// auto, with a warning, so a typo never strands a device offline.
+func (a *Agent) transportMode() string {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("RMM_TRANSPORT")))
+	if mode == "" {
+		mode = strings.ToLower(strings.TrimSpace(a.cfg.Transport))
+	}
+	switch mode {
+	case "websocket", "quic", "auto":
+		return mode
+	case "":
+		return "auto"
+	}
+	slog.Warn("unknown transport, using auto", "transport", mode, "want", "websocket, quic or auto")
+	return "auto"
+}
+
+// quicState reads the remembered QUIC port and last failure time.
+func (a *Agent) quicState() (port int, failedAt int64) {
+	a.qmu.Lock()
+	defer a.qmu.Unlock()
+	return a.cfg.QUICPort, a.cfg.QUICFailedAt
+}
+
+// setQUICFailedAt records (or, with 0, clears) the last QUIC failure and
+// saves it, so a restart does not forget that this network drops UDP.
+func (a *Agent) setQUICFailedAt(ts int64) {
+	a.qmu.Lock()
+	defer a.qmu.Unlock()
+	if a.cfg.QUICFailedAt == ts {
+		return
+	}
+	a.cfg.QUICFailedAt = ts
+	if err := a.cfg.Save(); err != nil {
+		slog.Warn("cannot save the QUIC failure time", "err", err)
+	}
+}
+
+// rememberQUIC stores what the server says about its QUIC listener. A server
+// that stopped advertising it (QUIC turned off) clears the port, and the
+// failure memory with it: the next time it comes back is a fresh start.
+func (a *Agent) rememberQUIC(cfg protocol.AgentConfig) {
+	if a.cfg == nil {
+		return
+	}
+	port := 0
+	if cfg.QUIC {
+		port = cfg.QUICPort
+	}
+	a.qmu.Lock()
+	defer a.qmu.Unlock()
+	if a.cfg.QUICPort == port {
+		return
+	}
+	a.cfg.QUICPort = port
+	if port == 0 {
+		a.cfg.QUICFailedAt = 0
+	}
+	if err := a.cfg.Save(); err != nil {
+		slog.Warn("cannot save the QUIC port", "err", err)
+	}
+}
+
 func (a *Agent) session(ctx context.Context) error {
+	if a.cfg.Key == "" && a.cfg.EnrollToken == "" {
+		return errors.New("no agent key and no enrollment token; run `rmm-agent install`")
+	}
+	mode := a.transportMode()
+	port, failedAt := a.quicState()
+	if chooseQUIC(mode, port, failedAt, time.Now()) {
+		link, welcome, err := a.dialQUIC(ctx, port)
+		if err == nil {
+			return a.sessionQUIC(ctx, link, welcome)
+		}
+		var te *quicTransportError
+		if !errors.As(err, &te) || mode == "quic" {
+			return err
+		}
+		if ctx.Err() != nil {
+			// A stop or a cancelled dial says nothing about the UDP path, and
+			// remembering it would hold the device on WebSocket for ten minutes.
+			return ctx.Err()
+		}
+		slog.Warn("QUIC failed, falling back to WebSocket", "err", err, "retry_quic_in", quicRetryAfter)
+		a.setQUICFailedAt(time.Now().Unix())
+	}
+	return a.sessionWS(ctx)
+}
+
+// dialQUIC is the agent's QUIC attempt: the address, the credentials, and the
+// refusal handling. An unknown-key refusal is the 401 equivalent and gets the
+// same re-enrollment treatment; it is returned as a plain error so it is
+// never mistaken for a transport failure.
+func (a *Agent) dialQUIC(ctx context.Context, port int) (*quicLink, protocol.Envelope, error) {
+	addr, err := quicAddress(a.cfg.ServerURL, port)
+	if err != nil {
+		return nil, protocol.Envelope{}, err
+	}
+	auth := protocol.Auth{Token: a.cfg.EnrollToken}
+	if a.cfg.Key != "" {
+		auth = protocol.Auth{Key: a.cfg.Key}
+	}
+	link, env, err := dialQUIC(ctx, addr, a.cfg.Fingerprint, auth, a.hello())
+	var ref *quicRefusal
+	if errors.As(err, &ref) && ref.msg == protocol.ErrUnknownAgentKey && a.cfg.Key != "" && a.cfg.EnrollToken != "" {
+		slog.Warn("agent key rejected, re-enrolling with stored token")
+		a.cfg.Key, a.cfg.AgentID = "", ""
+		a.cfg.Save()
+	}
+	return link, env, err
+}
+
+func (a *Agent) sessionWS(ctx context.Context) error {
 	hdr := http.Header{}
 	if a.cfg.Key != "" {
 		hdr.Set("Authorization", "Bearer "+a.cfg.Key)
-	} else if a.cfg.EnrollToken != "" {
-		hdr.Set("X-Enroll-Token", a.cfg.EnrollToken)
 	} else {
-		return errors.New("no agent key and no enrollment token; run `rmm-agent install`")
+		hdr.Set("X-Enroll-Token", a.cfg.EnrollToken)
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	ws, resp, err := Dial(dialCtx, a.cfg.WSURL("/ws/agent"), a.cfg.Fingerprint, hdr)
@@ -168,40 +290,13 @@ func (a *Agent) session(ctx context.Context) error {
 	if err := ws.ReadJSON(&env); err != nil {
 		return err
 	}
-	if env.T != "welcome" {
-		return errors.New("server refused: " + env.Err)
-	}
-	var welcome struct {
-		AgentID  string          `json:"agent_id"`
-		AgentKey string          `json:"agent_key"`
-		Config   json.RawMessage `json:"config"`
-	}
-	if err := json.Unmarshal(env.D, &welcome); err != nil {
+	if err := a.welcomed(env); err != nil {
 		return err
 	}
-	if welcome.AgentKey != "" {
-		a.cfg.AgentID, a.cfg.Key = welcome.AgentID, welcome.AgentKey
-		if err := a.cfg.Save(); err != nil {
-			slog.Error("cannot save enrollment; the device will re-enroll next start", "err", err)
-		} else {
-			slog.Info("enrolled", "agent_id", welcome.AgentID)
-		}
-	}
-	a.applyConfigRaw(welcome.Config)
 	ws.SetReadDeadline(time.Time{})
-	slog.Info("connected", "server", a.cfg.ServerURL, "agent_id", a.cfg.AgentID)
 
-	// Notify supervisor that TLS handshake, WS upgrade, and check-in succeeded (Milestone 6)
-	a.notifyHealthy()
-
-	// Catch-up is exactly one re-send of the cached last report per baseline,
-	// with its original timestamp and version; the start-up pass that follows
-	// supersedes it server-side (A14).
-	go a.baselines.resend()
-
-	sessCtx, stop := context.WithCancel(ctx)
+	sessCtx, stop := a.startSession(ctx)
 	defer stop()
-	go a.pushLoop(sessCtx)
 	// a cancelled context (service stop, SIGTERM) must unblock ReadMessage
 	go func() {
 		<-sessCtx.Done()
@@ -223,11 +318,82 @@ func (a *Agent) session(ctx context.Context) error {
 	}
 }
 
+// sessionQUIC runs a session over an established QUIC connection whose welcome
+// has already been read.
+func (a *Agent) sessionQUIC(ctx context.Context, link *quicLink, welcome protocol.Envelope) error {
+	c := &conn{q: link}
+	a.setConn(c)
+	defer a.setConn(nil)
+	defer link.close(quicCodeNormal, "agent stopping")
+
+	if err := a.welcomed(welcome); err != nil {
+		return err
+	}
+	a.setQUICFailedAt(0)
+
+	sessCtx, stop := a.startSession(ctx)
+	defer stop()
+	// a cancelled context (service stop, SIGTERM) must unblock the readers
+	go func() {
+		<-sessCtx.Done()
+		link.close(quicCodeNormal, "shutting down")
+	}()
+	err := link.serve(sessCtx, a)
+	a.shells.closeAll()
+	return err
+}
+
+// welcomed handles the server's answer to hello, whichever transport carried
+// it: a refusal is an error, an enrollment saves the key it brings, and the
+// pushed configuration is applied.
+func (a *Agent) welcomed(env protocol.Envelope) error {
+	if env.T != "welcome" {
+		return errors.New("server refused: " + env.Err)
+	}
+	var welcome struct {
+		AgentID  string          `json:"agent_id"`
+		AgentKey string          `json:"agent_key"`
+		Config   json.RawMessage `json:"config"`
+	}
+	if err := json.Unmarshal(env.D, &welcome); err != nil {
+		return err
+	}
+	if welcome.AgentKey != "" {
+		a.cfg.AgentID, a.cfg.Key = welcome.AgentID, welcome.AgentKey
+		if err := a.cfg.Save(); err != nil {
+			slog.Error("cannot save enrollment; the device will re-enroll next start", "err", err)
+		} else {
+			slog.Info("enrolled", "agent_id", welcome.AgentID)
+		}
+	}
+	a.applyConfigRaw(welcome.Config)
+	slog.Info("connected", "server", a.cfg.ServerURL, "agent_id", a.cfg.AgentID)
+	return nil
+}
+
+// startSession is what follows a successful welcome on either transport. The
+// returned context ends with the session; stop ends it early.
+func (a *Agent) startSession(ctx context.Context) (context.Context, context.CancelFunc) {
+	// Notify supervisor that TLS handshake, WS upgrade, and check-in succeeded (Milestone 6)
+	a.notifyHealthy()
+
+	// Catch-up is exactly one re-send of the cached last report per baseline,
+	// with its original timestamp and version; the start-up pass that follows
+	// supersedes it server-side (A14).
+	go a.baselines.resend()
+
+	sessCtx, stop := context.WithCancel(ctx)
+	go a.pushLoop(sessCtx)
+	return sessCtx, stop
+}
+
 // applyConfigRaw applies a pushed config from its JSON, keeping each baseline
 // spec's bytes as received so their standing approvals can be checked.
 func (a *Agent) applyConfigRaw(data json.RawMessage) {
 	if len(data) == 0 {
-		a.applyConfig(protocol.AgentConfig{}, nil, nil)
+		// No config says nothing about QUIC either, so the remembered port stays.
+		port, _ := a.quicState()
+		a.applyConfig(protocol.AgentConfig{QUIC: port > 0, QUICPort: port, Cache: a.config().Cache}, nil, nil)
 		return
 	}
 	cfg, raws, auth, err := splitConfig(data)
@@ -250,6 +416,10 @@ func (a *Agent) applyConfig(cfg protocol.AgentConfig, raws map[int64]json.RawMes
 	a.rmu.Lock()
 	a.remote = cfg
 	a.rmu.Unlock()
+	a.rememberQUIC(cfg)
+	if a.mesh != nil {
+		a.mesh.apply(a, cfg.Cache)
+	}
 	// The pushed set is always complete: a baseline that is missing here was
 	// unassigned, disabled or deleted, and the engine stops it at once (A10).
 	if a.baselines != nil {
@@ -401,6 +571,9 @@ func (a *Agent) sendInventory() {
 	if a.trust != nil {
 		inv.ExecutedHead = a.trust.executedHead()
 	}
+	if a.mesh != nil {
+		inv.Cache = a.mesh.stats()
+	}
 	if c := a.socket(); c != nil {
 		c.send(protocol.Envelope{T: protocol.TypeInventory, D: protocol.Must(inv)})
 	}
@@ -522,6 +695,11 @@ func (a *Agent) handle(ctx context.Context, env protocol.Envelope) {
 		if err = json.Unmarshal(env.D, &in); err == nil {
 			out, err = installUpdates(ctx, in, func(line string) { c.event("patch", line, nil) })
 		}
+	case protocol.ReqServicingRepair:
+		var in protocol.ServicingRepair
+		if err = json.Unmarshal(env.D, &in); err == nil {
+			out, err = servicingRepair(ctx, a.cfg, in, func(line string) { c.event("patch", line, nil) })
+		}
 	case protocol.ReqEventLogQuery:
 		var in protocol.EventLogQuery
 		if err = json.Unmarshal(env.D, &in); err == nil {
@@ -605,7 +783,13 @@ func (a *Agent) handle(ctx context.Context, env protocol.Envelope) {
 	case protocol.ReqAgentUpdate:
 		var in protocol.AgentUpdate
 		if err = json.Unmarshal(env.D, &in); err == nil {
-			err = selfUpdate(ctx, a.cfg, in, a.IPCClient())
+			var source string
+			source, err = selfUpdateSource(ctx, a.cfg, in, a.IPCClient())
+			if err == nil && source != "" {
+				// Where the bytes came from, so the operator can tell a
+				// cache hit from a WAN download.
+				out = map[string]string{"source": source}
+			}
 		}
 	case protocol.ReqTrustUpdate:
 		out, err = a.trustUpdate(env)

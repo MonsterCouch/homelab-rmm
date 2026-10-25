@@ -2,6 +2,8 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -42,6 +44,46 @@ type Config struct {
 	// exactly what the operators' browsers will report.
 	WebAuthnRPID    string
 	WebAuthnOrigins []string
+	// QUIC listens for agents over QUIC on UDP as well as WebSocket over HTTPS
+	// (docs/plans/2026-10-24-phase3e-quic.md). QUICPort is the UDP port; zero
+	// means the same number as the HTTPS port. Refused with Insecure, because
+	// QUIC always carries TLS.
+	QUIC     bool
+	QUICPort int
+	// Telemetry selects where the metrics series lives: "sqlite" (the default,
+	// inside rmm.db), "pebble" (an embedded LSM under <data dir>/telemetry) or
+	// "clickhouse" (a server reached over its HTTP interface). TelemetryDSN,
+	// TelemetryUser and TelemetryPassword are for ClickHouse only; the DSN may
+	// also carry user:password@. See docs/plans/2026-10-24-phase4a-telemetry-store.md.
+	Telemetry         string
+	TelemetryDSN      string
+	TelemetryUser     string
+	TelemetryPassword string
+}
+
+// TelemetryEngine is the engine name with the default filled in.
+func (c Config) TelemetryEngine() string {
+	if e := strings.ToLower(strings.TrimSpace(c.Telemetry)); e != "" {
+		return e
+	}
+	return "sqlite"
+}
+
+// CheckTelemetryConfig refuses a telemetry setting that cannot work, before
+// anything touches the disk, so a typo fails with its reason instead of
+// quietly starting on the default engine.
+func CheckTelemetryConfig(cfg Config) error {
+	switch cfg.TelemetryEngine() {
+	case "sqlite", "pebble":
+		return nil
+	case "clickhouse":
+		if strings.TrimSpace(cfg.TelemetryDSN) == "" {
+			return errors.New("--telemetry clickhouse needs --telemetry-dsn (RMM_TELEMETRY_DSN), for example http://clickhouse:8123")
+		}
+		return nil
+	default:
+		return fmt.Errorf("--telemetry %q is not an engine; use sqlite, pebble or clickhouse", cfg.Telemetry)
+	}
 }
 
 // defaultICEServers is used when none are configured: a public STUN server is
@@ -131,6 +173,18 @@ func (c Config) FromEnv() Config {
 				c.ICEServers = append(c.ICEServers, s)
 			}
 		}
+	}
+	if v := strings.TrimSpace(os.Getenv("RMM_TELEMETRY")); v != "" {
+		c.Telemetry = v
+	}
+	if v := strings.TrimSpace(os.Getenv("RMM_TELEMETRY_DSN")); v != "" {
+		c.TelemetryDSN = v
+	}
+	if v := os.Getenv("RMM_TELEMETRY_USER"); v != "" {
+		c.TelemetryUser = v
+	}
+	if v := os.Getenv("RMM_TELEMETRY_PASSWORD"); v != "" {
+		c.TelemetryPassword = v
 	}
 	if v := strings.TrimSpace(os.Getenv("RMM_WEBAUTHN_RP_ID")); v != "" {
 		c.WebAuthnRPID = v

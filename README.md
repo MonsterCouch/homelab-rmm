@@ -57,6 +57,11 @@ and its own script library and baseline kinds. It is simply not where the depth 
 - **Software Catalog** — repository of approved software applications (winget and custom installers) with fleet deployment and end-user self-service availability.
 - **Client Portal & Companion** — `rmm-desktop` client companion in the Windows notification area communicating over local Named Pipe IPC (`\\.\pipe\homelab-rmm-portal`); end-user self-service software installation and ticket submission.
 - **Network Discovery & SNMP** — subnet sweeps (ARP/ICMP ping sweeps) and SNMP hardware polling (v2c) for switches, routers, printers, and unmanaged devices.
+- **QUIC transport (optional)** — `--quic` adds a UDP listener so each request rides its own stream (no head-of-line blocking); agents fall back to WebSocket on their own ([docs/OPERATIONS.md](docs/OPERATIONS.md#quic-transport-optional)).
+- **Metrics storage engines** — the metrics series stays in SQLite by default, or moves to an embedded Pebble store or a ClickHouse server with `--telemetry`; `rmm-server telemetry migrate` copies existing history ([docs/OPERATIONS.md](docs/OPERATIONS.md#metrics-storage-telemetry-engines)). ClickHouse is tested against a protocol fake only.
+- **Subnet update cache (optional)** — devices on one subnet fetch an agent update once across the WAN; the server picks a leader per subnet, members verify every chunk and the whole hash and fall back to the server ([docs/OPERATIONS.md](docs/OPERATIONS.md#update-cache-subnet-mesh)).
+- **Windows servicing repair** — DISM RestoreHealth, SFC, Windows Update component reset and CAB/MSU injection, run by hand (signed like any action) or automatically by a patch policy that sees a known servicing error, at most once a day per device ([docs/OPERATIONS.md](docs/OPERATIONS.md#windows-servicing-repair)).
+- **Signed actions** — in organizations with a trust bundle, devices run destructive requests only when an operator's security key signed them; `rmm-signer`, a Windows command-line signer, prints the exact manifest and signs it with Windows Hello or a key outside the browser ([docs/SECURITY.md](docs/SECURITY.md#signed-actions)).
 - **Users** — admin / tech / viewer roles (a viewer looks at everything and changes nothing: no writes, and no terminal, remote desktop, file download or enrollment token either; technicians can be scoped to specific organizations), TOTP two-factor authentication, session management, password reset from the CLI.
 - **Audit log** of every action with user and source address.
 
@@ -533,6 +538,9 @@ all. `make`, `tools/build.sh` and `tools/build.ps1` therefore refuse to build `r
 `web/dist/index.html` is missing and tell you to run `make web` first; `ALLOW_EMPTY_WEB=1`
 overrides that for a binary you intend to run with `--dev-web`. `tools/build.ps1` is the Windows
 twin of the Makefile. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
+`make signer` builds `rmm-signer` for Windows (amd64 and arm64); `make all` includes it, but `make package`
+and `tools/build.*` do not archive it yet. Usage: `rmm-signer login|list|show|sign|logout|selftest`.
 
 
 ### Windows installers

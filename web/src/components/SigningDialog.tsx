@@ -83,6 +83,15 @@ function SigningModal({ item, waiting }: { item: QueuedSigning; waiting: number 
           <Button onClick={cancel} disabled={busy}>
             Cancel
           </Button>
+          {c.manifestId && (
+            <Button
+              onClick={() => settle(item.id, { kind: 'park' })}
+              disabled={busy}
+              title="Closes this dialog. The request waits, up to its expiry, for you to sign it with rmm-signer (which shows the exact bytes itself) or on the Approvals page."
+            >
+              Sign with rmm-signer
+            </Button>
+          )}
           {canSkip && (
             <Button onClick={() => settle(item.id, { kind: 'skip' })} disabled={busy} title="Audit mode: the action runs unsigned and the agent reports it">
               Continue without signing

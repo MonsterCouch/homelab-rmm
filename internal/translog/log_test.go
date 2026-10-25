@@ -155,7 +155,10 @@ func TestHeadSignatureAndKey(t *testing.T) {
 		t.Fatal("no signature line in the note")
 	}
 	bad := append([]byte(nil), signed...)
-	last := len(bad) - 3
+	// Flip a byte well inside the base64 signature. The final data character
+	// carries two padding bits that decoders ignore, so flipping it would
+	// sometimes leave the signature intact.
+	last := len(bad) - 10
 	if bad[last] == 'A' {
 		bad[last] = 'B'
 	} else {

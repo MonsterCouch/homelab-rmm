@@ -4,10 +4,11 @@
 #   tools/build.sh web        npm ci + npm run build (web/dist, embedded by the server)
 #   tools/build.sh server     rmm-server for windows/amd64, windows/arm64, linux/amd64, linux/arm64
 #   tools/build.sh agents     rmm-agent for those plus linux/arm (GOARM=7)
-#   tools/build.sh all        web, server, agents
+#   tools/build.sh signer     rmm-signer (out-of-band approval signer) for windows/amd64 and windows/arm64
+#   tools/build.sh all        web, server, agents, signer
 #   tools/build.sh test       go vet, go test, UI type-check + build
 #   tools/build.sh package    dist/homelab-rmm-<os>-<arch>.zip (+ .tar.gz on linux) and SHA256SUMS
-#                             (archives what `server` and `agents` built; it does NOT build
+#                             (archives what `server`, `agents` and `signer` built; it does NOT build
 #                             anything, and refuses a binary older than the sources or web/dist
 #                             it was built from - ALLOW_STALE_BUILD=1 packages it anyway)
 #   tools/build.sh checksums  regenerate dist/SHA256SUMS
@@ -15,6 +16,8 @@
 #
 # `server` and `package` refuse to run without a built UI in web/dist, because the
 # server binary embeds it; ALLOW_EMPTY_WEB=1 overrides that for a --dev-web binary.
+#
+# The Windows archives also carry rmm-signer-windows-<arch>.exe beside rmm-server.exe.
 #
 # Environment: VERSION (default: git describe), GO, NPM, DIST (default dist),
 # ALLOW_EMPTY_WEB, ALLOW_STALE_BUILD.
@@ -30,10 +33,12 @@ DIST=${DIST:-dist}
 case "$DIST" in /*) ;; *) DIST="$ROOT/$DIST" ;; esac
 VERSION=${VERSION:-$(git describe --tags --always 2>/dev/null || echo dev)}
 MODULE=github.com/MonsterCouch/homelab-rmm
-LDFLAGS="-s -w -X ${MODULE}/internal/server.Version=${VERSION} -X ${MODULE}/internal/agent.Version=${VERSION}"
+LDFLAGS="-s -w -X ${MODULE}/internal/server.Version=${VERSION} -X ${MODULE}/internal/agent.Version=${VERSION} -X main.Version=${VERSION}"
 
 SERVER_PLATFORMS="windows/amd64 windows/arm64 linux/amd64 linux/arm64"
 AGENT_PLATFORMS="windows/amd64 windows/arm64 linux/amd64 linux/arm64 linux/arm"
+# rmm-signer signs with the Windows WebAuthn API, so only Windows gets a binary.
+SIGNER_PLATFORMS="windows/amd64 windows/arm64"
 
 log() { printf '  %s\n' "$*"; }
 die() { printf 'build.sh: %s\n' "$*" >&2; exit 1; }
@@ -122,7 +127,7 @@ do_checksums() {
 	local -a files=()
 	tool=$(sha256_tool)
 	[ -d "$DIST" ] || die "no $DIST directory to checksum"
-	for f in "$DIST"/homelab-rmm-*.zip "$DIST"/homelab-rmm-*.tar.gz "$DIST"/rmm-server-* "$DIST"/rmm-agent-*; do
+	for f in "$DIST"/homelab-rmm-*.zip "$DIST"/homelab-rmm-*.tar.gz "$DIST"/rmm-server-* "$DIST"/rmm-agent-* "$DIST"/rmm-signer-*; do
 		# an unmatched glob stays literal; skip it (and never hash SHA256SUMS itself)
 		[ -f "$f" ] && files+=("$(basename "$f")")
 	done
@@ -158,7 +163,7 @@ fresh() {
 }
 
 do_package() {
-	local p os arch name stage srv ap a
+	local p os arch name stage srv ap a sp s
 	require_web
 	mkdir -p "$DIST"
 	rm -f "$DIST"/homelab-rmm-*.zip "$DIST"/homelab-rmm-*.tar.gz
@@ -179,6 +184,15 @@ do_package() {
 			fresh "$a" agents
 			cp "$a" "$stage/agents/"
 		done
+		# the signer ships in the Windows archives only, where it can run
+		if [ "$os" = windows ]; then
+			for sp in $SIGNER_PLATFORMS; do
+				s=$(binname rmm-signer "${sp%/*}" "${sp#*/}")
+				[ -f "$s" ] || die "missing $s (run: tools/build.sh signer)"
+				fresh "$s" signer
+				cp "$s" "$stage/"
+			done
+		fi
 		cp README.md "$stage/"
 		[ -f CHANGELOG.md ] && cp CHANGELOG.md "$stage/"
 		[ -d docs ] && cp -r docs "$stage/docs"
@@ -221,12 +235,13 @@ for target in "$@"; do
 		web)       do_web ;;
 		server)    require_web; build_platforms rmm-server "$SERVER_PLATFORMS" ;;
 		agents)    build_platforms rmm-agent "$AGENT_PLATFORMS" ;;
-		all)       do_web; require_web; build_platforms rmm-server "$SERVER_PLATFORMS"; build_platforms rmm-agent "$AGENT_PLATFORMS" ;;
+		signer)    build_platforms rmm-signer "$SIGNER_PLATFORMS" ;;
+		all)       do_web; require_web; build_platforms rmm-server "$SERVER_PLATFORMS"; build_platforms rmm-agent "$AGENT_PLATFORMS"; build_platforms rmm-signer "$SIGNER_PLATFORMS" ;;
 		test)      do_test ;;
 		package)   do_package ;;
 		checksums) do_checksums ;;
 		clean)     do_clean ;;
-		-h|--help|help) sed -n '2,18p' "$0" ;;
-		*) die "unknown target '$target' (web|server|agents|all|test|package|checksums|clean)" ;;
+		-h|--help|help) sed -n '2,23p' "$0" ;;
+		*) die "unknown target '$target' (web|server|agents|signer|all|test|package|checksums|clean)" ;;
 	esac
 done

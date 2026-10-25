@@ -42,7 +42,7 @@ type hubEvent struct {
 type agentConn struct {
 	id        string
 	hello     protocol.Hello
-	conn      *websocket.Conn
+	tr        agentTransport // the socket or QUIC connection, see transport.go
 	writeMu   sync.Mutex
 	pending   map[string]chan protocol.Envelope  // request id -> reply
 	streams   map[string]func(protocol.Envelope) // request id -> stream sink
@@ -128,32 +128,53 @@ func hashKey(key string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// handleAgentWS is the agent endpoint. Two ways in:
+// credentials are what an agent presents to get in: an enrolled device's key
+// or the token of a first contact. The WebSocket path reads them from HTTP
+// headers and the QUIC path from the auth frame; authenticate treats both the
+// same.
+type credentials struct {
+	key    string
+	hasKey bool
+	token  string
+}
+
+// authenticate checks credentials before any socket or stream is committed to
+// the device. For an enrolled agent it returns the device id; for a valid
+// enrollment token it returns an empty id (the record is created after hello,
+// so it has a hostname). A non-empty refusal is the sentence to send back.
+func (h *Hub) authenticate(c credentials) (agentID, refusal string) {
+	switch {
+	case c.hasKey:
+		id, ok := h.s.db.agentByKey(c.key)
+		if !ok {
+			return "", protocol.ErrUnknownAgentKey
+		}
+		return id, ""
+	case c.token != "":
+		// enrollment is completed after hello so the record has a hostname,
+		// but the token is checked now so a bad one never gets a socket
+		if err := h.s.db.checkEnrollToken(c.token); err != nil {
+			return "", protocol.ErrEnrollmentRefused + err.Error()
+		}
+		return "", ""
+	default:
+		return "", protocol.ErrMissingCredentials
+	}
+}
+
+// handleAgentWS is the WebSocket agent endpoint. Two ways in:
 //   - Authorization: Bearer <agent key>  (an enrolled agent)
 //   - X-Enroll-Token: <token>            (first contact; the reply carries the new id+key)
 func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	ip := h.s.clientIP(r)
-	var agentID string
-	authz := r.Header.Get("Authorization")
-	enroll := r.Header.Get("X-Enroll-Token")
-	switch {
-	case strings.HasPrefix(authz, "Bearer "):
-		key := strings.TrimPrefix(authz, "Bearer ")
-		id, ok := h.s.db.agentByKey(key)
-		if !ok {
-			writeErr(w, http.StatusUnauthorized, "unknown agent key")
-			return
-		}
-		agentID = id
-	case enroll != "":
-		// enrollment is completed after hello so the record has a hostname,
-		// but the token is checked now so a bad one never gets a socket
-		if err := h.s.db.checkEnrollToken(enroll); err != nil {
-			writeErr(w, http.StatusUnauthorized, "enrollment refused: "+err.Error())
-			return
-		}
-	default:
-		writeErr(w, http.StatusUnauthorized, "missing credentials")
+	var creds credentials
+	if authz := r.Header.Get("Authorization"); strings.HasPrefix(authz, "Bearer ") {
+		creds.key, creds.hasKey = strings.TrimPrefix(authz, "Bearer "), true
+	}
+	creds.token = r.Header.Get("X-Enroll-Token")
+	agentID, refusal := h.authenticate(creds)
+	if refusal != "" {
+		writeErr(w, http.StatusUnauthorized, refusal)
 		return
 	}
 
@@ -177,15 +198,28 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var newKey string
-	justEnrolled := agentID == ""
+	id, newKey, justEnrolled, err := h.identify(agentID, creds.token, &hello, ip)
+	if err != nil {
+		conn.WriteJSON(protocol.Envelope{T: "error", Err: protocol.ErrEnrollmentRefused + err.Error()})
+		conn.Close()
+		return
+	}
+	ac := h.newConn(&wsTransport{conn: conn}, id, hello, ip)
+	h.serve(ac, newKey, justEnrolled)
+}
+
+// identify settles who a device is once its hello has arrived: an enrolled
+// agent keeps its id, a first contact is enrolled now. It is the part of the
+// old handleAgentWS that both transports share before they have a connection
+// object, including the audit rows that tell an operator about a re-keyed or
+// duplicated record.
+func (h *Hub) identify(agentID, enrollToken string, hello *protocol.Hello, ip string) (id, newKey string, justEnrolled bool, err error) {
+	justEnrolled = agentID == ""
 	if agentID == "" {
-		en, err := h.s.db.enrollAgent(enroll, hello, ip, h.IsOnline)
+		en, err := h.s.db.enrollAgent(enrollToken, *hello, ip, h.IsOnline)
 		if err != nil {
-			conn.WriteJSON(protocol.Envelope{T: "error", Err: "enrollment refused: " + err.Error()})
-			conn.Close()
 			slog.Warn("enrollment refused", "ip", ip, "host", hello.Hostname, "err", err)
-			return
+			return "", "", false, err
 		}
 		agentID, newKey = en.ID, en.Key
 		switch {
@@ -210,9 +244,13 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	hello.AgentID = agentID
+	return agentID, newKey, justEnrolled, nil
+}
 
+// newConn builds the hub's record of one live connection over tr.
+func (h *Hub) newConn(tr agentTransport, agentID string, hello protocol.Hello, ip string) *agentConn {
 	ac := &agentConn{
-		id: agentID, hello: hello, conn: conn, ip: ip,
+		id: agentID, hello: hello, tr: tr, ip: ip,
 		pending: map[string]chan protocol.Envelope{}, streams: map[string]func(protocol.Envelope){},
 		connected: time.Now(), closed: make(chan struct{}), ingest: make(chan protocol.Envelope, ingestQueue),
 	}
@@ -220,6 +258,15 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	ac.logSize.Store(max(hello.LogSize, 0))
 	ac.logSent.Store(max(hello.LogSize, 0))
 	ac.lastPong.Store(time.Now().UnixNano())
+	tr.bind(ac)
+	return ac
+}
+
+// serve runs an authenticated, identified connection to its end: welcome,
+// registration, the online bookkeeping, the read side, and the teardown. It is
+// the transport-neutral half of the old handleAgentWS.
+func (h *Hub) serve(ac *agentConn, newKey string, justEnrolled bool) {
+	agentID, hello, ip := ac.id, ac.hello, ac.ip
 
 	// welcome: identity (for a new enrollment) + config
 	welcome := map[string]any{"agent_id": agentID, "config": h.s.agentConfig(agentID)}
@@ -227,10 +274,10 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 		welcome["agent_key"] = newKey
 	}
 	if err := ac.send(protocol.Envelope{T: "welcome", D: protocol.Must(welcome)}); err != nil {
-		conn.Close()
+		ac.tr.close()
 		return
 	}
-	conn.SetReadDeadline(time.Time{})
+	ac.tr.welcomed()
 
 	// Replace any stale socket for the same id. The old connection is swapped
 	// out under the lock and closed AFTER releasing it: close() hands the
@@ -250,7 +297,7 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	h.s.db.markOnline(agentID, hello, ip, true)
 	h.s.db.setAgentTrust(agentID, hello.TrustEpoch, hello.TrustHash)
 	h.s.db.setExecutedHead(agentID, hello.ExecutedHead)
-	slog.Info("agent connected", "id", agentID, "host", hello.Hostname, "ip", ip, "version", hello.Version)
+	slog.Info("agent connected", "id", agentID, "host", hello.Hostname, "ip", ip, "version", hello.Version, "transport", ac.transportName())
 	h.broadcast(hubEvent{Kind: "agent_online", AgentID: agentID})
 	h.s.onAgentOnline(agentID)
 	if justEnrolled {
@@ -266,7 +313,7 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 
 	go h.keepalive(ac)
 	go h.ingestLoop(ac)
-	h.readLoop(ac)
+	ac.tr.readLoop()
 
 	// Only the socket that is still the device's current one may declare it
 	// offline. A replaced socket's teardown would otherwise race the new
@@ -294,15 +341,23 @@ func (h *Hub) handleAgentWS(w http.ResponseWriter, r *http.Request) {
 	h.s.sched.automation("agent_offline", agentID, nil)
 }
 
+// keepaliveEvery and keepaliveDead are how often the hub pings a device and
+// how long it tolerates silence before dropping the connection. Variables so a
+// test can shrink them; nothing else writes them.
+var (
+	keepaliveEvery = 30 * time.Second
+	keepaliveDead  = 90 * time.Second
+)
+
 func (h *Hub) keepalive(ac *agentConn) {
-	t := time.NewTicker(30 * time.Second)
+	t := time.NewTicker(keepaliveEvery)
 	defer t.Stop()
 	for {
 		select {
 		case <-ac.closed:
 			return
 		case <-t.C:
-			if time.Since(time.Unix(0, ac.lastPong.Load())) > 90*time.Second {
+			if time.Since(time.Unix(0, ac.lastPong.Load())) > keepaliveDead {
 				slog.Warn("agent unresponsive, dropping", "id", ac.id)
 				ac.close()
 				return
@@ -312,60 +367,71 @@ func (h *Hub) keepalive(ac *agentConn) {
 	}
 }
 
-func (h *Hub) readLoop(ac *agentConn) {
-	for {
-		_, data, err := ac.conn.ReadMessage()
-		if err != nil {
+// handleFrame is the transport-neutral body of the read side: every frame an
+// agent sends, from whichever stream or socket it arrived on, lands here. A
+// transport may call it from several goroutines at once (QUIC runs one pump
+// per stream), so it touches shared state only under the locks it always did.
+func (ac *agentConn) handleFrame(env protocol.Envelope) {
+	if env.Log > 0 {
+		ac.noteLogSize(env.Log)
+		if env.Err != "" && strings.Contains(env.Err, "log proof") {
+			// The device refused a proof, so it did not move to the head
+			// that was sent: start the next proof from what it holds.
+			ac.logSent.Store(env.Log)
+		}
+	}
+	switch env.T {
+	case protocol.TypePong:
+		// Liveness tracks PONGS, not traffic: an agent that floods frames
+		// but never answers a ping is exactly the one keepalive must drop.
+		ac.lastPong.Store(time.Now().UnixNano())
+	case protocol.TypeReply:
+		if env.ID == "ka" {
 			return
 		}
-		var env protocol.Envelope
-		if err := json.Unmarshal(data, &env); err != nil {
-			slog.Warn("bad frame from agent", "id", ac.id, "err", err)
-			continue
+		ac.pmu.Lock()
+		ch := ac.pending[env.ID]
+		delete(ac.pending, env.ID)
+		sink := ac.streams[env.ID]
+		delete(ac.streams, env.ID)
+		ac.pmu.Unlock()
+		if ch != nil {
+			ch <- env
+		} else if sink != nil {
+			sink(env)
 		}
-		if env.Log > 0 {
-			ac.noteLogSize(env.Log)
-			if env.Err != "" && strings.Contains(env.Err, "log proof") {
-				// The device refused a proof, so it did not move to the head
-				// that was sent: start the next proof from what it holds.
-				ac.logSent.Store(env.Log)
-			}
+	case protocol.TypeStream:
+		ac.pmu.Lock()
+		sink := ac.streams[env.ID]
+		ac.pmu.Unlock()
+		if sink != nil {
+			sink(env)
 		}
-		switch env.T {
-		case protocol.TypePong:
-			// Liveness tracks PONGS, not traffic: an agent that floods frames
-			// but never answers a ping is exactly the one keepalive must drop.
-			ac.lastPong.Store(time.Now().UnixNano())
-		case protocol.TypeReply:
-			if env.ID == "ka" {
-				continue
-			}
-			ac.pmu.Lock()
-			ch := ac.pending[env.ID]
-			delete(ac.pending, env.ID)
-			sink := ac.streams[env.ID]
-			delete(ac.streams, env.ID)
-			ac.pmu.Unlock()
-			if ch != nil {
-				ch <- env
-			} else if sink != nil {
-				sink(env)
-			}
-		case protocol.TypeStream:
-			ac.pmu.Lock()
-			sink := ac.streams[env.ID]
-			ac.pmu.Unlock()
-			if sink != nil {
-				sink(env)
-			}
-		case protocol.TypeInventory, protocol.TypeMetrics, protocol.TypeEvent, protocol.TypeBaseline:
-			// A baseline report is not droppable like a metrics sample: it is
-			// the only record of a pass that may have run while the device was
-			// offline, so it follows the inventory path (push back, then warn).
-			ac.enqueue(env)
-		default:
-			slog.Debug("unhandled agent frame", "type", env.T)
-		}
+	case protocol.TypeInventory, protocol.TypeMetrics, protocol.TypeEvent, protocol.TypeBaseline:
+		// A baseline report is not droppable like a metrics sample: it is
+		// the only record of a pass that may have run while the device was
+		// offline, so it follows the inventory path (push back, then warn).
+		ac.enqueue(env)
+	default:
+		slog.Debug("unhandled agent frame", "type", env.T)
+	}
+}
+
+// failRequest ends a request that can no longer be answered, such as a QUIC
+// request stream the agent finished without sending its final reply. It is a
+// no-op when the request already completed, so the stream's normal end after a
+// reply is harmless.
+func (ac *agentConn) failRequest(id, msg string) {
+	ac.pmu.Lock()
+	ch := ac.pending[id]
+	delete(ac.pending, id)
+	sink := ac.streams[id]
+	delete(ac.streams, id)
+	ac.pmu.Unlock()
+	if ch != nil {
+		ch <- protocol.Envelope{ID: id, Err: msg}
+	} else if sink != nil {
+		sink(protocol.Envelope{T: protocol.TypeReply, ID: id, Err: msg})
 	}
 }
 
@@ -528,6 +594,10 @@ func (ac *agentConn) withLogProof(env protocol.Envelope) (protocol.Envelope, err
 	return env, nil
 }
 
+// send writes env on the control path: the one ordered channel that carries
+// everything not tied to a request id (the welcome, pings, config pushes and
+// fire-and-forget notices). withLogProof runs here for every frame, so a
+// signed notice carries its proof no matter which transport sends it.
 func (ac *agentConn) send(env protocol.Envelope) error {
 	ac.writeMu.Lock()
 	defer ac.writeMu.Unlock()
@@ -535,24 +605,58 @@ func (ac *agentConn) send(env protocol.Envelope) error {
 	if err != nil {
 		return err
 	}
-	ac.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	return ac.conn.WriteJSON(env)
+	return ac.tr.writeControl(env)
 }
 
-// closeGraceful tells the agent why the socket is going away before dropping
-// it, so a planned restart shows as a clean close in agent.log instead of a
-// 1006 fault that costs the device a reconnect backoff.
+// sendRequest writes a request that expects an answer and returns the stream
+// it travels on (nil on a transport with a single socket). The write lock is
+// held across the proof and the write, so proofs are made and put on the wire
+// in one order.
+func (ac *agentConn) sendRequest(env protocol.Envelope) (requestStream, error) {
+	ac.writeMu.Lock()
+	defer ac.writeMu.Unlock()
+	prev := ac.logSent.Load()
+	env, err := ac.withLogProof(env)
+	if err != nil {
+		return nil, err
+	}
+	rs, err := ac.tr.openRequest(env)
+	if err != nil {
+		// On QUIC a failed open leaves the connection alive and the agent never
+		// saw this proof, so the next one must be made from the head the agent
+		// does hold. A concurrent reset from an agent refusal wins over this.
+		if cur := ac.logSent.Load(); cur != prev {
+			ac.logSent.CompareAndSwap(cur, prev)
+		}
+		return nil, err
+	}
+	return rs, nil
+}
+
+// transportName is "websocket" or "quic", and empty for a bare test record.
+func (ac *agentConn) transportName() string {
+	if ac.tr == nil {
+		return ""
+	}
+	return ac.tr.name()
+}
+
+// closeGraceful tells the agent why the connection is going away before
+// dropping it, so a planned restart shows as a clean close in agent.log
+// instead of a fault that costs the device a reconnect backoff.
 func (ac *agentConn) closeGraceful() {
-	ac.conn.WriteControl(websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseServiceRestart, "server shutting down"),
-		time.Now().Add(2*time.Second))
+	if ac.tr != nil {
+		ac.tr.closeGraceful()
+	}
 	ac.close()
 }
 
 func (ac *agentConn) close() {
 	ac.closeOnce.Do(func() {
 		close(ac.closed)
-		ac.conn.Close()
+		if ac.tr != nil {
+			ac.tr.close()
+		}
 		ac.pmu.Lock()
 		pending, streams := ac.pending, ac.streams
 		ac.pending, ac.streams = map[string]chan protocol.Envelope{}, map[string]func(protocol.Envelope){}
@@ -621,7 +725,8 @@ func (h *Hub) RequestA(ctx context.Context, agentID, typ string, payload any, ou
 	if payload != nil {
 		d = protocol.Must(payload)
 	}
-	if err := ac.send(protocol.Envelope{T: typ, ID: id, D: d, A: auth}); err != nil {
+	rs, err := ac.sendRequest(protocol.Envelope{T: typ, ID: id, D: d, A: auth})
+	if err != nil {
 		ac.pmu.Lock()
 		delete(ac.pending, id)
 		ac.pmu.Unlock()
@@ -632,6 +737,11 @@ func (h *Hub) RequestA(ctx context.Context, agentID, typ string, payload any, ou
 		ac.pmu.Lock()
 		delete(ac.pending, id)
 		ac.pmu.Unlock()
+		if rs != nil {
+			// Nobody is waiting any more: free the stream (QUIC) so a late
+			// reply from the agent has nowhere to go.
+			rs.abort()
+		}
 		return ctx.Err()
 	case env := <-ch:
 		if env.Err != "" {
@@ -666,7 +776,8 @@ func (h *Hub) StreamA(agentID, typ string, payload any, sink func(protocol.Envel
 	if payload != nil {
 		d = protocol.Must(payload)
 	}
-	if err := ac.send(protocol.Envelope{T: typ, ID: id, D: d, A: auth}); err != nil {
+	rs, err := ac.sendRequest(protocol.Envelope{T: typ, ID: id, D: d, A: auth})
+	if err != nil {
 		ac.pmu.Lock()
 		delete(ac.streams, id)
 		ac.pmu.Unlock()
@@ -676,6 +787,11 @@ func (h *Hub) StreamA(agentID, typ string, payload any, sink func(protocol.Envel
 		ac.pmu.Lock()
 		delete(ac.streams, id)
 		ac.pmu.Unlock()
+		if rs != nil {
+			// Nobody listens any more: free the QUIC stream so a wedged
+			// script or shell does not keep one of the agent's stream slots.
+			rs.abort()
+		}
 	}
 	return id, cancel, nil
 }

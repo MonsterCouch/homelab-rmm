@@ -67,8 +67,12 @@ type PatchPolicy struct {
 	InstallSchedule string  `json:"install_schedule"`
 	Mode            string  `json:"mode"`
 	Reboot          string  `json:"reboot"`
-	Enabled         bool    `json:"enabled"`
-	CreatedAt       int64   `json:"created_at"`
+	// Repair is "off" (the default) or "auto": with auto, a scan or install
+	// that reports a servicing error code starts one servicing repair on the
+	// device (see servicing.go).
+	Repair    string `json:"repair"`
+	Enabled   bool   `json:"enabled"`
+	CreatedAt int64  `json:"created_at"`
 }
 
 func (d *DB) ListPatches(agentID, status string, limit int64) ([]Patch, error) {
@@ -121,7 +125,7 @@ func patchCategories(c []string) string {
 }
 
 func (d *DB) ListPatchPolicies() ([]PatchPolicy, error) {
-	rows, err := d.Query(`SELECT id, name, targets, scan_schedule, install_schedule, mode, reboot, enabled, created_at FROM patch_policies ORDER BY name`)
+	rows, err := d.Query(`SELECT id, name, targets, scan_schedule, install_schedule, mode, reboot, repair, enabled, created_at FROM patch_policies ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +134,7 @@ func (d *DB) ListPatchPolicies() ([]PatchPolicy, error) {
 	for rows.Next() {
 		var p PatchPolicy
 		var t string
-		if err := rows.Scan(&p.ID, &p.Name, &t, &p.ScanSchedule, &p.InstallSchedule, &p.Mode, &p.Reboot, &p.Enabled, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &t, &p.ScanSchedule, &p.InstallSchedule, &p.Mode, &p.Reboot, &p.Repair, &p.Enabled, &p.CreatedAt); err != nil {
 			return nil, err
 		}
 		json.Unmarshal([]byte(t), &p.Targets)
@@ -262,6 +266,9 @@ func (s *Server) patchScanLocked(agentID string) error {
 	s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,?)`, agentID, ts, "patch", scanMsg, jsonText(map[string]any{"updates_found": missingCount}))
 	s.hub.broadcast(hubEvent{Kind: "event", AgentID: agentID, Data: map[string]any{"ts": ts, "kind": "patch", "message": scanMsg}})
 	s.hub.broadcast(hubEvent{Kind: "patches", AgentID: agentID})
+	// A scan that failed on a damaged update stack is what an automatic
+	// servicing repair reacts to.
+	s.autoRepairAfter(agentID, res.Error)
 	return nil
 }
 
@@ -360,6 +367,7 @@ func (s *Server) patchInstallLocked(agentID string, ids []string, reboot bool, b
 	}))
 	s.hub.broadcast(hubEvent{Kind: "event", AgentID: agentID, Data: map[string]any{"ts": ts, "kind": "patch", "message": installMsg}})
 	s.hub.broadcast(hubEvent{Kind: "patches", AgentID: agentID})
+	s.autoRepairAfterInstall(agentID, failedReasons(res.Failed))
 	return &res, nil
 }
 
@@ -657,17 +665,32 @@ func (s *Server) savePatchPolicy(w http.ResponseWriter, r *http.Request, id int6
 	if p.Reboot == "" {
 		p.Reboot = "never"
 	}
+	switch p.Repair {
+	case "off", "auto":
+	case "":
+		// A client that predates the field must not switch repairs off (or
+		// on) by leaving it out: an update keeps what the policy has.
+		p.Repair = "off"
+		if id != 0 {
+			if existing, err := s.db.GetPatchPolicy(id); err == nil && existing.Repair != "" {
+				p.Repair = existing.Repair
+			}
+		}
+	default:
+		writeErr(w, 400, `repair must be "off" or "auto"`)
+		return
+	}
 	var err error
 	if id == 0 {
 		var res interface{ LastInsertId() (int64, error) }
-		res, err = s.db.Exec(`INSERT INTO patch_policies(name, targets, scan_schedule, install_schedule, mode, reboot, enabled, created_at) VALUES(?,?,?,?,?,?,?,?)`,
-			p.Name, jsonText(p.Targets), p.ScanSchedule, p.InstallSchedule, p.Mode, p.Reboot, p.Enabled, now())
+		res, err = s.db.Exec(`INSERT INTO patch_policies(name, targets, scan_schedule, install_schedule, mode, reboot, repair, enabled, created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+			p.Name, jsonText(p.Targets), p.ScanSchedule, p.InstallSchedule, p.Mode, p.Reboot, p.Repair, p.Enabled, now())
 		if err == nil {
 			id, _ = res.LastInsertId()
 		}
 	} else {
-		_, err = s.db.Exec(`UPDATE patch_policies SET name=?, targets=?, scan_schedule=?, install_schedule=?, mode=?, reboot=?, enabled=? WHERE id=?`,
-			p.Name, jsonText(p.Targets), p.ScanSchedule, p.InstallSchedule, p.Mode, p.Reboot, p.Enabled, id)
+		_, err = s.db.Exec(`UPDATE patch_policies SET name=?, targets=?, scan_schedule=?, install_schedule=?, mode=?, reboot=?, repair=?, enabled=? WHERE id=?`,
+			p.Name, jsonText(p.Targets), p.ScanSchedule, p.InstallSchedule, p.Mode, p.Reboot, p.Repair, p.Enabled, id)
 	}
 	if err != nil {
 		fail(w, err)

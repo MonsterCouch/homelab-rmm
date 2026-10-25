@@ -173,6 +173,11 @@ export function DeviceDetail() {
           </Link>
           <span className="faint">/</span>
           <OnlineDot online={a.online} />
+          {a.online && a.transport && (
+            <span className="muted small" title="Transport of the agent connection">
+              {a.transport === 'quic' ? 'QUIC' : 'WebSocket'}
+            </span>
+          )}
           <h1>{a.display_name}</h1>
           {/* Both the OS label and the last IP are on the Overview tab; on a
               phone they cost a row of a head that repeats on all twelve
