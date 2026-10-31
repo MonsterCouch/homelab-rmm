@@ -1214,7 +1214,33 @@ export interface UpdateBatchResult {
   failed: { id: string; name?: string; error: string }[];
   /** devices left out of the update because they already run this build */
   up_to_date: number;
+  /** what each device that confirmed the update said about its download; absent from a server that predates it */
+  results?: AgentUpdateResult[];
+  /** devices that confirmed the update, by where they downloaded it; absent from a server that predates it */
+  by_source?: UpdateSourceCounts;
   message: string;
+}
+
+/** A device's answer to an update: where its bytes came from. An agent that predates it leaves source empty. */
+export interface AgentUpdateResult {
+  /** only in a batch reply */
+  id?: string;
+  name?: string;
+  /** "origin", "cache <leader> over h3|https", "origin (the cache failed: ...)", or empty */
+  source: string;
+  bytes?: number;
+  resumed_chunks?: number;
+  version?: string;
+}
+
+/** Devices per download source in one update batch. */
+export interface UpdateSourceCounts {
+  cache: number;
+  origin: number;
+  /** from the server because the subnet cache failed */
+  origin_cache_failed: number;
+  /** no source reported: the device already ran the build, or its agent predates the reply */
+  unreported: number;
 }
 
 // ---- Phase 3: operator-signed actions ----

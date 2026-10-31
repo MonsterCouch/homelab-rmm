@@ -394,9 +394,8 @@ func (s *Server) handleDispatchAgentUpdate(w http.ResponseWriter, r *http.Reques
 		Run: func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth) {
 			// Detached from the request like the batch: a browser that closes
 			// must not cancel a dispatch that has already been sent.
-			ctx, cancel := context.WithTimeout(context.Background(), fleetUpdateReplyWindow)
-			defer cancel()
-			if err := s.hub.RequestA(ctx, id, protocol.ReqAgentUpdate, req, nil, auth); err != nil {
+			res, err := s.sendUpdate(id, agentLabel(a), req, auth, fleetUpdateReplyWindow)
+			if err != nil {
 				switch {
 				case errors.Is(err, context.DeadlineExceeded):
 					// The device answers once the binary is downloaded and
@@ -413,9 +412,16 @@ func (s *Server) handleDispatchAgentUpdate(w http.ResponseWriter, r *http.Reques
 				}
 				return
 			}
+			// An agent that predates the reply answers with no body, so res
+			// is empty and the update still counts as done. sendUpdate has
+			// already put the answer on the device's event list.
+			s.audit(r, "agent.self_update", id, map[string]any{
+				"version": Version, "sha256": req.SHA256, "source": res.Source, "bytes": res.Bytes, "resumed_chunks": res.ResumedChunks,
+			})
 			writeJSON(w, http.StatusOK, map[string]any{
 				"ok":      true,
 				"message": fmt.Sprintf("Update command sent to agent %s (%s)", a.DisplayName, Version),
+				"result":  res,
 			})
 		},
 	})
@@ -505,11 +511,15 @@ func (s *Server) handleDispatchAllAgentsUpdate(w http.ResponseWriter, r *http.Re
 			g.AgentIDs = append(g.AgentIDs, a.ID)
 			continue
 		}
-		go func(agentID string, uReq protocol.AgentUpdate) {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		go func(agentID, label string, uReq protocol.AgentUpdate) {
+			// The reply is not waited for here, so the source lands on the
+			// device's event list and not in this handler's answer. The
+			// request stays open for lateUpdateWindow because a download that
+			// takes longer than a few seconds is the normal case.
+			ctx, cancel := context.WithTimeout(context.Background(), lateUpdateWindow)
 			defer cancel()
-			_ = s.hub.Request(ctx, agentID, protocol.ReqAgentUpdate, uReq, nil)
-		}(a.ID, *req)
+			_, _ = s.requestUpdate(ctx, agentID, label, uReq, nil)
+		}(a.ID, agentLabel(a), *req)
 		count++
 	}
 
@@ -593,6 +603,131 @@ type fleetUpdateFailure struct {
 	ID    string `json:"id"`
 	Name  string `json:"name,omitempty"`
 	Error string `json:"error"`
+}
+
+// fleetUpdateResult is what a device that confirmed a batch update said about
+// its download. The embedded reply is empty for an agent that predates it.
+type fleetUpdateResult struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+	protocol.AgentUpdateResult
+}
+
+// Where an update's bytes came from, as the batch reply counts it.
+const (
+	sourceKindCache      = "cache"
+	sourceKindOrigin     = "origin"
+	sourceKindCacheFail  = "origin_cache_failed"
+	sourceKindUnreported = "unreported"
+)
+
+// updateSourceKind sorts the free-text source an agent reports (see
+// selfUpdateSource in the agent) into the buckets the console counts. A device
+// that already ran the build downloaded nothing and reports no source, the
+// same as an agent that predates the reply, so both are "unreported".
+func updateSourceKind(source string) string {
+	switch {
+	case source == "":
+		return sourceKindUnreported
+	case strings.HasPrefix(source, "cache "):
+		return sourceKindCache
+	case strings.HasPrefix(source, "origin ("):
+		return sourceKindCacheFail
+	default:
+		return sourceKindOrigin
+	}
+}
+
+// countBySource counts the devices of a batch per source kind. Every kind is
+// present, so the console can read the counts without checking for gaps.
+func countBySource(results []fleetUpdateResult) map[string]int {
+	out := map[string]int{sourceKindCache: 0, sourceKindOrigin: 0, sourceKindCacheFail: 0, sourceKindUnreported: 0}
+	for _, r := range results {
+		out[updateSourceKind(r.Source)]++
+	}
+	return out
+}
+
+// lateUpdateWindow is how long a dispatched update stays open for its answer
+// after the handler has stopped waiting, so a download that outlasts
+// fleetUpdateReplyWindow still lands on the device's event list. A variable so
+// that a test need not wait it out.
+var lateUpdateWindow = 15 * time.Minute
+
+// requestUpdate sends agent.update to one device and, when the device answers,
+// records the answer. The caller owns ctx.
+func (s *Server) requestUpdate(ctx context.Context, id, label string, req protocol.AgentUpdate, auth *protocol.ActionAuth) (protocol.AgentUpdateResult, error) {
+	var res protocol.AgentUpdateResult
+	if err := s.hub.RequestA(ctx, id, protocol.ReqAgentUpdate, req, &res, auth); err != nil {
+		return res, err
+	}
+	s.recordAgentUpdate(id, label, res)
+	return res, nil
+}
+
+// sendUpdate is requestUpdate for a handler that waits at most window for the
+// answer. After that it returns context.DeadlineExceeded, but the request
+// stays open for lateUpdateWindow and the answer is still recorded when it
+// arrives.
+func (s *Server) sendUpdate(id, label string, req protocol.AgentUpdate, auth *protocol.ActionAuth, window time.Duration) (protocol.AgentUpdateResult, error) {
+	type answer struct {
+		res protocol.AgentUpdateResult
+		err error
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), max(lateUpdateWindow, window))
+	ch := make(chan answer, 1)
+	go func() {
+		defer cancel()
+		res, err := s.requestUpdate(ctx, id, label, req, auth)
+		ch <- answer{res, err}
+	}()
+	timer := time.NewTimer(window)
+	defer timer.Stop()
+	select {
+	case a := <-ch:
+		return a.res, a.err
+	case <-timer.C:
+		return protocol.AgentUpdateResult{}, context.DeadlineExceeded
+	}
+}
+
+// updateEventMu serialises the event inserts of a fleet update, which would
+// otherwise be thousands of concurrent writers on one database.
+var updateEventMu sync.Mutex
+
+// updateEventMessage words the event for a device's answer. A source means
+// the device downloaded and staged the build. An empty one means it reported
+// none: it already ran this build and skipped the download, it is an older
+// agent, or it updated by another route, so the event does not claim a staging.
+func updateEventMessage(label string, res protocol.AgentUpdateResult) string {
+	if res.Source == "" {
+		msg := "Agent update accepted by " + label
+		if res.Version != "" {
+			msg += " (" + res.Version + ")"
+		}
+		return msg + "; no download source reported (it may already run this build, or be an older agent)"
+	}
+	msg := "Agent update staged on " + label
+	if res.Version != "" {
+		msg += " (" + res.Version + ")"
+	}
+	return msg + "; downloaded from " + res.Source
+}
+
+// recordAgentUpdate writes the device's answer to an update on its event list,
+// where the console shows it. It is written even when the source is empty, so
+// the list says the device accepted the update.
+func (s *Server) recordAgentUpdate(agentID, label string, res protocol.AgentUpdateResult) {
+	msg := updateEventMessage(label, res)
+	fields := jsonText(map[string]any{
+		"source": res.Source, "source_kind": updateSourceKind(res.Source), "bytes": res.Bytes, "resumed_chunks": res.ResumedChunks, "version": res.Version,
+	})
+	updateEventMu.Lock()
+	defer updateEventMu.Unlock()
+	if _, err := s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,?)`,
+		agentID, now(), "update", msg, fields); err != nil {
+		slog.Warn("record agent update event", "agent_id", agentID, "err", err)
+	}
 }
 
 // Most failures one fleet.update audit entry names, and the longest reason it
@@ -752,8 +887,6 @@ func (s *Server) handleDispatchAgentBatchUpdate(w http.ResponseWriter, r *http.R
 			// half-way would otherwise cancel every dispatch still in flight and
 			// leave the update half sent, and the operator is waiting for the
 			// answer anyway.
-			ctx, cancel := context.WithTimeout(context.Background(), fleetUpdateReplyWindow)
-			defer cancel()
 			var (
 				mu         sync.Mutex
 				wg         sync.WaitGroup
@@ -761,17 +894,19 @@ func (s *Server) handleDispatchAgentBatchUpdate(w http.ResponseWriter, r *http.R
 				installing int
 				offline    int
 				failed     = []fleetUpdateFailure{}
+				results    = []fleetUpdateResult{}
 			)
 			for _, id := range ids {
 				wg.Add(1)
 				go func(id string) {
 					defer wg.Done()
-					err := s.hub.RequestA(ctx, id, protocol.ReqAgentUpdate, req, nil, auth)
+					res, err := s.sendUpdate(id, labels[id], req, auth, fleetUpdateReplyWindow)
 					mu.Lock()
 					defer mu.Unlock()
 					switch {
 					case err == nil:
 						accepted++
+						results = append(results, fleetUpdateResult{ID: id, Name: labels[id], AgentUpdateResult: res})
 					case errors.Is(err, ErrAgentOffline):
 						offline++
 					case errors.Is(err, context.DeadlineExceeded):
@@ -786,13 +921,15 @@ func (s *Server) handleDispatchAgentBatchUpdate(w http.ResponseWriter, r *http.R
 			}
 			wg.Wait()
 			sort.Slice(failed, func(i, j int) bool { return failed[i].ID < failed[j].ID })
+			sort.Slice(results, func(i, j int) bool { return results[i].ID < results[j].ID })
+			bySource := countBySource(results)
 
 			// On record before the answer goes out, as the other handlers that
 			// reach devices do. r speaks for the operator who asked for the
 			// update, at their address, whoever completed the signatures.
 			details := map[string]any{
 				"targets": len(ids), "os": fam, "arch": arch, "version": Version, "sha256": req.SHA256,
-				"accepted": accepted, "installing": installing, "offline": offline, "failed": len(failed), "up_to_date": upToDate,
+				"accepted": accepted, "installing": installing, "offline": offline, "failed": len(failed), "up_to_date": upToDate, "by_source": bySource,
 			}
 			// Who failed and why is kept the way the other handlers keep a
 			// refusal, so the log can still answer it after the toast is gone.
@@ -813,6 +950,8 @@ func (s *Server) handleDispatchAgentBatchUpdate(w http.ResponseWriter, r *http.R
 				"installing":    installing,
 				"offline":       offline,
 				"failed":        failed,
+				"results":       results,
+				"by_source":     bySource,
 				"up_to_date":    upToDate,
 				"message":       fleetUpdateMessage(accepted, installing, offline, len(failed)),
 			})

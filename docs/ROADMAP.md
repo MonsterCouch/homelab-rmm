@@ -43,7 +43,7 @@ flowchart TD
 - [x] **Secret In-Memory Protection & Output Redaction:**
   - Real-time stream redactor on stdout/stderr streams sanitizing Bearer tokens, key-value secrets (`password=...`), and PEM private keys into `[REDACTED]`.
 
-### Phase 2: Remote Control & Streaming Overhaul *(Completed, Linux Wayland capture partial)*
+### Phase 2: Remote Control & Streaming Overhaul *(Completed, Linux Wayland capture unverified on a real compositor)*
 Plan: [`docs/plans/2026-10-01-phase2-remote-desktop-webrtc.md`](plans/2026-10-01-phase2-remote-desktop-webrtc.md). Wire protocol: [`docs/DESKTOP-PROTOCOL.md`](DESKTOP-PROTOCOL.md).
 - [x] **DirectX (DXGI) Desktop Duplication:**
   - `IDXGIOutputDuplication` GPU capture with hybrid-GPU adapter matching, driver dirty/move rects and hardware cursor compositing; automatic GDI fallback (`internal/agent/desktop/capture_dxgi_windows.go`).
@@ -54,9 +54,11 @@ Plan: [`docs/plans/2026-10-01-phase2-remote-desktop-webrtc.md`](plans/2026-10-01
 - [x] **Administrative Backstage Mode:**
   - Windows `CreateDesktopW` virtual desktop isolation on `winsta0`, off-screen `PrintWindow` compositing and `PostMessageW` input (never `GetDC(NULL)` or `SendInput`).
   - Enables technicians to perform interactive GUI and shell maintenance without taking over the logged-in user's monitor.
-- [ ] **Linux Screen Streaming Modernization** *(partial)*:
-  - Done: `/dev/uinput` input injection and the XDG ScreenCast portal negotiation with a persisted restore token.
-  - Open: PipeWire frame ingestion needs a PipeWire client (libpipewire, i.e. CGO), so Wayland sessions still capture through the X11 / screenshot-portal path.
+- [x] **Linux Screen Streaming Modernization** *(implemented, not verified against a real compositor)*:
+  - `/dev/uinput` input injection and the XDG ScreenCast portal negotiation with a persisted restore token.
+  - PipeWire frame ingestion is a pure Go client (no libpipewire, no CGO): `internal/agent/desktop/pipewire/pod` (SPA POD codec), `proto` (native protocol over the portal's fd) and `stream` (a video input stream as a client-node). Details: `docs/plans/2026-10-25-loose-ends.md`.
+  - **Unverified.** It was built on Windows and tested only against a fake server and hand-derived byte vectors; no PipeWire daemon, portal or compositor has run it. The `epoll`, `eventfd` and `mmap` code only compiles. The biggest open question is whether the portal's restricted connection accepts the client-node and the session manager links it to the portal node.
+  - **First check:** on a GNOME or KDE Wayland session, run the agent with `RMM_DEBUG=1` and open a remote desktop session. `desktop: Wayland capture uses PipeWire` followed by live frames is a pass. `desktop: PipeWire capture unavailable` or `... failed; falling back to the Screenshot portal` names the reason in its `err` field; keep that line. `RMM_WAYLAND_PORTAL=0` forces the old path. See `docs/OPERATIONS.md`.
 
 ### Phase 3: Signed Actions & Tamper-Evident Audit *(Completed)*
 Plan: [`docs/plans/2026-10-06-phase3-signed-actions.md`](plans/2026-10-06-phase3-signed-actions.md). Re-scoped on 2026-10-06: browser WebAuthn signing first and an out-of-band signer later; a local Merkle log instead of Sigstore Rekor; QUIC delivered last as an agent-only transport.
@@ -76,7 +78,7 @@ Plans: [`4A`](plans/2026-10-24-phase4a-telemetry-store.md), [`4B`](plans/2026-10
   - The server assigns the roles instead of the agents electing them. It already holds every device's LAN addresses and online state, and a multicast election would add a discovery protocol, a second trust problem and a failure mode on networks that block multicast. One leader per organization and subnet, re-assigned every 60 s and on every online/offline event.
   - The leader keeps a content-addressable store (2 MiB chunks, each verified against an index) and serves it over HTTPS and HTTP/3 behind a daily HMAC token and a pinned certificate. Members verify the whole file against the SHA-256 the server named and fall back to the origin. Today it carries the agent binary through `selfUpdate`. The chunks are checked against an index the leader serves, not a Merkle tree; the whole-file hash is what the trust rests on.
   - Windows updates and winget downloads are out of scope: they come from Microsoft's CDN, where Delivery Optimization already peers on the LAN.
-  - The settings switch is global, not per organization; the update source reaches the agent log but not yet the console (`update.go` discards the reply).
+  - The settings switch is global, not per organization; the update source reaches the console: the agent's `agent.update` reply is recorded on the device's activity list and the audit row, and fleet batches count devices by source (devices updated through unsigned `update-all` are not counted).
 - [x] **4C Autonomous Windows Servicing Repair:**
   - `servicing.repair` is a signed `ClassAction` running `dism_restore`, `sfc`, `reset_components`, `add_package` and `rescan` in canonical order, each hidden, timed out and tailed. `reset_components` renames `SoftwareDistribution` and `catroot2` instead of deleting them.
   - `patch_policies.repair = auto` starts one repair per device per 24 hours when a scan or install carries one of the known servicing codes, under a standing approval unit (purpose `repair`) that binds the steps and the reboot mode and never covers a package. Records, audit rows and `event` alerts included; the device page can run it by hand.

@@ -268,7 +268,7 @@ See `routes()` in `internal/server/api.go`. Highlights:
   where `dispatched_to`, `accepted`, `installing` and `offline` count devices: `accepted` have
   downloaded and checked the binary, `installing` did not reply within 20 seconds (a device replies
   only once the binary is staged), `offline` were not connected, and `dispatched_to` is `accepted`
-  plus `installing`. `failed` lists, with the device's name, the devices that answered with an error
+  plus `installing`. `results` has one entry per device that confirmed, `{id, name, source, bytes, resumed_chunks, version}`, and `by_source` counts them as `cache`, `origin`, `origin_cache_failed` and `unreported` (an agent too old to send the reply is still accepted; its source is empty). Both are also recorded as `update` events on each device, and `by_source` is in the `fleet.update` audit details. `failed` lists, with the device's name, the devices that answered with an error
   or could not be sent the request, and the `message` names them as devices that did not take the
   update, never as unreachable (that word is for `offline`). `signed` says whether the update went
   out under a signature: it is false for an organization that does not sign actions, for an operator
@@ -279,7 +279,10 @@ See `routes()` in `internal/server/api.go`. Highlights:
   Signed actions),
   `POST /api/agents/{id}/update` (dispatch update to specific agent; waits as long as `update-batch`
   does. A device still downloading and checking the binary answers 200
-  `{ok: true, installing: true, message}` and restarts on its own when done, an offline device 409,
+  `{ok: true, installing: true, message, result}`, where `result` is the agent's
+  `{source, bytes, resumed_chunks, version}` (`source` is `origin`, `cache <leader> over h3|https`, or
+  `origin (the cache failed: reason)`, empty from an agent too old to report it; the same fields are
+  recorded as an `update` event on the device and in the `agent.self_update` audit row) and restarts on its own when done, an offline device 409,
   any other error 400 with the device's reason. A device that already runs the build, by the digest
   it reported at its last update-check (recorded for 24 hours), answers 200
   `{ok: true, up_to_date: true, message}` before any signature is asked for, unless `?force=1`),

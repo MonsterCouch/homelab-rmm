@@ -76,6 +76,13 @@ func selfUpdate(ctx context.Context, cfg *Config, req protocol.AgentUpdate, ipc 
 // ("cache <leader id> over h3", "origin", ...; "" when nothing was
 // downloaded), which the agent.update reply carries to the operator.
 func selfUpdateSource(ctx context.Context, cfg *Config, req protocol.AgentUpdate, ipc ...*supervisor.IPCClient) (string, error) {
+	res, err := selfUpdateResult(ctx, cfg, req, ipc...)
+	return res.Source, err
+}
+
+// selfUpdateResult is selfUpdate that returns the whole agent.update reply:
+// the source, the bytes downloaded and the chunks a retry resumed.
+func selfUpdateResult(ctx context.Context, cfg *Config, req protocol.AgentUpdate, ipc ...*supervisor.IPCClient) (protocol.AgentUpdateResult, error) {
 	var client *supervisor.IPCClient
 	if len(ipc) > 0 && ipc[0] != nil {
 		client = ipc[0]
@@ -89,15 +96,16 @@ func ApplyStagedUpdate(ctx context.Context, cfg *Config, req protocol.AgentUpdat
 	return err
 }
 
-func applyStagedUpdate(ctx context.Context, cfg *Config, req protocol.AgentUpdate, ipc *supervisor.IPCClient) (string, error) {
+func applyStagedUpdate(ctx context.Context, cfg *Config, req protocol.AgentUpdate, ipc *supervisor.IPCClient) (protocol.AgentUpdateResult, error) {
+	none := protocol.AgentUpdateResult{Version: req.Version}
 	// Pre-flight check: SHA-256 must be exactly 64 hex characters
 	if !sha256HexRE.MatchString(req.SHA256) {
-		return "", errors.New("agent update: sha256 must be 64 hex characters")
+		return none, errors.New("agent update: sha256 must be 64 hex characters")
 	}
 
 	// Pre-flight check: URL scheme and server trust boundaries
 	if err := checkUpdateURL(cfg.ServerURL, req.URL); err != nil {
-		return "", err
+		return none, err
 	}
 
 	// A push of the build this device already runs has nothing to install, and
@@ -108,20 +116,20 @@ func applyStagedUpdate(ctx context.Context, cfg *Config, req protocol.AgentUpdat
 	// this skips no verification.
 	if cur := currentBinarySHA256(); cur != "" && strings.EqualFold(cur, req.SHA256) {
 		slog.Info("agent update skipped: this device already runs that build", "sha256", req.SHA256, "version", req.Version)
-		return "", nil
+		return none, nil
 	}
 
 	// Standalone fallback handling
 	if ipc == nil {
 		if os.Getenv("RMM_ALLOW_LEGACY_UPDATE") == "1" {
 			slog.Warn("supervisor IPC not available, falling back to legacy in-place update")
-			return "", doLegacySelfUpdate(ctx, cfg, req.URL, req.SHA256)
+			return none, doLegacySelfUpdate(ctx, cfg, req.URL, req.SHA256)
 		}
 		slog.Warn("self-update unavailable in standalone mode: supervisor IPC required",
 			"url", req.URL,
 			"version", req.Version,
 		)
-		return "", errors.New("self-update unavailable: agent is running in standalone mode without supervisor IPC")
+		return none, errors.New("self-update unavailable: agent is running in standalone mode without supervisor IPC")
 	}
 
 	// Step 1: Query supervisor for inactive slot path over IPC
@@ -130,10 +138,10 @@ func applyStagedUpdate(ctx context.Context, cfg *Config, req protocol.AgentUpdat
 		PID:  os.Getpid(),
 	})
 	if err != nil {
-		return "", fmt.Errorf("query inactive slot from supervisor: %w", err)
+		return none, fmt.Errorf("query inactive slot from supervisor: %w", err)
 	}
 	if resp.Type != supervisor.MsgInactiveResp || resp.Path == "" {
-		return "", fmt.Errorf("unexpected supervisor response for inactive slot: type=%s, path=%s", resp.Type, resp.Path)
+		return none, fmt.Errorf("unexpected supervisor response for inactive slot: type=%s, path=%s", resp.Type, resp.Path)
 	}
 
 	inactiveDir := resp.Path
@@ -145,23 +153,23 @@ func applyStagedUpdate(ctx context.Context, cfg *Config, req protocol.AgentUpdat
 
 	// Step 2: Download binary payload with TLS pinning, through the subnet
 	// cache leader when this device has one and from the origin otherwise.
-	body, source, err := openUpdatePayload(ctx, cfg, req, inactiveDir)
+	body, res, err := openUpdatePayload(ctx, cfg, req, inactiveDir)
 	if err != nil {
-		return "", err
+		return none, err
 	}
 	defer body.Close()
 
 	// Step 3: Stream payload into inactive slot with header sniffing and checksum verification
 	targetBin := filepath.Join(inactiveDir, supervisor.BinaryExecutableName)
 	if err := stageBinaryToSlot(body, inactiveDir, targetBin, req.SHA256); err != nil {
-		return "", fmt.Errorf("stage binary into %s: %w", inactiveDir, err)
+		return none, fmt.Errorf("stage binary into %s: %w", inactiveDir, err)
 	}
 
 	slog.Info("agent update binary verified and staged",
 		"binary", targetBin,
 		"sha256", req.SHA256,
 		"version", req.Version,
-		"source", source,
+		"source", res.Source,
 	)
 
 	// Step 4: Request supervisor restart and slot flip
@@ -172,13 +180,13 @@ func applyStagedUpdate(ctx context.Context, cfg *Config, req protocol.AgentUpdat
 		Version: req.Version,
 	}
 	if err := ipc.Send(restartMsg); err != nil {
-		return "", fmt.Errorf("send restart request to supervisor: %w", err)
+		return none, fmt.Errorf("send restart request to supervisor: %w", err)
 	}
 
 	// Step 5: Schedule graceful worker exit to allow server reply flush
 	scheduleWorkerExit(req.Version)
 
-	return source, nil
+	return res, nil
 }
 
 // updateCache is the subnet cache client the running agent built from its
@@ -194,7 +202,7 @@ var updateCache atomic.Pointer[cache.Client]
 // by itself; the result is read from a temporary file in dir that goes away
 // with the returned closer. Without a leader the origin is read directly, as
 // before the cache existed.
-func openUpdatePayload(ctx context.Context, cfg *Config, req protocol.AgentUpdate, dir string) (io.ReadCloser, string, error) {
+func openUpdatePayload(ctx context.Context, cfg *Config, req protocol.AgentUpdate, dir string) (io.ReadCloser, protocol.AgentUpdateResult, error) {
 	pinned := &http.Transport{TLSClientConfig: TLSConfig(cfg.Fingerprint)}
 	if cl := updateCache.Load(); cl != nil && cl.Leader != nil {
 		c := *cl
@@ -203,12 +211,12 @@ func openUpdatePayload(ctx context.Context, cfg *Config, req protocol.AgentUpdat
 		res, err := c.Fetch(ctx, req.URL, req.SHA256, tmp)
 		if err != nil {
 			os.Remove(tmp + ".part")
-			return nil, "", fmt.Errorf("download update payload: %w", err)
+			return nil, protocol.AgentUpdateResult{}, fmt.Errorf("download update payload: %w", err)
 		}
 		f, err := os.Open(tmp)
 		if err != nil {
 			os.Remove(tmp)
-			return nil, "", fmt.Errorf("open the downloaded update payload: %w", err)
+			return nil, protocol.AgentUpdateResult{}, fmt.Errorf("open the downloaded update payload: %w", err)
 		}
 		source := "origin"
 		if res.Source == "cache" {
@@ -217,22 +225,22 @@ func openUpdatePayload(ctx context.Context, cfg *Config, req protocol.AgentUpdat
 			source = "origin (the cache failed: " + res.Fallback + ")"
 		}
 		slog.Info("agent update payload downloaded", "source", source, "bytes", res.Bytes, "resumed_chunks", res.Resumed)
-		return &tempFile{File: f, path: tmp}, source, nil
+		return &tempFile{File: f, path: tmp}, protocol.AgentUpdateResult{Source: source, Bytes: res.Bytes, ResumedChunks: res.Resumed, Version: req.Version}, nil
 	}
 	client := &http.Client{Timeout: 10 * time.Minute, Transport: pinned}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, req.URL, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("create download request: %w", err)
+		return nil, protocol.AgentUpdateResult{}, fmt.Errorf("create download request: %w", err)
 	}
 	httpResp, err := client.Do(httpReq)
 	if err != nil {
-		return nil, "", fmt.Errorf("download update payload: %w", err)
+		return nil, protocol.AgentUpdateResult{}, fmt.Errorf("download update payload: %w", err)
 	}
 	if httpResp.StatusCode != http.StatusOK {
 		httpResp.Body.Close()
-		return nil, "", fmt.Errorf("download failed: HTTP %s", httpResp.Status)
+		return nil, protocol.AgentUpdateResult{}, fmt.Errorf("download failed: HTTP %s", httpResp.Status)
 	}
-	return httpResp.Body, "origin", nil
+	return httpResp.Body, protocol.AgentUpdateResult{Source: "origin", Bytes: max(httpResp.ContentLength, 0), Version: req.Version}, nil
 }
 
 // tempFile removes its file when closed.

@@ -698,6 +698,18 @@ type AgentUpdate struct {
 	Version string `json:"version"`
 }
 
+// AgentUpdateResult is the reply to agent.update once the new binary is staged.
+// Source says where the bytes came from: "origin", "cache <leader> over h3|https",
+// or "origin (the cache failed: <reason>)". It is empty when nothing was
+// downloaded (the device already ran the build) and in the reply of an agent
+// that predates this struct, which answers with no body at all.
+type AgentUpdateResult struct {
+	Source        string `json:"source"`
+	Bytes         int64  `json:"bytes,omitempty"`
+	ResumedChunks int    `json:"resumed_chunks,omitempty"`
+	Version       string `json:"version,omitempty"`
+}
+
 // ---- Network Discovery & SNMP ----
 
 type NetworkScanReq struct {

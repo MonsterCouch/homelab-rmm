@@ -8,7 +8,7 @@
 // summary, and as one sentence for a toast.
 
 import { api, ApiError, isPending } from '../api/client';
-import type { SignedUpdateGroup, UpdateBatchResult } from '../api/types';
+import type { SignedUpdateGroup, UpdateBatchResult, UpdateSourceCounts } from '../api/types';
 import { errMsg } from '../state/toast';
 import { pluralize } from './format';
 
@@ -34,6 +34,31 @@ export interface FleetUpdateSummary {
   failed: { group: SignedUpdateGroup; error: string }[];
   /** groups left unsigned because the operator cancelled a signing dialog */
   cancelledGroups: number;
+  /**
+   * devices of the signed groups that confirmed the update, by where they
+   * downloaded it. Devices of organizations that do not sign are not in it:
+   * the server does not wait for their answer, and their source is on each
+   * device's activity list.
+   */
+  bySource: UpdateSourceCounts;
+}
+
+/**
+ * One sentence for where an update's bytes came from, from the source string
+ * the agent reports. Never empty: an agent that predates the report says so.
+ */
+export function describeUpdateSource(source: string | undefined): string {
+  const s = (source ?? '').trim();
+  if (!s) return 'Download source not reported';
+  const cache = /^cache (\S+) over (\S+)$/.exec(s);
+  if (cache) {
+    const via = cache[2] === 'h3' ? 'HTTP/3' : cache[2] === 'https' ? 'HTTPS' : cache[2];
+    return `Downloaded from the subnet cache (leader ${cache[1]} over ${via})`;
+  }
+  const failed = /^origin \(the cache failed: (.*)\)$/.exec(s);
+  if (failed) return `Downloaded from the server (the subnet cache failed: ${failed[1].replace(/[.\s]+$/, '')})`;
+  if (s === 'origin') return 'Downloaded from the server';
+  return `Downloaded from ${s}`;
 }
 
 /** "3 devices (linux/amd64) in Acme": which devices a group is, for a sentence. */
@@ -81,6 +106,7 @@ async function run(): Promise<FleetUpdateSummary> {
     pendingGroups: 0,
     failed: [],
     cancelledGroups: 0,
+    bySource: { cache: 0, origin: 0, origin_cache_failed: 0, unreported: 0 },
   };
   for (const [i, g] of groups.entries()) {
     try {
@@ -98,6 +124,7 @@ async function run(): Promise<FleetUpdateSummary> {
       // not an error: it only needs the update again when it is back.
       s.offline += res.offline;
       s.upToDate += res.up_to_date ?? 0;
+      for (const k of Object.keys(s.bySource) as (keyof UpdateSourceCounts)[]) s.bySource[k] += res.by_source?.[k] ?? 0;
       const failed = res.failed ?? [];
       if (failed.length > 0) s.failed.push({ group: g, error: explainFailures(failed) });
     } catch (err) {
@@ -158,6 +185,14 @@ export function summarizeFleetUpdate(s: FleetUpdateSummary): string {
   const parts: string[] = [];
   const sent = s.unsigned + s.signed;
   if (sent > 0) parts.push(`Update sent to ${pluralize(sent, 'device')}${s.signed > 0 ? ` (${s.signed} by signed update)` : ''}`);
+  const { cache, origin, origin_cache_failed: cacheFailed } = s.bySource;
+  if (cache + origin + cacheFailed > 0) {
+    const where: string[] = [];
+    if (cache > 0) where.push(`${cache} from the subnet cache`);
+    if (origin > 0) where.push(`${origin} from the server`);
+    if (cacheFailed > 0) where.push(`${cacheFailed} from the server after the subnet cache failed`);
+    parts.push(`Downloads: ${where.join(', ')}`);
+  }
   if (s.pendingGroups > 0) parts.push(`${pluralize(s.pendingGroups, 'group')} ${s.pendingGroups === 1 ? 'is' : 'are'} waiting for another approver`);
   if (s.offline > 0) parts.push(`${pluralize(s.offline, 'device')} ${s.offline === 1 ? 'was' : 'were'} offline; run Update Agents again when ${s.offline === 1 ? 'it is' : 'they are'} back`);
   if (s.noBuild > 0) parts.push(`${pluralize(s.noBuild, 'online device')} skipped: this server has no agent build for ${s.noBuild === 1 ? 'it' : 'them'}`);

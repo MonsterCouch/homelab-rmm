@@ -431,6 +431,7 @@ func (s *session) captureLoop(ctx context.Context) error {
 		lastCap    time.Time
 		fails      int
 	)
+	sizeMismatches := 0 // consecutive frames whose size differs from the monitor's
 
 	applyCtl := func(msg viewerMsg) {
 		switch msg.T {
@@ -586,6 +587,13 @@ func (s *session) captureLoop(ctx context.Context) error {
 
 		img, err := s.cap.capture(cur)
 		lastCap = time.Now()
+		if errors.Is(err, errNoFrameYet) {
+			// An idle screen that has sent no frame yet is not a failure.
+			if !wait(captureRetry) {
+				return nil
+			}
+			continue
+		}
 		if err != nil {
 			fails++
 			if fails > maxCaptureFails {
@@ -602,9 +610,22 @@ func (s *session) captureLoop(ctx context.Context) error {
 		if img.Rect.Dx() != cur.Bounds.Dx() || img.Rect.Dy() != cur.Bounds.Dy() {
 			// The backend disagrees with what it enumerated a moment ago:
 			// the mode changed mid-flight. Re-enumerate before trusting it.
+			// A backend that keeps disagreeing is a failure, not a loop.
+			sizeMismatches++
+			if sizeMismatches == 1 {
+				slog.Warn("desktop: captured frame size differs from the monitor size; re-reading the monitors",
+					"frame", img.Rect.Size(), "monitor", cur.Bounds.Size())
+			}
+			if sizeMismatches > maxCaptureFails {
+				return fmt.Errorf("the captured frame is %v but the monitor is %v", img.Rect.Size(), cur.Bounds.Size())
+			}
 			mons = nil
+			if !wait(captureRetry) {
+				return nil
+			}
 			continue
 		}
+		sizeMismatches = 0
 
 		// Optimistic fast-start: once the peer connection is up, feed the
 		// H.264 track from the same CPU frame the tiles use, so the viewer's

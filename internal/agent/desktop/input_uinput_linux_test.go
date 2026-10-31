@@ -508,10 +508,10 @@ func TestRestoreTokenRoundTrip(t *testing.T) {
 	}
 }
 
-func TestPipeWireCaptureNeverFakesFrames(t *testing.T) {
+func TestPipeWireCaptureWithoutSessionFailsWithoutFrames(t *testing.T) {
 	c := &pipewireCapturer{}
 	img, err := c.capture(monitor{Bounds: image.Rect(0, 0, 10, 10)})
-	if img != nil || !errors.Is(err, errPipeWireNoIngest) {
+	if img != nil || err == nil {
 		t.Fatalf("capture = %v, %v", img, err)
 	}
 	if _, err := c.monitors(); err == nil {

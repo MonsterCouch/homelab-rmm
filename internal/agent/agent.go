@@ -783,12 +783,12 @@ func (a *Agent) handle(ctx context.Context, env protocol.Envelope) {
 	case protocol.ReqAgentUpdate:
 		var in protocol.AgentUpdate
 		if err = json.Unmarshal(env.D, &in); err == nil {
-			var source string
-			source, err = selfUpdateSource(ctx, a.cfg, in, a.IPCClient())
-			if err == nil && source != "" {
+			var res protocol.AgentUpdateResult
+			res, err = selfUpdateResult(ctx, a.cfg, in, a.IPCClient())
+			if err == nil {
 				// Where the bytes came from, so the operator can tell a
 				// cache hit from a WAN download.
-				out = map[string]string{"source": source}
+				out = res
 			}
 		}
 	case protocol.ReqTrustUpdate:

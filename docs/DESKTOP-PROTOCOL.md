@@ -133,7 +133,7 @@ enforces that the forbidden APIs appear nowhere in the backstage source.
   Capture uses XShm/XGetImage through `kbinani/screenshot`; input uses the XTEST extension via
   `jezek/xgb`. An active X11 session owned by a user wins; the display manager's greeter
   (`Class=greeter`) is used only when there is nothing else, and the `note` then says no user is
-  logged in. Wayland sessions are reported as unsupported in the `note` — a Wayland *greeter* is
+  logged in. A Wayland session is captured through the ScreenCast portal and PipeWire (unverified against a real compositor; see docs/OPERATIONS.md, "Wayland screen capture"), with the Screenshot portal as the fallback — a Wayland *greeter* is
   reported as "no user is logged in" instead, because that is the more useful half of the truth.
 - **Linux without logind** (no systemd, a hand-started X server, a kiosk box, Xvfb) — three
   optional keys in the agent config, `agent.json` in `$RMM_AGENT_DIR` or `/etc/homelab-rmm`, are

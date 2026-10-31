@@ -161,7 +161,7 @@ the new version and fix the compare links at the bottom).
   and the fallback is `tailscale cert` on the server, not a relay in the app.
 - Linux paths that need systemd, ufw/firewalld or a package install were unit-tested against
   canned output; the container used for development had no systemd and no network for apt.
-- Wayland desktops are refused by design (X11 works).
+- Wayland desktops are captured through the ScreenCast portal and a pure-Go PipeWire client, which has never run against a real compositor or PipeWire daemon; it falls back to the Screenshot portal when it fails (X11 is unchanged). See docs/OPERATIONS.md, "Wayland screen capture".
 - Docker image builds were not executed (no daemon available); the Dockerfile was reviewed.
 
 ## Known open items

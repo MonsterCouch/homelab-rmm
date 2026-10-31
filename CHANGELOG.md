@@ -6,6 +6,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Wayland screen capture on Linux:** the desktop helper reads frames from the XDG ScreenCast portal through a pure-Go
+  PipeWire client (no CGO, no libpipewire), with the Screenshot portal as the fallback and `RMM_WAYLAND_PORTAL=0` as the
+  off switch. It has not been run against a real compositor yet; see `docs/OPERATIONS.md`, "Wayland screen capture".
+- **Update source in the console:** the agent reports where an update came from (origin, subnet cache or cache failure);
+  the device activity tab and the fleet update summary show it.
 - **Multi-Tenancy Hierarchy (Organizations & Sites):** Manage multi-client fleets under distinct
   Organizations with physical Sites, technician assignment (`org_scope`), and tenant isolation.
 - **Client Self-Service Portal & Desktop Companion (`rmm-desktop`):**

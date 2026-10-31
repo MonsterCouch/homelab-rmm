@@ -6,42 +6,67 @@ package desktop
 //
 // WHAT IS IMPLEMENTED
 //
-// The full portal negotiation, in pure Go over godbus: CreateSession,
+// The portal negotiation, in pure Go over godbus: CreateSession,
 // SelectSources (types=MONITOR, persist_mode=2 so the grant is remembered),
-// Start, and OpenPipeRemote (which yields a file descriptor for a private
-// PipeWire connection). The restore_token the portal returns from Start is
-// persisted (see restoreTokenPath) and offered on the next SelectSources, so
-// an unattended session is restored without a prompt where the compositor
-// supports it. The result is a PipeWire node id, the remote fd and the
-// geometry of each stream.
+// Start, and OpenPipeRemote (a file descriptor for a private PipeWire
+// connection). The restore_token from Start is saved (see restoreTokenPath)
+// and offered on the next SelectSources, so an unattended session is restored
+// without a prompt where the compositor supports it.
 //
-// WHAT IS NOT IMPLEMENTED (honest limit)
+// Frames are read by a pure-Go PipeWire client, with no CGO and no
+// libpipewire. The pieces, all under internal/agent/desktop/pipewire:
 //
-// Reading frames from that node. PipeWire has no stable pure-Go client: the
-// native protocol is a binary SPA-POD protocol over the fd, and consuming a
-// video stream means implementing the client-node object, param negotiation
-// (EnumFormat/Format/Buffers), receiving memfd/DMA-BUF buffers by SCM_RIGHTS
-// and driving them through eventfd-signalled activations. That is
-// libpipewire's job, and linking it needs CGO, which this build forbids. So
-// pipewireCapturer.capture always returns errPipeWireNoIngest. It never
-// returns synthetic frames.
+//	pod     the SPA POD binary format (bytes only, tested everywhere)
+//	proto   the native protocol over the portal's fd (SCM_RIGHTS), behind a
+//	        Transport interface
+//	stream  one video input stream, a client-node object that links to the
+//	        portal's node, negotiates a raw format, maps the buffers and
+//	        copies each frame out as *image.RGBA; shared memory and eventfds
+//	        sit behind the Mem and Signal interfaces, so the state machine is
+//	        tested on Windows against a fake server
 //
-// CONSEQUENCE FOR THE CALLER
+// pipewireCapturer opens the transport on the OpenPipeRemote fd once and
+// starts one stream per portal node, lazily, on the first capture of that
+// monitor. capture returns the newest frame. The first call waits up to
+// firstFrameTimeout for a frame to arrive; later calls return the newest
+// frame without waiting, so a screen that has not changed returns the same
+// image. A first-frame timeout is transient (GNOME and KDE send buffers only
+// on damage) and breaks nothing. A stream error or a failed Open marks that
+// node broken, and waylandCapturer then closes the capturer and switches to
+// the screenshot fallback. The same happens when the portal sends
+// Session.Closed (the share was revoked or the portal restarted) and when a
+// running stream has sent no frame for staleFrameLimit, which cannot be told
+// apart from a screen that stays idle. While on the fallback, a goroutine
+// probes the portal again with a growing delay, but only when a restore token
+// is saved, so no approval dialog appears unasked; when a probe works,
+// PipeWire is used again. The monitor sizes are corrected from the first frame
+// of each stream, because the portal reports logical sizes and the stream
+// delivers pixels. Close cancels a portal negotiation in progress and is not
+// treated as a failure.
 //
-// newWaylandCapturer() therefore does not start a portal session by default:
-// that would put a permission dialog on the user's screen only to discard the
-// result. It goes straight to the fallback (screenCapturer, i.e. kbinani,
-// which on a Wayland session uses the Screenshot portal for real pixels and
-// Xwayland/Xinerama for geometry). Set RMM_WAYLAND_PORTAL=1 to run the portal
-// negotiation anyway (it is still followed by the fallback because capture()
-// fails); that is how to exercise this code on a real compositor and to see
-// the restore token being saved. If an ingest implementation is ever added,
-// flip pipewireIngestImplemented.
+// SELECTION AND THE KILL SWITCH
 //
-// NOT VERIFIED: none of this has been run against a real portal; it was
-// written against the portal specification and cross-compiled only.
+// newWaylandCapturer starts the portal by default. RMM_WAYLAND_PORTAL=0 turns
+// it off and goes straight to the fallback; any other value, including 1,
+// means the default. On any portal or stream failure, at start-up or later,
+// it logs one line with the reason and uses screenCapturer (kbinani, which on
+// a Wayland session takes real pixels from the Screenshot portal and uses
+// Xwayland for geometry). Without a DISPLAY there is no fallback and the
+// error is returned. The pure parts of the decision are in
+// capture_pipewire_select.go and are tested on every platform.
+//
+// NOT VERIFIED
+//
+// None of this has run against a real compositor or PipeWire daemon. The
+// portal code was written against the specification and the stream against
+// PipeWire's source; both are tested only with fakes. The first run on GNOME
+// or KDE with RMM_DEBUG=1 is the check. Open questions are listed in
+// docs/plans/2026-10-25-loose-ends.md and the stream package's notes, mainly
+// whether the server accepts a client-node created through the portal's
+// restricted connection and links it to the portal node.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"image"
@@ -54,13 +79,22 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
+
+	"github.com/MonsterCouch/homelab-rmm/internal/agent/desktop/pipewire/proto"
+	"github.com/MonsterCouch/homelab-rmm/internal/agent/desktop/pipewire/stream"
 )
 
 // pipewireIngestImplemented says whether pipewireCapturer.capture can produce
-// frames. It is false: see the file comment.
-const pipewireIngestImplemented = false
+// frames.
+const pipewireIngestImplemented = true
 
-var errPipeWireNoIngest = errors.New("PipeWire frame ingestion is not available in this CGO-free build (portal session negotiated, but no pure-Go PipeWire client exists)")
+const (
+	// firstFrameTimeout bounds the wait for a stream's first frame.
+	firstFrameTimeout = 2 * time.Second
+	// streamOpenTimeout bounds stream.Open (Hello, CreateObject, negotiation
+	// up to Command Start).
+	streamOpenTimeout = 10 * time.Second
+)
 
 // waylandMode is set by platformInit when the helper serves a Wayland
 // session; input selection (preferUinput) and capture selection read it.
@@ -121,12 +155,6 @@ func startOptions(handleToken string) map[string]dbus.Variant {
 	return map[string]dbus.Variant{"handle_token": dbus.MakeVariant(handleToken)}
 }
 
-// pwStream is one entry of Start's "streams" result.
-type pwStream struct {
-	Node   uint32
-	Bounds image.Rectangle // position and size in compositor coordinates; empty if not reported
-}
-
 // parseStreams decodes Start's results: streams (a(ua{sv})) and the optional
 // restore_token (s).
 func parseStreams(results map[string]dbus.Variant) (streams []pwStream, restoreToken string, err error) {
@@ -171,22 +199,6 @@ func variantPair(v dbus.Variant) ([2]int32, bool) {
 	a, ok1 := f[0].(int32)
 	b, ok2 := f[1].(int32)
 	return [2]int32{a, b}, ok1 && ok2
-}
-
-// monitorsFromStreams turns stream geometry into monitors (Index in stream
-// order; the one at the desktop origin, else the first, is primary).
-func monitorsFromStreams(streams []pwStream) []monitor {
-	var mons []monitor
-	for _, s := range streams {
-		if s.Bounds.Empty() || len(mons) >= maxMonitors {
-			continue
-		}
-		mons = append(mons, monitor{Index: len(mons), Bounds: s.Bounds})
-	}
-	if len(mons) > 0 {
-		markPrimary(mons)
-	}
-	return mons
 }
 
 // ---- restore token persistence ----
@@ -254,10 +266,10 @@ func (p *portalConn) token(prefix string) string {
 // request performs one portal call that answers through a Request/Response
 // signal. build receives the handle_token to embed in the options and returns
 // the call's arguments.
-func (p *portalConn) request(method string, timeout time.Duration, build func(handleToken string) []interface{}) (map[string]dbus.Variant, error) {
+func (p *portalConn) request(ctx context.Context, method string, timeout time.Duration, build func(handleToken string) []interface{}) (map[string]dbus.Variant, error) {
 	tok := p.token("rmm")
 	var handle dbus.ObjectPath
-	if err := p.obj.Call(method, 0, build(tok)...).Store(&handle); err != nil {
+	if err := p.obj.CallWithContext(ctx, method, 0, build(tok)...).Store(&handle); err != nil {
 		return nil, fmt.Errorf("%s: %w", method, err)
 	}
 	if expect := requestPath(p.conn.Names()[0], tok); handle != expect {
@@ -278,6 +290,8 @@ func (p *portalConn) request(method string, timeout time.Duration, build func(ha
 			if s.Name == ifacePortalReq+".Response" {
 				p.pending[s.Path] = s.Body
 			}
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%s: %w", method, ctx.Err())
 		case <-deadline.C:
 			return nil, fmt.Errorf("%s: no response from the portal within %s", method, timeout)
 		}
@@ -300,21 +314,34 @@ func decodeResponse(method string, body []interface{}) (map[string]dbus.Variant,
 	}
 }
 
-// pipewireCapturer holds a negotiated ScreenCast session. It satisfies
-// capturer, but capture() cannot deliver frames (see the file comment).
+// pipewireCapturer holds a negotiated ScreenCast session and the PipeWire
+// connection opened on its fd. It satisfies capturer.
 type pipewireCapturer struct {
 	pc      *portalConn
 	session dbus.ObjectPath
 	streams []pwStream
 	mons    []monitor
-	remote  *os.File // PipeWire connection from OpenPipeRemote
+	conn    *proto.Conn // PipeWire connection from OpenPipeRemote; owns the fd
 	closer  sync.Once
+
+	mu     sync.Mutex
+	opened map[uint32]*stream.Stream // by portal node id
+	hello  bool                      // Core.Hello was sent by the first stream
+	broken map[uint32]error          // by portal node id; set once, later captures of that node return it
+	closed bool
+	lost   error // set when the portal ends the session; every later capture returns it
+
+	quit     chan struct{} // closed by Close; stops the signal watcher
+	watching sync.WaitGroup
+
+	monMu sync.Mutex // guards mons, which capture corrects from the frame size
 }
 
-// newPipeWireCapturer runs the portal negotiation. It may block until the
-// user approves the screen-share dialog (bounded by startTimeout) when no
-// valid restore token exists.
-func newPipeWireCapturer() (*pipewireCapturer, error) {
+// newPipeWireCapturer runs the portal negotiation and opens the PipeWire
+// connection. It may block until the user approves the screen-share dialog
+// (bounded by startTimeout) when no valid restore token exists. Cancelling ctx
+// ends the wait. No stream is started yet.
+func newPipeWireCapturer(ctx context.Context) (*pipewireCapturer, error) {
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
 		return nil, fmt.Errorf("connect to the session bus: %w", err)
@@ -325,7 +352,7 @@ func newPipeWireCapturer() (*pipewireCapturer, error) {
 		sigs:    make(chan *dbus.Signal, 32),
 		pending: map[dbus.ObjectPath][]interface{}{},
 	}
-	c := &pipewireCapturer{pc: pc}
+	c := &pipewireCapturer{pc: pc, opened: map[uint32]*stream.Stream{}, broken: map[uint32]error{}, quit: make(chan struct{})}
 	fail := func(err error) (*pipewireCapturer, error) {
 		c.Close()
 		return nil, err
@@ -344,7 +371,7 @@ func newPipeWireCapturer() (*pipewireCapturer, error) {
 	}
 	persist := ver >= persistMinVersion
 
-	res, err := pc.request(ifaceScreenCast+".CreateSession", requestTimeout, func(tok string) []interface{} {
+	res, err := pc.request(ctx, ifaceScreenCast+".CreateSession", requestTimeout, func(tok string) []interface{} {
 		return []interface{}{createSessionOptions(tok, pc.token("rmms"))}
 	})
 	if err != nil {
@@ -359,18 +386,23 @@ func newPipeWireCapturer() (*pipewireCapturer, error) {
 	if c.session == "" {
 		return fail(errors.New("CreateSession returned no session handle"))
 	}
+	// Session.Closed arrives when the user revokes the share or the portal or
+	// compositor restarts; without it a dead session looks like an idle screen.
+	if err := conn.AddMatchSignal(dbus.WithMatchInterface(ifacePortalSess), dbus.WithMatchMember("Closed"), dbus.WithMatchObjectPath(c.session)); err != nil {
+		return fail(fmt.Errorf("subscribe to portal session close: %w", err))
+	}
 
 	restore := ""
 	if persist {
 		restore = loadRestoreToken()
 	}
-	if _, err := pc.request(ifaceScreenCast+".SelectSources", requestTimeout, func(tok string) []interface{} {
+	if _, err := pc.request(ctx, ifaceScreenCast+".SelectSources", requestTimeout, func(tok string) []interface{} {
 		return []interface{}{c.session, selectSourcesOptions(tok, restore, persist)}
 	}); err != nil {
 		return fail(err)
 	}
 
-	res, err = pc.request(ifaceScreenCast+".Start", startTimeout, func(tok string) []interface{} {
+	res, err = pc.request(ctx, ifaceScreenCast+".Start", startTimeout, func(tok string) []interface{} {
 		return []interface{}{c.session, "", startOptions(tok)}
 	})
 	if err != nil {
@@ -388,14 +420,58 @@ func newPipeWireCapturer() (*pipewireCapturer, error) {
 	}
 
 	var fd dbus.UnixFD
-	if err := pc.obj.Call(ifaceScreenCast+".OpenPipeRemote", 0, c.session, map[string]dbus.Variant{}).Store(&fd); err != nil {
+	if err := pc.obj.CallWithContext(ctx, ifaceScreenCast+".OpenPipeRemote", 0, c.session, map[string]dbus.Variant{}).Store(&fd); err != nil {
 		return fail(fmt.Errorf("OpenPipeRemote: %w", err))
 	}
-	c.remote = os.NewFile(uintptr(fd), "pipewire-remote")
+	// The transport takes ownership of fd and closes it on failure.
+	tr, err := proto.NewSocketTransport(int(fd))
+	if err != nil {
+		return fail(fmt.Errorf("open the PipeWire connection: %w", err))
+	}
+	c.conn = proto.NewConn(tr, proto.Config{CloseFd: proto.CloseFd})
 
 	c.mons = monitorsFromStreams(streams)
+	c.watching.Add(1)
+	go c.watchSignals()
 	slog.Info("desktop: ScreenCast portal session ready", "nodes", len(streams), "monitors", len(c.mons), "persist", persist)
 	return c, nil
+}
+
+// watchSignals reads the bus signals after setup: Session.Closed for this
+// session marks the capturer lost, and stray Request.Response signals are
+// discarded so the channel never fills up.
+func (c *pipewireCapturer) watchSignals() {
+	defer c.watching.Done()
+	for {
+		select {
+		case <-c.quit:
+			return
+		case s := <-c.pc.sigs:
+			if s == nil {
+				c.markLost(errors.New("the session bus connection closed"))
+				return
+			}
+			if s.Name == ifacePortalSess+".Closed" && s.Path == c.session {
+				c.markLost(errPortalSessionClosed)
+			}
+		}
+	}
+}
+
+// markLost records that the session cannot deliver frames any more.
+func (c *pipewireCapturer) markLost(err error) {
+	c.mu.Lock()
+	if c.lost == nil && !c.closed {
+		c.lost = err
+	}
+	c.mu.Unlock()
+}
+
+// lostErr returns why the session ended, or nil.
+func (c *pipewireCapturer) lostErr() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lost
 }
 
 // screenCastProps reads the interface version and the supported source types.
@@ -414,46 +490,136 @@ func screenCastProps(obj dbus.BusObject) (version uint32, types uint32, err erro
 }
 
 func (c *pipewireCapturer) monitors() ([]monitor, error) {
+	c.monMu.Lock()
+	defer c.monMu.Unlock()
 	if len(c.mons) == 0 {
 		return nil, errors.New("the portal did not report a stream with a usable size")
 	}
 	return c.mons, nil
 }
 
-// capture always fails: the node and fd are negotiated but there is no
-// CGO-free PipeWire client to read buffers from them.
-func (c *pipewireCapturer) capture(m monitor) (*image.RGBA, error) {
-	return nil, errPipeWireNoIngest
-}
-
-// nodeFor returns the PipeWire node serving monitor index i (for logging and
-// for a future ingest implementation).
-func (c *pipewireCapturer) nodeFor(i int) (uint32, bool) {
-	n := 0
-	for _, s := range c.streams {
-		if s.Bounds.Empty() {
-			continue
-		}
-		if n == i {
-			return s.Node, true
-		}
-		n++
+// noteFrameSize makes the monitor's bounds the size of the frame the stream
+// delivers, so a scaled or HiDPI output does not disagree with its portal
+// geometry forever.
+func (c *pipewireCapturer) noteFrameSize(idx int, img *image.RGBA) {
+	c.monMu.Lock()
+	defer c.monMu.Unlock()
+	if mons, changed := withFrameSize(c.mons, idx, img.Rect.Dx(), img.Rect.Dy()); changed {
+		slog.Info("desktop: PipeWire frame size differs from the portal's monitor size; using the frame size",
+			"monitor", idx, "frame", img.Rect.Size())
+		c.mons = mons
 	}
-	return 0, false
 }
 
-// Close ends the portal session and releases the fd and bus connection.
+// streamFor returns the running stream for monitor m, starting it on first
+// use. It holds c.mu while the stream opens (at most streamOpenTimeout), so a
+// concurrent Close waits for that.
+func (c *pipewireCapturer) streamFor(m monitor) (*stream.Stream, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.conn == nil {
+		return nil, errCapturerClosed
+	}
+	node, ok := nodeForMonitor(c.streams, m.Index)
+	if !ok {
+		return nil, fmt.Errorf("the portal has no PipeWire node for monitor %d", m.Index)
+	}
+	if err := c.broken[node]; err != nil {
+		return nil, err
+	}
+	if st := c.opened[node]; st != nil {
+		return st, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), streamOpenTimeout)
+	defer cancel()
+	st, err := stream.Open(ctx, c.conn, stream.Options{NodeID: node, SkipHello: c.hello})
+	if err != nil {
+		c.broken[node] = fmt.Errorf("open the PipeWire stream for node %d: %w", node, err)
+		return nil, c.broken[node]
+	}
+	c.hello = true
+	c.opened[node] = st
+	return st, nil
+}
+
+// markBroken records the first failure of a node's stream and returns it. A
+// failure of one monitor's stream does not affect the others.
+func (c *pipewireCapturer) markBroken(node uint32, err error) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return errCapturerClosed
+	}
+	if c.broken[node] == nil {
+		c.broken[node] = err
+	}
+	return c.broken[node]
+}
+
+// capture returns the newest frame of the stream serving monitor m. The
+// returned image is shared and must not be modified. It never returns a
+// synthetic frame. A stream that is open but has sent nothing within
+// firstFrameTimeout gives errNoFrameYet and stays usable; only an Open failure
+// or a stream error marks that node broken.
+func (c *pipewireCapturer) capture(m monitor) (*image.RGBA, error) {
+	if err := c.lostErr(); err != nil {
+		return nil, err
+	}
+	st, err := c.streamFor(m)
+	if err != nil {
+		return nil, err
+	}
+	node, _ := nodeForMonitor(c.streams, m.Index)
+	if err := st.Err(); err != nil {
+		return nil, c.markBroken(node, fmt.Errorf("PipeWire stream ended: %w", err))
+	}
+	img, _ := st.Latest()
+	if img == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), firstFrameTimeout)
+		defer cancel()
+		img, _, err = st.Wait(ctx, 0)
+		if err != nil {
+			switch {
+			case errors.Is(err, stream.ErrClosed):
+				return nil, errCapturerClosed
+			case errors.Is(err, context.DeadlineExceeded) && st.Err() == nil:
+				return nil, noFrameYet(firstFrameTimeout)
+			}
+			return nil, c.markBroken(node, err)
+		}
+	}
+	if streamStale(st.Running(), st.LastFrame(), time.Now(), staleFrameLimit) {
+		return nil, c.markBroken(node, errStreamStalled)
+	}
+	c.noteFrameSize(m.Index, img)
+	return img, nil
+}
+
+// Close stops the streams, closes the PipeWire connection, ends the portal
+// session and releases the bus connection.
 func (c *pipewireCapturer) Close() error {
 	c.closer.Do(func() {
-		if c.remote != nil {
-			c.remote.Close()
+		c.mu.Lock()
+		c.closed = true
+		close(c.quit)
+		open := c.opened
+		c.opened = map[uint32]*stream.Stream{}
+		c.mu.Unlock()
+		for _, st := range open {
+			st.Close()
+		}
+		if c.conn != nil {
+			c.conn.Close()
 		}
 		if c.pc != nil && c.pc.conn != nil {
 			if c.session != "" {
-				c.pc.conn.Object(portalName, c.session).Call(ifacePortalSess+".Close", 0)
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				c.pc.conn.Object(portalName, c.session).CallWithContext(ctx, ifacePortalSess+".Close", 0)
+				cancel()
 			}
 			c.pc.conn.RemoveSignal(c.pc.sigs)
 			c.pc.conn.Close()
+			c.watching.Wait()
 		}
 	})
 	return nil
@@ -461,61 +627,190 @@ func (c *pipewireCapturer) Close() error {
 
 // ---- Wayland capture selection ----
 
-// portalAttemptEnabled says whether to start a ScreenCast session at all.
-func portalAttemptEnabled() bool {
-	return pipewireIngestImplemented || os.Getenv("RMM_WAYLAND_PORTAL") == "1"
-}
-
 // waylandCapturer picks the capture backend lazily on first use (newCapturer
 // cannot return an error, and Serve already treats a monitors() error as "no
-// usable display"): PipeWire when it really yields frames, otherwise the
-// screenCapturer fallback if a DISPLAY exists, otherwise an explicit error.
+// usable display"): PipeWire when the portal and a first frame work,
+// otherwise the screenCapturer fallback if a DISPLAY exists, otherwise an
+// explicit error. A PipeWire failure after start-up switches to the fallback
+// once.
 type waylandCapturer struct {
-	once    sync.Once
-	backend capturer
-	err     error
+	once   sync.Once
+	ctx    context.Context // cancelled by Close; ends a portal negotiation in progress
+	cancel context.CancelFunc
+
+	mu       sync.Mutex
+	backend  capturer
+	err      error
+	retrying bool // a goroutine is trying to bring PipeWire back
 }
 
-func newWaylandCapturer() capturer { return &waylandCapturer{} }
+func newWaylandCapturer() capturer {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &waylandCapturer{ctx: ctx, cancel: cancel}
+}
 
 func (w *waylandCapturer) init() {
 	w.once.Do(func() {
-		if portalAttemptEnabled() {
-			pw, err := newPipeWireCapturer()
-			if err == nil {
-				if mons, merr := pw.monitors(); merr == nil {
-					if _, cerr := pw.capture(mons[0]); cerr == nil {
-						w.backend = pw
-						return
-					} else {
-						err = cerr
-					}
-				} else {
-					err = merr
-				}
-				pw.Close()
+		on := portalEnabled(os.Getenv("RMM_WAYLAND_PORTAL"))
+		var pw *pipewireCapturer
+		var perr error
+		if on {
+			pw, perr = probePipeWire(w.ctx)
+			if perr != nil {
+				slog.Warn("desktop: PipeWire capture unavailable; falling back to the Screenshot portal", "err", perr)
 			}
-			slog.Warn("desktop: PipeWire capture unavailable; falling back", "err", err)
+		} else {
+			slog.Info("desktop: PipeWire capture disabled by RMM_WAYLAND_PORTAL=0; using the Screenshot portal")
 		}
-		if os.Getenv("DISPLAY") == "" {
-			w.err = errors.New("Wayland screen capture needs PipeWire, which is not available in this build, and there is no Xwayland DISPLAY to fall back to")
-			return
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		// Checked under w.mu: Close cancels the context before it reads
+		// w.backend under the same lock, so a probe that finishes while Close
+		// runs is either seen by Close or closed here, never left open.
+		if pw != nil && w.ctx.Err() != nil {
+			pw.Close() // Close ran while the probe did
+			pw, perr = nil, errCapturerClosed
 		}
-		// XDG_SESSION_TYPE stays "wayland" on purpose: kbinani then takes the
-		// Screenshot-portal path for the pixels (real compositor output; a
-		// plain XGetImage on Xwayland returns black for native windows) and
-		// uses the X display only for monitor geometry.
-		slog.Warn("desktop: Wayland capture falls back to the Screenshot portal via the X display (slow, per-frame request)")
-		w.backend = screenCapturer{}
+		choice, err := chooseWaylandBackend(on, perr, os.Getenv("DISPLAY"))
+		switch choice {
+		case backendPortal:
+			w.backend = pw
+			slog.Info("desktop: Wayland capture uses PipeWire")
+		case backendScreenshot:
+			w.backend = screenCapturer{}
+		default:
+			w.err = err
+		}
+		if on && perr != nil && fallBackWanted(perr) {
+			w.startRetryLocked()
+		}
 	})
 }
 
-func (w *waylandCapturer) monitors() ([]monitor, error) {
+// probePipeWire negotiates the portal and waits for the first frame of the
+// first monitor, so a stream that cannot deliver is found before the session
+// starts. A stream that opened but has not sent a frame yet (an idle screen)
+// passes, since the portal and the connection work. The capturer is closed on
+// any other failure.
+func probePipeWire(ctx context.Context) (*pipewireCapturer, error) {
+	pw, err := newPipeWireCapturer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	mons, err := pw.monitors()
+	if err == nil {
+		_, err = pw.capture(mons[0])
+		if errors.Is(err, errNoFrameYet) {
+			slog.Info("desktop: the PipeWire stream is open but the screen has not changed yet; capture continues", "err", err)
+			err = nil
+		}
+	}
+	if err != nil {
+		pw.Close()
+		return nil, err
+	}
+	return pw, nil
+}
+
+// current returns the backend, or the error that left none.
+func (w *waylandCapturer) current() (capturer, error) {
 	w.init()
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.err != nil {
 		return nil, w.err
 	}
-	mons, err := w.backend.monitors()
+	return w.backend, nil
+}
+
+// fallBack replaces a failed PipeWire backend with the screenshot path. It
+// reports false when there is no DISPLAY to fall back to. The failed capturer
+// is closed after w.mu is released, because ending the portal session waits
+// for the portal and must not hold up other capture calls. A retry loop tries
+// to bring PipeWire back.
+func (w *waylandCapturer) fallBack(failed capturer, cause error) bool {
+	w.mu.Lock()
+	if w.backend != failed {
+		ok := w.err == nil // another call already switched
+		w.mu.Unlock()
+		return ok
+	}
+	_, derr := chooseWaylandBackend(false, cause, os.Getenv("DISPLAY"))
+	if derr != nil {
+		w.backend, w.err = nil, derr
+	} else {
+		w.backend = screenCapturer{}
+	}
+	w.startRetryLocked()
+	w.mu.Unlock()
+
+	if c, ok := failed.(interface{ Close() error }); ok {
+		c.Close()
+	}
+	if derr != nil {
+		slog.Warn("desktop: PipeWire capture failed and there is no X display to fall back to", "err", cause)
+		return false
+	}
+	slog.Warn("desktop: PipeWire capture failed; falling back to the Screenshot portal until PipeWire can be restored", "err", cause)
+	return true
+}
+
+// startRetryLocked starts the goroutine that retries the portal, unless one
+// runs already or capture is closed. w.mu must be held.
+func (w *waylandCapturer) startRetryLocked() {
+	if w.retrying || w.ctx.Err() != nil {
+		return
+	}
+	w.retrying = true
+	go w.retryPipeWire()
+}
+
+// retryPipeWire probes the portal again with a growing delay and switches back
+// to PipeWire when a probe works. It only retries while a restore token
+// exists, because a new share would pop up the approval dialog on the user's
+// screen at a time they did not ask for. It stops when capture is closed.
+func (w *waylandCapturer) retryPipeWire() {
+	var delay time.Duration
+	for {
+		delay = nextRetryDelay(delay)
+		t := time.NewTimer(delay)
+		select {
+		case <-w.ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+		if loadRestoreToken() == "" {
+			w.mu.Lock()
+			w.retrying = false
+			w.mu.Unlock()
+			slog.Info("desktop: not retrying PipeWire capture: there is no saved screen-share permission to restore silently")
+			return
+		}
+		pw, err := probePipeWire(w.ctx)
+		if err != nil {
+			slog.Debug("desktop: PipeWire capture is still unavailable", "err", err, "next_try_in", nextRetryDelay(delay))
+			continue
+		}
+		w.mu.Lock()
+		if w.ctx.Err() != nil {
+			w.mu.Unlock()
+			pw.Close()
+			return
+		}
+		w.backend, w.err, w.retrying = pw, nil, false
+		w.mu.Unlock()
+		slog.Info("desktop: PipeWire capture is back")
+		return
+	}
+}
+
+func (w *waylandCapturer) monitors() ([]monitor, error) {
+	b, err := w.current()
+	if err != nil {
+		return nil, err
+	}
+	mons, err := b.monitors()
 	if err == nil {
 		setDesktopHint(monitorUnion(mons))
 	}
@@ -523,15 +818,39 @@ func (w *waylandCapturer) monitors() ([]monitor, error) {
 }
 
 func (w *waylandCapturer) capture(m monitor) (*image.RGBA, error) {
-	w.init()
-	if w.err != nil {
-		return nil, w.err
+	b, err := w.current()
+	if err != nil {
+		return nil, err
 	}
-	return w.backend.capture(m)
+	img, err := b.capture(m)
+	if err == nil {
+		return img, nil
+	}
+	if _, isPW := b.(*pipewireCapturer); !isPW {
+		return nil, err
+	}
+	if w.ctx.Err() != nil {
+		return nil, errCapturerClosed
+	}
+	if !fallBackWanted(err) {
+		return nil, err
+	}
+	if !w.fallBack(b, err) {
+		return nil, err
+	}
+	b, err = w.current()
+	if err != nil {
+		return nil, err
+	}
+	return b.capture(m)
 }
 
 func (w *waylandCapturer) Close() error {
-	if c, ok := w.backend.(interface{ Close() error }); ok {
+	w.cancel()
+	w.mu.Lock()
+	b := w.backend
+	w.mu.Unlock()
+	if c, ok := b.(interface{ Close() error }); ok {
 		return c.Close()
 	}
 	return nil

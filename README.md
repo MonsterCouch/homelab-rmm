@@ -453,9 +453,13 @@ stopping the service, putting the files back and starting it. More in
   user's sessions **and disables that user's TOTP** (re-enroll the authenticator under *Account*
   afterwards). An admin can also reset another user's 2FA under *Users*, or create a new admin
   with `rmm-server user add`.
-- **Remote desktop shows "Wayland sessions are not supported".** The Linux desktop is running
-  Wayland; log in with an X11/Xorg session. On Windows the helper needs an interactive console
-  session; the logon screen and UAC prompts are captured through the SYSTEM token.
+- **Remote desktop on Linux shows a frozen or black picture under Wayland.** Wayland capture goes
+  through the ScreenCast portal and a built-in PipeWire client, and it has not yet been run against
+  a real compositor. The first session asks the person at the machine to allow screen sharing. See
+  [docs/OPERATIONS.md](docs/OPERATIONS.md), "Wayland screen capture", for the log lines to read and
+  for `RMM_WAYLAND_PORTAL=0`, which falls back to the Screenshot portal. An X11/Xorg session needs
+  none of this. On Windows the helper needs an interactive console session; the logon screen and
+  UAC prompts are captured through the SYSTEM token.
 - **Terminal fails to open.** The agent needs `powershell.exe`/`pwsh` (Windows) or `bash`/`sh`
   (Linux) on PATH. PowerShell scripts prefer `pwsh` and fall back to Windows PowerShell 5.1.
 - **A Linux device shows no patches.** No supported package manager was found (apt-get, dnf,
@@ -505,7 +509,7 @@ The full threat model, what is and is not protected, and recommendations are in
 ## Roadmap
 
 - Native endpoint & cloud backups, mobile device management (MDM), and commercial EDR orchestration (see [docs/ROADMAP.md](docs/ROADMAP.md)).
-- Wayland capture for the Linux remote desktop.
+- Confirm Wayland capture for the Linux remote desktop on a real GNOME and KDE session (the PipeWire client is written and tested against fakes only).
 - macOS agent (the platform contract in `internal/agent/platform_other.go` is ready for it).
 - Published container images and signed releases.
 - More notification channels for alerts (webhooks are available through automations today).
