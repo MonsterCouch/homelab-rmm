@@ -43,7 +43,7 @@ func platformInit() error {
 	waylandMode.Store(false)
 	if os.Getenv("DISPLAY") == "" {
 		if os.Getenv("WAYLAND_DISPLAY") != "" {
-			return errWayland
+			return fmt.Errorf("%w; WAYLAND_DISPLAY is set but XDG_SESSION_TYPE is not wayland, so set XDG_SESSION_TYPE=wayland to use that path", errWayland)
 		}
 		return errors.New("DISPLAY is not set; no X11 display to capture")
 	}

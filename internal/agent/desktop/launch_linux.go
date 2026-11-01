@@ -48,7 +48,10 @@ type x11Session struct {
 const greeterClass = "greeter"
 
 var (
-	errWayland = errors.New("Wayland sessions are not supported yet")
+	// errWayland marks a session the X11 path cannot serve: Wayland is
+	// captured through the ScreenCast portal and driven through /dev/uinput
+	// (launchWayland, waylandCapturer), never through XGetImage or XTEST.
+	errWayland = errors.New("Wayland is served only through the ScreenCast portal and /dev/uinput, not X11")
 	// errWaylandGreeter wraps errWayland so callers that special-case
 	// Wayland still do, but the operator is told the more useful half:
 	// there is no user session to attach to at all.

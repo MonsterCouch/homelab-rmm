@@ -216,8 +216,8 @@ func TestSelectSession(t *testing.T) {
 	if err != nil || s.id != "c1" || s.class != greeterClass {
 		t.Fatalf("greeter not used as the fallback: %+v %v", s, err)
 	}
-	// Wayland: a greeter means "no user is logged in", a user session means
-	// "not supported yet"; both stay recognisable as errWayland.
+	// Wayland: a greeter means "no user is logged in", a user session is
+	// handed to launchWayland; both stay recognisable as errWayland.
 	wl := map[string]map[string]string{
 		"w1": {"Type": "wayland", "Active": "yes", "Class": greeterClass, "User": "0"},
 		"w2": {"Type": "wayland", "Active": "yes", "Class": "user", "User": "0"},
