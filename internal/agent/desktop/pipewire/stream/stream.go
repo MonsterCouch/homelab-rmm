@@ -17,6 +17,7 @@ package stream
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"image"
@@ -127,11 +128,13 @@ type Stream struct {
 	mixSeq     uint64          // last value handed out as mix.seq
 	multiMix   bool            // the "several active mixes" Debug line was written
 	transport  *transportState
+	position   *mapping // the driver's Position area from SetIO, read for clock.id
 	peers      map[uint32]*peer
 	running    bool
 	activeSent bool
 	loopOn     bool
 	badFrames  int
+	wakes      uint64 // wake-ups seen, for traceWake
 	stats      Stats
 
 	fmu     sync.Mutex // guards the published frame
@@ -355,6 +358,8 @@ func (s *Stream) releaseAllLocked() {
 	for id := range s.peers {
 		s.removePeerLocked(id)
 	}
+	s.unmap(s.position)
+	s.position = nil
 	if t := s.transport; t != nil {
 		_ = t.waiter.Close()
 		s.unmap(t.act)
@@ -411,6 +416,7 @@ func (s *Stream) closeFd(fd int) {
 
 // dispatch runs with s.mu held.
 func (s *Stream) dispatch(ev any) error {
+	s.trace(ev)
 	switch e := ev.(type) {
 	case proto.CoreBoundProps:
 		s.global, s.haveGlobal = e.GlobalID, true
@@ -428,6 +434,8 @@ func (s *Stream) dispatch(ev any) error {
 		return s.onSetActivation(e)
 	case proto.ClientNodeCommand:
 		s.onCommand(e)
+	case proto.ClientNodeSetIO:
+		return s.onSetIO(e)
 	case proto.ClientNodeAddPort:
 		_ = s.conn.ReportError(s.proxy, errNotSupported, "adding ports is not supported")
 	case proto.ClientNodeRemovePort:
@@ -481,6 +489,7 @@ func (s *Stream) onTransport(e proto.ClientNodeTransport) error {
 	_ = w.Drain()
 	atomic.StoreUint32(atomicWord(m.data, actStatus), actFinished)
 	s.transport = &transportState{readFd: e.ReadFd, writeFd: e.WriteFd, memID: e.MemID, offset: e.Offset, act: m, waiter: w}
+	s.publishActiveDriver()
 
 	if err := s.conn.Send(s.proxy, proto.ClientNodeSetActive{Active: true}); err != nil {
 		return err
@@ -488,7 +497,89 @@ func (s *Stream) onTransport(e proto.ClientNodeTransport) error {
 	s.activeSent = true
 	s.loopOn = true
 	go s.loop(w)
+	go s.traceActivation()
 	return nil
+}
+
+// traceActivation logs, once a second for the first half minute and then once
+// a minute, the scheduling state of this node's activation block and of every
+// peer's: status, state[0].required and pending, and the three timestamps.
+// It is Debug-only and exists because a node that is never woken leaves no
+// other trace.
+func (s *Stream) traceActivation() {
+	if !slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+	dump := func(name string, b []byte) []any {
+		return []any{
+			name, fmt.Sprintf("status=%d result=%d required=%d pending=%d signal=%d awake=%d finish=%d",
+				atomic.LoadUint32(atomicWord(b, actStatus)),
+				atomic.LoadInt32(atomicInt(b, actState0Status)),
+				atomic.LoadInt32(atomicInt(b, actState0Status+4)),
+				atomic.LoadInt32(atomicInt(b, actState0Pending)),
+				binary.LittleEndian.Uint64(b[actSignalTime:]),
+				binary.LittleEndian.Uint64(b[actAwakeTime:]),
+				binary.LittleEndian.Uint64(b[actFinishTime:])),
+		}
+	}
+	for i := 0; ; i++ {
+		d := time.Second
+		if i >= 30 {
+			d = time.Minute
+		}
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(d):
+		}
+		s.mu.Lock()
+		attrs := []any{"wakes", s.wakes, "frames", s.stats.Frames, "running", s.running}
+		if t := s.transport; t != nil {
+			attrs = append(attrs, dump("self", t.act.data)...)
+		}
+		for id, p := range s.peers {
+			attrs = append(attrs, dump(fmt.Sprintf("peer_%d", id), p.act.data)...)
+		}
+		s.mu.Unlock()
+		slog.Debug("pipewire: activation", attrs...)
+	}
+}
+
+// onSetIO handles the node-level I/O areas. Only Position matters: it lives
+// inside the driver's activation block, and its clock.id names the driver.
+// pw_impl_node_set_io copies that id into the node's own active_driver_id,
+// which the driver checks against its own id before it schedules the node.
+// Clock and the other areas are not needed to receive frames.
+func (s *Stream) onSetIO(e proto.ClientNodeSetIO) error {
+	if e.IOID != pod.IOPosition {
+		return nil
+	}
+	s.unmap(s.position)
+	s.position = nil
+	if e.MemID == proto.InvalidID {
+		return nil
+	}
+	if e.Size < posClockID+4 {
+		return fmt.Errorf("the Position I/O area is %d bytes, too small for struct spa_io_position", e.Size)
+	}
+	m, err := s.mapRegion(e.MemID, e.Offset, e.Size, mapRead)
+	if err != nil {
+		return fmt.Errorf("mapping the Position I/O area failed: %w", err)
+	}
+	s.position = m
+	s.publishActiveDriver()
+	return nil
+}
+
+// publishActiveDriver writes the driver's id from the mapped Position area
+// into this node's activation, once both are known.
+func (s *Stream) publishActiveDriver() {
+	if s.position == nil || s.transport == nil {
+		return
+	}
+	id := atomic.LoadUint32(atomicWord(s.position.data, posClockID))
+	atomic.StoreUint32(atomicWord(s.transport.act.data, actActiveDriverID), id)
+	slog.Debug("pipewire: active driver published", "driver", id)
 }
 
 // onSetActivation records a peer's activation block and its eventfd so the
@@ -743,6 +834,7 @@ func (s *Stream) cycle() error {
 		return nil
 	}
 	act := t.act.data
+	s.traceWake(act)
 	if !casStatus(act, actTriggered, actAwake) {
 		return nil
 	}
@@ -863,4 +955,55 @@ func (s *Stream) Running() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.running
+}
+
+// trace logs every server event at Debug level: the first run against a real
+// compositor showed that nothing else tells an operator which step of the
+// negotiation the server took. Fields are kept short on purpose.
+func (s *Stream) trace(ev any) {
+	if !slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+	switch e := ev.(type) {
+	case proto.ClientNodeTransport:
+		slog.Debug("pipewire: event Transport", "mem", e.MemID, "offset", e.Offset, "size", e.Size, "read_fd", e.ReadFd, "write_fd", e.WriteFd)
+	case proto.ClientNodeSetActivation:
+		slog.Debug("pipewire: event SetActivation", "node", e.NodeID, "mem", e.MemID, "signal_fd", e.SignalFd)
+	case proto.ClientNodeCommand:
+		id, ok := e.NodeCommandID()
+		slog.Debug("pipewire: event Command", "id", id, "known", ok)
+	case proto.ClientNodePortSetParam:
+		slog.Debug("pipewire: event PortSetParam", "dir", e.Direction, "port", e.PortID, "param", e.ParamID, "none", proto.IsNone(e.Param))
+	case proto.ClientNodePortSetMixInfo:
+		slog.Debug("pipewire: event PortSetMixInfo", "dir", e.Direction, "port", e.PortID, "mix", e.MixID, "peer", e.PeerID)
+	case proto.ClientNodePortUseBuffers:
+		slog.Debug("pipewire: event PortUseBuffers", "dir", e.Direction, "port", e.PortID, "mix", e.MixID, "n", len(e.Buffers))
+	case proto.ClientNodePortSetIO:
+		slog.Debug("pipewire: event PortSetIO", "dir", e.Direction, "port", e.PortID, "mix", e.MixID, "io", e.IOID, "mem", e.MemID, "size", e.Size)
+	case proto.ClientNodeSetIO:
+		slog.Debug("pipewire: event SetIO", "io", e.IOID, "mem", e.MemID, "offset", e.Offset, "size", e.Size)
+	default:
+		slog.Debug("pipewire: event", "type", fmt.Sprintf("%T", ev))
+	}
+}
+
+// traceWake logs the first wake-ups and then one in every 300, with the
+// activation status seen before the TRIGGERED to AWAKE swap and the state of
+// every mix, so a stream that wakes but never reads a frame explains itself.
+func (s *Stream) traceWake(act []byte) {
+	s.wakes++
+	if s.wakes > 20 && s.wakes%300 != 0 {
+		return
+	}
+	if !slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+	attrs := []any{"wake", s.wakes, "status", atomic.LoadUint32(atomicWord(act, actStatus)), "running", s.running, "format", s.format != nil, "mixes", len(s.mixes), "peers", len(s.peers)}
+	for id, m := range s.mixes {
+		attrs = append(attrs, fmt.Sprintf("mix_%d", id), fmt.Sprintf("io=%v buffers=%d", m.io != nil, len(m.buffers)))
+		if m.io != nil {
+			attrs = append(attrs, fmt.Sprintf("mix_%d_io", id), fmt.Sprintf("status=%d buffer_id=%d", atomic.LoadInt32(atomicInt(m.io.data, ioBuffersStatus)), atomic.LoadUint32(atomicWord(m.io.data, ioBuffersBufferID))))
+		}
+	}
+	slog.Debug("pipewire: wake-up", attrs...)
 }

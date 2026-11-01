@@ -523,3 +523,101 @@ func (s *SlotManager) ValidateBinaryFile(path string) error {
 func (s *SlotManager) ValidateBinaryHeader(header []byte) error {
 	return validateBinaryHeader(header)
 }
+
+// fileSHA256 returns the hex SHA-256 of the file at path.
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// ErrUpdatePending is returned by RefreshActiveFromFile while an update is in
+// its trial window.
+var ErrUpdatePending = errors.New("an update is pending; refusing to refresh the active slot")
+
+// RefreshActiveFromFile makes the active slot's binary match src, which is
+// the executable an operator is installing. It is a no-op (false, nil) when
+// the slot already holds a byte-identical binary. Otherwise src is written to
+// a temp file in the slot directory, fsynced, chmod 0755 and renamed over the
+// slot binary.
+//
+// While an update is pending (trial window) the refresh is refused with
+// ErrUpdatePending and nothing is changed: a running supervisor holds its own
+// in-memory copy of state.json, so rewriting the pending fields here could be
+// overwritten by its next save and leave bin/current and state.json
+// disagreeing. Re-run the install once the update is confirmed or rolled
+// back. A non-empty version is recorded as LastGoodVersion.
+func (s *SlotManager) RefreshActiveFromFile(src, version string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := ValidateBinaryFile(src); err != nil {
+		return false, fmt.Errorf("installing executable: %w", err)
+	}
+	srcSum, err := fileSHA256(src)
+	if err != nil {
+		return false, fmt.Errorf("hash installing executable: %w", err)
+	}
+
+	if s.state.PendingSlot != "" {
+		return false, ErrUpdatePending
+	}
+
+	activeDir := s.getActiveSlotDirLocked()
+	dst := filepath.Join(activeDir, BinaryExecutableName)
+	dstSum, derr := fileSHA256(dst)
+	if derr == nil && dstSum == srcSum {
+		return false, nil
+	}
+
+	{
+		in, err := os.Open(src)
+		if err != nil {
+			return false, fmt.Errorf("open installing executable: %w", err)
+		}
+		defer in.Close()
+		tmp, err := os.CreateTemp(activeDir, ".refresh-*.tmp")
+		if err != nil {
+			return false, fmt.Errorf("create temp slot binary: %w", err)
+		}
+		tmpPath := tmp.Name()
+		done := false
+		defer func() {
+			if !done {
+				_ = tmp.Close()
+				_ = os.Remove(tmpPath)
+			}
+		}()
+		if _, err := io.Copy(tmp, in); err != nil {
+			return false, fmt.Errorf("copy slot binary: %w", err)
+		}
+		if err := tmp.Sync(); err != nil {
+			return false, fmt.Errorf("sync slot binary: %w", err)
+		}
+		if err := tmp.Close(); err != nil {
+			return false, fmt.Errorf("close slot binary: %w", err)
+		}
+		if err := os.Chmod(tmpPath, 0755); err != nil {
+			return false, fmt.Errorf("chmod slot binary: %w", err)
+		}
+		if err := replaceFileAtomic(tmpPath, dst); err != nil {
+			return false, err
+		}
+		done = true
+	}
+
+	if version != "" {
+		s.state.LastGoodVersion = version
+	}
+	if err := s.saveStateLocked(); err != nil {
+		return true, fmt.Errorf("save state after refresh: %w", err)
+	}
+	return true, nil
+}

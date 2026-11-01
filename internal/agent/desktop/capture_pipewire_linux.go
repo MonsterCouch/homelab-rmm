@@ -8,7 +8,7 @@ package desktop
 //
 // The portal negotiation, in pure Go over godbus: CreateSession,
 // SelectSources (types=MONITOR, persist_mode=2 so the grant is remembered),
-// Start, and OpenPipeRemote (a file descriptor for a private PipeWire
+// Start, and OpenPipeWireRemote (a file descriptor for a private PipeWire
 // connection). The restore_token from Start is saved (see restoreTokenPath)
 // and offered on the next SelectSources, so an unattended session is restored
 // without a prompt where the compositor supports it.
@@ -25,7 +25,7 @@ package desktop
 //	        sit behind the Mem and Signal interfaces, so the state machine is
 //	        tested on Windows against a fake server
 //
-// pipewireCapturer opens the transport on the OpenPipeRemote fd once and
+// pipewireCapturer opens the transport on the OpenPipeWireRemote fd once and
 // starts one stream per portal node, lazily, on the first capture of that
 // monitor. capture returns the newest frame. The first call waits up to
 // firstFrameTimeout for a frame to arrive; later calls return the newest
@@ -321,7 +321,7 @@ type pipewireCapturer struct {
 	session dbus.ObjectPath
 	streams []pwStream
 	mons    []monitor
-	conn    *proto.Conn // PipeWire connection from OpenPipeRemote; owns the fd
+	conn    *proto.Conn // PipeWire connection from OpenPipeWireRemote; owns the fd
 	closer  sync.Once
 
 	mu     sync.Mutex
@@ -420,8 +420,8 @@ func newPipeWireCapturer(ctx context.Context) (*pipewireCapturer, error) {
 	}
 
 	var fd dbus.UnixFD
-	if err := pc.obj.CallWithContext(ctx, ifaceScreenCast+".OpenPipeRemote", 0, c.session, map[string]dbus.Variant{}).Store(&fd); err != nil {
-		return fail(fmt.Errorf("OpenPipeRemote: %w", err))
+	if err := pc.obj.CallWithContext(ctx, ifaceScreenCast+".OpenPipeWireRemote", 0, c.session, map[string]dbus.Variant{}).Store(&fd); err != nil {
+		return fail(fmt.Errorf("OpenPipeWireRemote: %w", err))
 	}
 	// The transport takes ownership of fd and closes it on failure.
 	tr, err := proto.NewSocketTransport(int(fd))
@@ -854,4 +854,24 @@ func (w *waylandCapturer) Close() error {
 		return c.Close()
 	}
 	return nil
+}
+
+// capturerSetupNotice is the sentence the viewer sees while newCapturer's
+// first monitors() call may be waiting for the person at the machine: on a
+// Wayland session with the portal enabled and no saved restore token, the
+// ScreenCast portal shows a "Share Screen" prompt (GNOME) that has to be
+// accepted. With a token the next session is silent, so no notice. A token
+// the compositor no longer honours still prompts, without a notice.
+func capturerSetupNotice() string {
+	if !waylandMode.Load() || !portalEnabled(os.Getenv("RMM_WAYLAND_PORTAL")) || loadRestoreToken() != "" {
+		return ""
+	}
+	return setupNoticeFor(hostnameOrDevice())
+}
+
+func hostnameOrDevice() string {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
+	}
+	return "this device"
 }

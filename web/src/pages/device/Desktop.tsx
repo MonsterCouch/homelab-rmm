@@ -43,6 +43,8 @@ interface ScreenMsg {
 interface TextMsg {
   t: string;
   message?: string;
+  /** On a note: a wait the helper is in (a screen-share prompt); shown until the first frame. */
+  pending?: boolean;
   text?: string;
   x?: number;
   y?: number;
@@ -222,6 +224,10 @@ export function Desktop({ agent, canWrite }: TabProps) {
   const rtcActive = useRef(false);
   const rtcWatch = useRef(0);
   const rtcGrace = useRef(0);
+  // The helper reads no socket frames until its first screen message (a first
+  // Wayland session waits on a portal prompt), so the connect watchdog only
+  // runs once a screen has arrived.
+  const screenSeen = useRef(false);
   const rtcOnRef = useRef(true);
   const modeRef = useRef<Mode>('console');
 
@@ -237,6 +243,9 @@ export function Desktop({ agent, canWrite }: TabProps) {
 
   const [status, setStatus] = useState<Status>('idle');
   const [note, setNote] = useState('');
+  // What the helper is waiting for before it can stream, e.g. the person at
+  // the machine accepting a screen-share prompt; empty once it is over.
+  const [waitNote, setWaitNote] = useState('');
   const [detail, setDetail] = useState('');
   const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
   const [monitor, setMonitor] = useState(0);
@@ -410,9 +419,11 @@ export function Desktop({ agent, canWrite }: TabProps) {
         return;
       }
       rtc.current = r;
-      rtcWatch.current = window.setTimeout(() => {
-        if (rtc.current === r && !r.connected) rtcFallback(r, s);
-      }, RTC_CONNECT_MS);
+      if (screenSeen.current) {
+        rtcWatch.current = window.setTimeout(() => {
+          if (rtc.current === r && !r.connected) rtcFallback(r, s);
+        }, RTC_CONNECT_MS);
+      }
       r.start().catch((err) => {
         console.warn('webrtc offer failed', err);
         rtcFallback(r, s);
@@ -446,6 +457,16 @@ export function Desktop({ agent, canWrite }: TabProps) {
             break;
           case 'screen': {
             const sm = m as unknown as ScreenMsg;
+            setWaitNote('');
+            screenSeen.current = true;
+            {
+              const r = rtc.current;
+              if (r && !r.connected && !rtcWatch.current && ws.current === s) {
+                rtcWatch.current = window.setTimeout(() => {
+                  if (rtc.current === r && !r.connected) rtcFallback(r, s);
+                }, RTC_CONNECT_MS);
+              }
+            }
             screen.current = { w: sm.w, h: sm.h };
             const c = canvas.current;
             if (c && (c.width !== sm.w || c.height !== sm.h)) {
@@ -462,7 +483,8 @@ export function Desktop({ agent, canWrite }: TabProps) {
             break;
           }
           case 'note':
-            setNote(m.message ?? '');
+            if (m.pending) setWaitNote(m.message ?? '');
+            else setNote(m.message ?? '');
             break;
           case 'clipboard':
             setRemoteClip(m.text ?? '');
@@ -533,6 +555,8 @@ export function Desktop({ agent, canWrite }: TabProps) {
     setStatus('connecting');
     setDetail('');
     setNote('');
+    setWaitNote('');
+    screenSeen.current = false;
     const n = ++attempt.current;
     // Phase 3: remote desktop needs a signed grant first (a no-op when the
     // organization has no trust bundle, or the grant is still live).
@@ -1208,7 +1232,7 @@ export function Desktop({ agent, canWrite }: TabProps) {
             )}
             {status === 'connected' && !dims.w && (
               <>
-                <span className="spinner" /> Waiting for the first frame…
+                <span className="spinner" /> {waitNote || 'Waiting for the first frame…'}
               </>
             )}
             {status === 'closed' && 'Disconnected'}
@@ -1272,6 +1296,7 @@ export function Desktop({ agent, canWrite }: TabProps) {
           {status === 'error' && 'Error'}
         </span>
         {note && <span style={{ color: 'var(--warn)' }}>{note}</span>}
+        {waitNote && !dims.w && <span style={{ color: 'var(--warn)' }}>{waitNote}</span>}
         {detail && status === 'error' && <span style={{ color: 'var(--danger)' }}>{detail}</span>}
         {viewOnly && <span className="chip warn">view only</span>}
         {touchUI && dims.w > 0 && <span className="small muted">{zoom === 'fit' ? 'Fit' : `${Math.round(scaleRef.current * 100)}%`}</span>}

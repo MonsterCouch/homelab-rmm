@@ -454,8 +454,8 @@ stopping the service, putting the files back and starting it. More in
   afterwards). An admin can also reset another user's 2FA under *Users*, or create a new admin
   with `rmm-server user add`.
 - **Remote desktop on Linux shows a frozen or black picture under Wayland.** Wayland capture goes
-  through the ScreenCast portal and a built-in PipeWire client, and it has not yet been run against
-  a real compositor. The first session asks the person at the machine to allow screen sharing. See
+  through the ScreenCast portal and a built-in PipeWire client, and it is verified on GNOME 50 on
+  Wayland (KDE, DMA-BUF-only compositors, multi-monitor and HiDPI are not). The first session asks the person at the machine to allow screen sharing once. See
   [docs/OPERATIONS.md](docs/OPERATIONS.md), "Wayland screen capture", for the log lines to read and
   for `RMM_WAYLAND_PORTAL=0`, which falls back to the Screenshot portal. An X11/Xorg session needs
   none of this. On Windows the helper needs an interactive console session; the logon screen and
@@ -509,7 +509,7 @@ The full threat model, what is and is not protected, and recommendations are in
 ## Roadmap
 
 - Native endpoint & cloud backups, mobile device management (MDM), and commercial EDR orchestration (see [docs/ROADMAP.md](docs/ROADMAP.md)).
-- Confirm Wayland capture for the Linux remote desktop on a real GNOME and KDE session (the PipeWire client is written and tested against fakes only).
+- Confirm Wayland capture for the Linux remote desktop beyond GNOME 50 (verified there on Ubuntu 26.04.1, PipeWire 1.6.2): KDE, DMA-BUF-only compositors, multi-monitor and HiDPI are open.
 - macOS agent (the platform contract in `internal/agent/platform_other.go` is ready for it).
 - Published container images and signed releases.
 - More notification channels for alerts (webhooks are available through automations today).

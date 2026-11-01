@@ -6,9 +6,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **`/dev/uinput` access on Linux:** `rmm-agent install` writes `/etc/udev/rules.d/70-homelab-rmm-uinput.rules` and reloads udev so the
+  desktop helper (running as the session user) can inject input on Wayland without manual steps; `rmm-agent uninstall` removes it.
 - **Wayland screen capture on Linux:** the desktop helper reads frames from the XDG ScreenCast portal through a pure-Go
   PipeWire client (no CGO, no libpipewire), with the Screenshot portal as the fallback and `RMM_WAYLAND_PORTAL=0` as the
-  off switch. It has not been run against a real compositor yet; see `docs/OPERATIONS.md`, "Wayland screen capture".
+  off switch. It is verified on GNOME 50 on Wayland; see `docs/OPERATIONS.md`, "Wayland screen capture".
 - **Update source in the console:** the agent reports where an update came from (origin, subnet cache or cache failure);
   the device activity tab and the fleet update summary show it.
 - **Multi-Tenancy Hierarchy (Organizations & Sites):** Manage multi-client fleets under distinct
@@ -34,6 +36,14 @@ and versions follow [Semantic Versioning](https://semver.org/).
     agent binaries, systemd unit definitions, and embedded enrollment configs.
 - **In-Place Server Self-Updating:** `POST /api/server/update` performs atomic binary replacement of `rmm-server`,
   synchronizes updated agent packages in the `agents/` directory, and restarts the service gracefully.
+
+### Fixed
+- **Reinstall refreshes the A/B slot:** `rmm-agent install` run from a newer binary now replaces the active slot's `rmm-agent` (atomic temp-file write, fsync, rename, 0755) when its SHA-256 differs, so the service no longer keeps running the previous build; the refresh is refused (with a warning) while an update is pending, since a running supervisor keeps its own copy of `state.json`; re-run the install once the update settles.
+- **Desktop helper log spam:** the "fast-start video encode failed; tiles only" debug line is logged once per session instead of every frame on platforms without a hardware video encoder.
+- **Linux service unit:** the systemd unit template used `text/template` syntax the service library no longer accepts, so the service did not install.
+- **Linux supervisor:** it handed the worker the Windows pipe name and the worker dialled it, so the watchdog killed the worker every 30 seconds.
+- **Wayland capture:** the portal method is `OpenPipeWireRemote`, not `OpenPipeRemote`.
+- **Wayland capture:** the PipeWire stream never wrote `active_driver_id`, so the driver never scheduled it and no frame arrived.
 
 ### Security & Hardening
 - **Security Audit Mitigations (VULN-001 - VULN-016):**

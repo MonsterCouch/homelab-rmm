@@ -108,12 +108,12 @@ type SupervisorConfig struct {
 // Supervisor supervises the worker agent process, managing IPC communications,
 // heartbeat watchdog monitoring, and the automated 60-second rollback circuit.
 type Supervisor struct {
-	cfg        SupervisorConfig
-	slots      *SlotManager
-	ipc        *IPCServer
-	listener   net.Listener
-	ownsIPC    bool
-	logger     *slog.Logger
+	cfg      SupervisorConfig
+	slots    *SlotManager
+	ipc      *IPCServer
+	listener net.Listener
+	ownsIPC  bool
+	logger   *slog.Logger
 
 	mu                 sync.RWMutex
 	state              SupervisorState
@@ -122,7 +122,7 @@ type Supervisor struct {
 	workerRSS          uint64
 	workerStartedAt    time.Time
 	lastHeartbeat      time.Time
-	heartbeatCounter  uint64
+	heartbeatCounter   uint64
 	watchdogTriggered  bool
 	watchdogKills      uint64
 	restarts           uint64
@@ -241,17 +241,17 @@ func NewSupervisor(cfg SupervisorConfig) (*Supervisor, error) {
 	}
 
 	sup := &Supervisor{
-		cfg:          cfg,
-		slots:        slotMgr,
-		ipc:          ipc,
-		listener:     listener,
-		ownsIPC:      ownsIPC,
-		logger:       logger,
-		state:        StateStopped,
-		restartCh:    make(chan string, 8),
-		stopCh:       make(chan struct{}),
-		doneCh:       make(chan struct{}),
-		readyCh:      make(chan struct{}),
+		cfg:       cfg,
+		slots:     slotMgr,
+		ipc:       ipc,
+		listener:  listener,
+		ownsIPC:   ownsIPC,
+		logger:    logger,
+		state:     StateStopped,
+		restartCh: make(chan string, 8),
+		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
+		readyCh:   make(chan struct{}),
 	}
 
 	sup.registerIPCHandlers()
@@ -489,10 +489,15 @@ func (s *Supervisor) spawnWorker() error {
 
 	// Propagate environment
 	cmd.Env = append(os.Environ(), s.cfg.Env...)
-	if s.cfg.PipeName != "" {
-		cmd.Env = append(cmd.Env, "HOMELAB_RMM_IPC_PIPE="+s.cfg.PipeName, "RMM_SUPERVISOR_PIPE="+s.cfg.PipeName)
-	}
-	if s.cfg.SocketPath != "" {
+	// Only the endpoint this platform listens on is handed to the worker.
+	// Both names used to be exported everywhere, and a Linux worker took
+	// the Windows pipe name first, could not dial it, ran standalone and
+	// was killed by the watchdog every 30 seconds for never heartbeating.
+	if runtime.GOOS == "windows" {
+		if s.cfg.PipeName != "" {
+			cmd.Env = append(cmd.Env, "HOMELAB_RMM_IPC_PIPE="+s.cfg.PipeName, "RMM_SUPERVISOR_PIPE="+s.cfg.PipeName)
+		}
+	} else if s.cfg.SocketPath != "" {
 		cmd.Env = append(cmd.Env, "HOMELAB_RMM_IPC_SOCKET="+s.cfg.SocketPath, "RMM_SUPERVISOR_SOCKET="+s.cfg.SocketPath)
 	}
 
@@ -821,4 +826,3 @@ func ConnectIPC(targetPath string) (*IPCClient, error) {
 	_ = client.Connect(conn)
 	return client, nil
 }
-

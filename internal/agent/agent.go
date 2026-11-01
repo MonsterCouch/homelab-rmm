@@ -847,20 +847,21 @@ func (a *Agent) handle(ctx context.Context, env protocol.Envelope) {
 }
 
 // detectSupervisorIPC detects if the worker was spawned under supervisor IPC.
-// Precedence: HOMELAB_RMM_IPC_PIPE, RMM_SUPERVISOR_PIPE (Windows Named Pipe)
-// then HOMELAB_RMM_IPC_SOCKET, RMM_SUPERVISOR_SOCKET (Linux Unix Domain Socket).
+// The platform's own endpoint wins: on Windows the named pipe
+// (HOMELAB_RMM_IPC_PIPE, RMM_SUPERVISOR_PIPE), elsewhere the Unix socket
+// (HOMELAB_RMM_IPC_SOCKET, RMM_SUPERVISOR_SOCKET); the other kind is only a
+// fallback for a supervisor that exported just one of them.
 func detectSupervisorIPC() (string, bool) {
-	if p := os.Getenv("HOMELAB_RMM_IPC_PIPE"); p != "" {
-		return p, true
+	pipe := []string{"HOMELAB_RMM_IPC_PIPE", "RMM_SUPERVISOR_PIPE"}
+	sock := []string{"HOMELAB_RMM_IPC_SOCKET", "RMM_SUPERVISOR_SOCKET"}
+	order := append(sock, pipe...)
+	if runtime.GOOS == "windows" {
+		order = append(pipe, sock...)
 	}
-	if p := os.Getenv("RMM_SUPERVISOR_PIPE"); p != "" {
-		return p, true
-	}
-	if s := os.Getenv("HOMELAB_RMM_IPC_SOCKET"); s != "" {
-		return s, true
-	}
-	if s := os.Getenv("RMM_SUPERVISOR_SOCKET"); s != "" {
-		return s, true
+	for _, name := range order {
+		if v := os.Getenv(name); v != "" {
+			return v, true
+		}
 	}
 	return "", false
 }

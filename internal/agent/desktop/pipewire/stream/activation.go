@@ -19,7 +19,19 @@ const (
 	actAwakeTime     = 40  // u64 ns
 	actFinishTime    = 48  // u64 ns
 	actClientVersion = 540 // u32
+	// actActiveDriverID is active_driver_id: the client writes the id of the
+	// driver whose Position area it has mapped (pw_impl_node_set_io stores
+	// position->clock.id there). The driver's node_ready skips, every cycle,
+	// each target whose active_driver_id differs from its own id, so a node
+	// that never writes it is never scheduled. Found on the first run against
+	// GNOME 50 / PipeWire 1.6.
+	actActiveDriverID = 548 // u32
+	actPosition       = 560 // struct spa_io_position, 1688 bytes
 )
+
+// posClockID is the offset of clock.id inside struct spa_io_position: the
+// position starts with struct spa_io_clock {uint32 flags; uint32 id; ...}.
+const posClockID = 4
 
 // Activation status values (private.h).
 const (

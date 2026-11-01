@@ -351,6 +351,11 @@ func (sc *scenario) memoryAndTransport() {
 		s.send(proto.IDCore, m)
 	}
 	s.send(2, proto.ClientNodeTransport{ReadFd: fdRead, WriteFd: fdWrite, MemID: memAct, Offset: 0, Size: actSize})
+	// The Position area lives inside the driver's activation block; its
+	// clock.id names the driver, and the client must copy it into its own
+	// active_driver_id or the driver never schedules it.
+	atomic.StoreUint32(atomicWord(sc.drv, actPosition+posClockID), driverNode)
+	s.send(2, proto.ClientNodeSetIO{IOID: pod.IOPosition, MemID: memDrv, Offset: actPosition, Size: actSize - actPosition})
 	s.send(2, proto.ClientNodeSetActivation{NodeID: driverNode, SignalFd: fdDrvSig, MemID: memDrv, Offset: 0, Size: actSize})
 	s.send(2, proto.ClientNodeSetActivation{NodeID: ourGlobal, SignalFd: fdSelfSig, MemID: memAct, Offset: 0, Size: actSize})
 
@@ -362,6 +367,15 @@ func (sc *scenario) memoryAndTransport() {
 	}
 	if st := atomic.LoadUint32(atomicWord(sc.act, actStatus)); st != actFinished {
 		t.Fatalf("activation status after SetActive = %d, want FINISHED (3)", st)
+	}
+	// SetActive goes out while the Transport event is handled, before the
+	// SetIO that follows it is processed, so give the dispatcher a moment.
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadUint32(atomicWord(sc.act, actActiveDriverID)) != driverNode && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if v := atomic.LoadUint32(atomicWord(sc.act, actActiveDriverID)); v != driverNode {
+		t.Fatalf("active_driver_id = %d, want the driver %d from the Position area", v, driverNode)
 	}
 }
 

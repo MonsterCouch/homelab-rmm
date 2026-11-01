@@ -376,24 +376,45 @@ func copyBinary(src, dst string) error {
 	return out.Sync()
 }
 
-// ensureSlotsPopulated initializes A/B slot directories and ensures the stable
-// slot binary exists, copying the running executable if necessary.
+// ensureSlotsPopulated initializes A/B slot directories and makes sure the
+// active slot holds the running executable: it seeds an empty slot and, when
+// the executable differs by SHA-256 from the slot binary (a reinstall from a
+// newer build), refreshes the slot so the supervisor runs the new code.
 func ensureSlotsPopulated(baseDir string) (*supervisor.SlotManager, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = ""
+	}
+	return ensureSlotsPopulatedFrom(baseDir, exe)
+}
+
+func ensureSlotsPopulatedFrom(baseDir, exe string) (*supervisor.SlotManager, error) {
 	slots, err := supervisor.InitSlots(baseDir)
 	if err != nil {
 		return nil, fmt.Errorf("init slots: %w", err)
 	}
-
-	slotABin := filepath.Join(slots.GetActiveSlotDir(), supervisor.BinaryExecutableName)
-	if _, err := os.Stat(slotABin); os.IsNotExist(err) {
-		exe, err := os.Executable()
-		if err == nil {
-			if absExe, err := filepath.Abs(exe); err == nil && absExe != slotABin {
-				if err := copyBinary(absExe, slotABin); err != nil {
-					slog.Warn("could not copy running binary to active slot", "src", absExe, "dst", slotABin, "err", err)
-				}
-			}
+	if exe == "" {
+		return slots, nil
+	}
+	absExe, err := filepath.Abs(exe)
+	if err != nil {
+		return slots, nil
+	}
+	slotBin := filepath.Join(slots.GetActiveSlotDir(), supervisor.BinaryExecutableName)
+	if absExe == slotBin {
+		return slots, nil
+	}
+	if _, err := os.Stat(slotBin); os.IsNotExist(err) {
+		if err := copyBinary(absExe, slotBin); err != nil {
+			slog.Warn("could not copy running binary to active slot", "src", absExe, "dst", slotBin, "err", err)
 		}
+		return slots, nil
+	}
+	changed, err := slots.RefreshActiveFromFile(absExe, agent.Version)
+	if err != nil {
+		slog.Warn("could not refresh active slot from installing executable", "src", absExe, "dst", slotBin, "err", err)
+	} else if changed {
+		slog.Info("refreshed active slot from installing executable", "src", absExe, "dst", slotBin)
 	}
 	return slots, nil
 }
@@ -584,6 +605,10 @@ func runInstallCmd(args []string) {
 			fmt.Fprintln(os.Stderr, w)
 		}
 	}
+	// Linux only (a no-op elsewhere): let the session user open /dev/uinput.
+	for _, w := range svc.InstallUinputRule() {
+		fmt.Fprintln(os.Stderr, w)
+	}
 	logPath := agent.LogPath()
 	from := logSize(logPath)
 	if err := svc.Control(spec(), "install"); err != nil {
@@ -603,7 +628,14 @@ func runControlCmd(cmd string, args []string) {
 	dir := configDirFlag(fs)
 	fs.Parse(args)
 	applyConfigDir(*dir)
-	if err := svc.Control(spec(), cmd); err != nil {
+	err := svc.Control(spec(), cmd)
+	if cmd == "uninstall" {
+		// Remove the udev rule even when the service was already gone.
+		for _, w := range svc.RemoveUinputRule() {
+			fmt.Fprintln(os.Stderr, w)
+		}
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

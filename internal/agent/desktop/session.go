@@ -115,6 +115,9 @@ type session struct {
 	// JPEG tiles and feeds the H.264 track instead, until "fallback_tiles".
 	rtc       *webRTCSession
 	videoMode atomic.Bool
+	// fastStartLogged makes the fast-start encode failure log once per session
+	// (the capture loop retries every frame, so it would repeat every tick).
+	fastStartLogged atomic.Bool
 
 	// enc is the H.264 encoder for the WebRTC video track, created lazily by
 	// the capture goroutine and re-created when the frame size changes. encMu
@@ -637,7 +640,9 @@ func (s *session) captureLoop(ctx context.Context) error {
 			vf := videoFrame{rgba: img, w: img.Rect.Dx(), h: img.Rect.Dy(), fresh: true}
 			if nal, _, err := s.encodeVideo(vf); err != nil {
 				s.videoMode.Store(false)
-				slog.Debug("desktop: fast-start video encode failed; tiles only", "err", err)
+				if s.fastStartLogged.CompareAndSwap(false, true) {
+					slog.Debug("desktop: fast-start video encode failed; tiles only", "err", err)
+				}
 			} else if nal != nil {
 				if werr := s.rtc.writeVideo(nal, time.Second/webrtcFPS); werr != nil {
 					slog.Debug("desktop: write video sample", "err", werr)

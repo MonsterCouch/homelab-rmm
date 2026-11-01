@@ -13,6 +13,10 @@ Connection sequence:
    `{"t":"note","message":...}` (from the agent, e.g. "no user logged in, showing logon screen")
    and `{"t":"error","message":...}` before closing.
 
+   The helper dials `/ws/desktop-agent` before it probes the display or the capture backend, so the
+   server's 30/45 second wait for the helper never overlaps a first-session Wayland prompt (which can
+   take up to 2.5 minutes). A probe failure is reported over the socket as `{"t":"error"}`.
+
 All multi-byte integers in binary frames are **little-endian**.
 
 ## Helper → viewer
@@ -24,6 +28,7 @@ Text frames (JSON):
 | `{"t":"screen","w":1920,"h":1080,"monitor":0,"monitors":[{"index":0,"x":0,"y":0,"w":1920,"h":1080,"primary":true},...]}` | sent first, after a monitor switch and whenever the resolution changes. `w`/`h` are the current monitor's size; every tile that follows is in that monitor's pixel space. |
 | `{"t":"cursor","x":10,"y":20,"shape":"arrow"}` | optional cursor position. **No helper sends this yet on any platform**, and the Windows GDI capture excludes the cursor from the pixels, so the remote pointer is currently invisible in the stream. |
 | `{"t":"clipboard","text":"..."}` | optional: remote clipboard changed (text only). **No helper sends this yet on any platform**, so the viewer's "Remote clipboard" control never becomes available. The viewer-to-helper direction (pasting *into* the session) does work. |
+| `{"t":"note","message":"...","pending":true}` | optional, before `screen`: the helper is waiting for something before it can stream (on Wayland, the person at the machine accepting the screen-share prompt, e.g. "Waiting for the person at rmm-wayland to allow screen sharing"). A console that knows `pending` shows it until the first frame; an empty message withdraws it. Without `pending` a note is a plain note; a viewer that ignores unknown fields shows it as one. |
 | `{"t":"error","message":"..."}` | fatal; the helper closes afterwards. |
 
 Binary frames: first byte is the kind.

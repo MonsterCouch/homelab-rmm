@@ -60,53 +60,89 @@ const (
 // /ws/desktop-agent?token=<token> endpoint, pinning the certificate by
 // fingerprint, and streams until the socket closes or ctx ends.
 func Serve(ctx context.Context, cfg Config) error {
+	return serve(ctx, cfg, realServeDeps())
+}
+
+// serveDeps are the platform pieces serve uses, so a test can drive the
+// ordering (dial, then capturer set-up, then the session) with fakes.
+type serveDeps struct {
+	platformInit func() error
+	newInjector  func() (injector, error)
+	newCapturer  func() capturer
+	newBackstage func() (capturer, injector, error)
+	dial         func(ctx context.Context, url, fingerprint string) (*websocket.Conn, error)
+	// setupNotice returns the sentence for the viewer when newCapturer's
+	// monitors() may block on the person at the machine (a Wayland screen
+	// share prompt), or "" when set-up is not expected to wait.
+	setupNotice func() string
+	showBanner  func() func()
+}
+
+func realServeDeps() serveDeps {
+	return serveDeps{
+		platformInit: platformInit,
+		newInjector:  newInjector,
+		newCapturer:  newCapturer,
+		newBackstage: newBackstage,
+		dial:         dial,
+		setupNotice:  capturerSetupNotice,
+		showBanner:   showBanner,
+	}
+}
+
+func serve(ctx context.Context, cfg Config, d serveDeps) error {
 	serverURL, token, fingerprint, quality := cfg.ServerURL, cfg.Token, cfg.Fingerprint, cfg.Quality
 	if serverURL == "" || token == "" {
 		return errors.New("desktop helper needs --server and --token")
 	}
 	target := wsURL(serverURL, "/ws/desktop-agent?token="+url.QueryEscape(token))
 
-	// Probe the platform before dialling so a machine without a usable
-	// display fails with one clear message, but still tell the viewer
-	// about it: an error over the socket beats a 30 s "did not connect".
-	// The injector comes first on purpose: on X11 it holds the one
-	// persistent connection, and the capture backend's per-call
-	// connections must never be the server's last client (an X server
-	// regenerates when that disconnects and drops whoever connects
-	// meanwhile).
+	// Dial the bridge first, on every platform, then probe the platform.
+	// The server waits only 30 s (45 s while the agent RPC is outstanding)
+	// for the helper's socket and the one-time token is spent by the
+	// attempt; capturer set-up can take far longer than that, because on
+	// Wayland the first ScreenCast portal request waits for the person at
+	// the machine to accept a "Share Screen" prompt (up to 30 s + 2 min).
+	// Probing first made the server give up while the prompt was open and
+	// the helper then failed with HTTP 401. The property probing first
+	// had, that a machine without a usable display fails with one clear
+	// message instead of a mystery timeout, is kept: a probe failure is
+	// written to the socket as {"t":"error"} and the console shows it.
+	// The X11 order inside the probe is unchanged: the injector comes
+	// first on purpose, because it holds the one persistent X connection
+	// and the capture backend's per-call connections must never be the
+	// server's last client (an X server regenerates when that disconnects
+	// and drops whoever connects meanwhile). Dialling earlier opens no X
+	// connection, so that rule is not affected.
+	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ws, err := d.dial(dialCtx, target, fingerprint)
+	cancel()
+	if err != nil {
+		return err
+	}
+
 	var (
 		cap  capturer
 		inj  injector
 		perr error
 	)
 	backstage := modeOrDefault(cfg.Mode) == string(modeBackstage)
-	if perr = platformInit(); perr == nil {
+	if perr = d.platformInit(); perr == nil {
 		if backstage {
 			// An isolated administrative desktop the logged-in user never
 			// sees. Its capturer composites the virtual desktop's windows
 			// off-screen and its injector posts messages to them, so the
 			// physical screen and cursor are never touched.
-			cap, inj, perr = newBackstage()
-		} else if inj, perr = newInjector(); perr == nil {
-			cap = newCapturer()
-			if _, perr = cap.monitors(); perr != nil {
-				if c, ok := cap.(interface{ Close() error }); ok {
-					c.Close()
-				}
+			cap, inj, perr = d.newBackstage()
+		} else if inj, perr = d.newInjector(); perr == nil {
+			cap = d.newCapturer()
+			perr = probeCapturer(ctx, ws, cap, d.setupNotice)
+			if perr != nil {
+				closeCapturer(cap)
 				inj.close()
 				inj = nil
 			}
 		}
-	}
-
-	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	ws, err := dial(dialCtx, target, fingerprint)
-	cancel()
-	if err != nil {
-		if inj != nil {
-			inj.close()
-		}
-		return err
 	}
 	if perr != nil {
 		slog.Error("desktop helper cannot start", "err", perr)
@@ -118,10 +154,8 @@ func Serve(ctx context.Context, cfg Config) error {
 		return perr
 	}
 	defer inj.close()
-	if c, ok := cap.(interface{ Close() error }); ok {
-		defer c.Close()
-	}
-	hideBanner := showBanner()
+	defer closeCapturer(cap)
+	hideBanner := d.showBanner()
 	defer hideBanner()
 	slog.Info("desktop helper connected", "server", serverURL, "quality", quality, "mode", modeOrDefault(cfg.Mode), "webrtc", cfg.WebRTC)
 	s := newSession(ws, cap, inj, quality)
@@ -130,6 +164,56 @@ func Serve(ctx context.Context, cfg Config) error {
 	err = s.run(ctx)
 	slog.Info("desktop helper finished", "err", err)
 	return err
+}
+
+func closeCapturer(c capturer) {
+	if cl, ok := c.(interface{ Close() error }); ok {
+		cl.Close()
+	}
+}
+
+// probeCapturer enumerates the monitors once, which is where a capturer does
+// its set-up (and, on Wayland, waits for the screen-share prompt). When
+// notice says set-up may wait for a person, the viewer is told first with a
+// "note" that carries "pending":true; a console that knows the flag shows it
+// only until the first frame, and one that does not shows it as an ordinary
+// note. When set-up succeeds a pending note with an empty message withdraws
+// it. Cancelling ctx closes the capturer, which ends a wait in progress.
+func probeCapturer(ctx context.Context, ws *websocket.Conn, cap capturer, notice func() string) error {
+	pending := ""
+	if notice != nil {
+		pending = notice()
+	}
+	if pending != "" {
+		writePendingNote(ws, pending)
+	}
+	res := make(chan error, 1)
+	go func() {
+		_, err := cap.monitors()
+		res <- err
+	}()
+	var err error
+	select {
+	case err = <-res:
+	case <-ctx.Done():
+		closeCapturer(cap)
+		err = <-res
+		if err == nil {
+			err = ctx.Err()
+		}
+	}
+	if err == nil && pending != "" {
+		writePendingNote(ws, "")
+	}
+	return err
+}
+
+// writePendingNote sends {"t":"note","message":msg,"pending":true}. Nothing
+// else writes to the socket until the session starts, so no lock is needed.
+func writePendingNote(ws *websocket.Conn, msg string) {
+	b, _ := json.Marshal(map[string]any{"t": "note", "message": msg, "pending": true})
+	ws.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	ws.WriteMessage(websocket.TextMessage, b)
 }
 
 // Launch starts the helper for the interactive session from the agent

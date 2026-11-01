@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -191,5 +192,24 @@ func TestGetProcessRSS(t *testing.T) {
 	rss := getProcessRSS()
 	if rss == 0 {
 		t.Errorf("getProcessRSS returned 0")
+	}
+}
+
+// TestAgentDetectSupervisorIPCPrefersPlatformEndpoint: when both kinds are
+// exported, the worker must dial the one its platform listens on. A Linux
+// worker that took the Windows pipe name ran standalone and was killed by the
+// watchdog every 30 seconds.
+func TestAgentDetectSupervisorIPCPrefersPlatformEndpoint(t *testing.T) {
+	t.Setenv("HOMELAB_RMM_IPC_PIPE", `\\.\pipe\test-homelab-pipe`)
+	t.Setenv("RMM_SUPERVISOR_PIPE", `\\.\pipe\test-homelab-pipe`)
+	t.Setenv("HOMELAB_RMM_IPC_SOCKET", "/run/homelab-rmm/test.sock")
+	t.Setenv("RMM_SUPERVISOR_SOCKET", "/run/homelab-rmm/test.sock")
+	want := "/run/homelab-rmm/test.sock"
+	if runtime.GOOS == "windows" {
+		want = `\\.\pipe\test-homelab-pipe`
+	}
+	path, ok := detectSupervisorIPC()
+	if !ok || path != want {
+		t.Fatalf("detectSupervisorIPC() = %q, %v; want %q on %s", path, ok, want, runtime.GOOS)
 	}
 }

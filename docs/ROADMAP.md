@@ -43,7 +43,7 @@ flowchart TD
 - [x] **Secret In-Memory Protection & Output Redaction:**
   - Real-time stream redactor on stdout/stderr streams sanitizing Bearer tokens, key-value secrets (`password=...`), and PEM private keys into `[REDACTED]`.
 
-### Phase 2: Remote Control & Streaming Overhaul *(Completed, Linux Wayland capture unverified on a real compositor)*
+### Phase 2: Remote Control & Streaming Overhaul *(Completed; Linux Wayland capture verified on GNOME 50)*
 Plan: [`docs/plans/2026-10-01-phase2-remote-desktop-webrtc.md`](plans/2026-10-01-phase2-remote-desktop-webrtc.md). Wire protocol: [`docs/DESKTOP-PROTOCOL.md`](DESKTOP-PROTOCOL.md).
 - [x] **DirectX (DXGI) Desktop Duplication:**
   - `IDXGIOutputDuplication` GPU capture with hybrid-GPU adapter matching, driver dirty/move rects and hardware cursor compositing; automatic GDI fallback (`internal/agent/desktop/capture_dxgi_windows.go`).
@@ -54,11 +54,11 @@ Plan: [`docs/plans/2026-10-01-phase2-remote-desktop-webrtc.md`](plans/2026-10-01
 - [x] **Administrative Backstage Mode:**
   - Windows `CreateDesktopW` virtual desktop isolation on `winsta0`, off-screen `PrintWindow` compositing and `PostMessageW` input (never `GetDC(NULL)` or `SendInput`).
   - Enables technicians to perform interactive GUI and shell maintenance without taking over the logged-in user's monitor.
-- [x] **Linux Screen Streaming Modernization** *(implemented, not verified against a real compositor)*:
+- [x] **Linux Screen Streaming Modernization** *(verified on GNOME 50 Wayland, Ubuntu 26.04.1, PipeWire 1.6.2, in a Hyper-V VM)*:
   - `/dev/uinput` input injection and the XDG ScreenCast portal negotiation with a persisted restore token.
   - PipeWire frame ingestion is a pure Go client (no libpipewire, no CGO): `internal/agent/desktop/pipewire/pod` (SPA POD codec), `proto` (native protocol over the portal's fd) and `stream` (a video input stream as a client-node). Details: `docs/plans/2026-10-25-loose-ends.md`.
-  - **Unverified.** It was built on Windows and tested only against a fake server and hand-derived byte vectors; no PipeWire daemon, portal or compositor has run it. The `epoll`, `eventfd` and `mmap` code only compiles. The biggest open question is whether the portal's restricted connection accepts the client-node and the session manager links it to the portal node.
-  - **First check:** on a GNOME or KDE Wayland session, run the agent with `RMM_DEBUG=1` and open a remote desktop session. `desktop: Wayland capture uses PipeWire` followed by live frames is a pass. `desktop: PipeWire capture unavailable` or `... failed; falling back to the Screenshot portal` names the reason in its `err` field; keep that line. `RMM_WAYLAND_PORTAL=0` forces the old path. See `docs/OPERATIONS.md`.
+  - **Verified 2026-10-31** on GNOME 50 / mutter, PipeWire 1.6.2, xdg-desktop-portal-gnome 50, Ubuntu 26.04.1 in a Hyper-V VM: the console showed the live desktop and mouse and keyboard input worked. The real run found four bugs, now fixed (see `docs/plans/2026-10-25-loose-ends.md`). **Still unverified:** KDE, compositors that offer only DMA-BUF, multi-monitor and HiDPI scaling.
+  - **Check on another machine:** run the agent with `RMM_DEBUG=1` and open a remote desktop session. `desktop: Wayland capture uses PipeWire` followed by live frames is a pass. `desktop: PipeWire capture unavailable` or `... failed; falling back to the Screenshot portal` names the reason in its `err` field; keep that line. `RMM_WAYLAND_PORTAL=0` forces the old path. See `docs/OPERATIONS.md`.
 
 ### Phase 3: Signed Actions & Tamper-Evident Audit *(Completed)*
 Plan: [`docs/plans/2026-10-06-phase3-signed-actions.md`](plans/2026-10-06-phase3-signed-actions.md). Re-scoped on 2026-10-06: browser WebAuthn signing first and an out-of-band signer later; a local Merkle log instead of Sigstore Rekor; QUIC delivered last as an agent-only transport.

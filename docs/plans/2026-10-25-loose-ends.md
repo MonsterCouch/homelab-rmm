@@ -34,7 +34,7 @@ DMA-BUF buffers, cursor metadata as a separate layer (the cursor is composited b
 
 ## Status (implemented 2026-10-25)
 
-Both items are built. Neither has run against real infrastructure: the update source was not rendered in a browser, and the PipeWire client has never met a PipeWire daemon.
+Both items are built. The update source was not rendered in a browser. The PipeWire client has now run against a real compositor: on 2026-10-31 it streamed frames, with mouse and keyboard input, from GNOME 50 on Wayland (mutter) with PipeWire 1.6.2 and xdg-desktop-portal-gnome 50, on Ubuntu 26.04.1 in a Hyper-V VM, and the console showed the live desktop. The sections below were written before that run; the lists at the end say what it settled.
 
 ### 1. Update source
 
@@ -64,12 +64,44 @@ Deviations:
 - **Selection.** `RMM_WAYLAND_PORTAL=0` turns the portal off; any other value leaves it on. A first frame that is slow to arrive is not a failure (an idle screen sends none). A stream error, `Session.Closed` from the portal, or a running stream silent for 2 minutes switches to the screenshot path, and a background probe with backoff (30 seconds doubling to 10 minutes, only while a restore token exists) switches back; an idle screen therefore costs one switch every couple of minutes. The capturer corrects each monitor's `Bounds` to the stream's frame size after the first frame, so a HiDPI or cropped output no longer makes `session.go` re-enumerate forever; `session.go` still re-enumerates on the mismatch, and monitor positions are not rescaled. `streamFor` holds a mutex while a stream opens, so `Close` can wait up to 10 seconds. Returned images are shared between calls and must not be modified; whether `session.go` obeys that was not checked. None of the retry, stall or session-closed paths has run against a real portal.
 - The existing Linux test that asserted `errPipeWireNoIngest` was renamed `TestPipeWireCaptureWithoutSessionFailsWithoutFrames` and now expects any error and no image.
 
-### Not verified
+### Verified on 2026-10-31
 
-- Whether the portal's restricted fd accepts the client-node and whether WirePlumber links it from `node.target` alone.
-- Whether a synchronous node needs `Async`, the exact port `param_flags` the server wants, and whether the `PW_MEMBLOCK_FLAG_WRITABLE` value of 2 matches what the server announces.
-- The pixel byte order (taken from the format names), and whether producers hand out MemPtr or MemId data and with which `mapoffset`.
-- The `epoll`, `eventfd`, `mmap` and `SCM_RIGHTS` batching code (compiled, never run), id reuse in the proxy allocator, and the order of the first server messages after Hello.
-- The portal code, still written from the specification.
+Run on Ubuntu 26.04.1 (Hyper-V VM), GNOME 50 on Wayland, PipeWire 1.6.2, xdg-desktop-portal-gnome 50.
 
-First check: a GNOME or KDE Wayland session with `RMM_DEBUG=1`; see `docs/OPERATIONS.md`, "Wayland screen capture". Anything that fails falls back to the Screenshot portal as before.
+- The portal's restricted fd accepts `CreateObject("client-node")`.
+- WirePlumber links the node from `node.target` alone.
+- A synchronous node is fine. `Async` is not needed (the driver, mutter, is the async node).
+- MemFd buffers: the server offered 8 of them. Format BGRx 1024x768, framerate 0/1, maxFramerate about 60.
+- BGRx byte order renders correctly.
+- The `epoll`, `eventfd`, `mmap` and `SCM_RIGHTS` code works.
+- Order of the first server messages as observed: `PortSetParam(Format)` and `PortUseBuffers` before `Command Start`; `SetActivation` for the node itself before `Transport`, removed later with mem id `0xffffffff`. ClientNode interface version 6. Details in `docs/plans/2026-10-25-pipewire-protocol-notes.md`, section 8.
+
+### Found by the real run
+
+Four bugs, all fixed in the working tree:
+
+- **Linux service unit template** (`internal/svc/svc.go`): the systemd unit template used `text/template` syntax the service library no longer accepts, so the service could not be installed.
+- **Supervisor handed the worker the Windows pipe name** (`internal/supervisor/supervisor.go`, `internal/agent/agent.go`): the supervisor exported the Windows named-pipe name to the Linux worker and the worker dialled it, so its watchdog killed the worker every 30 seconds.
+- **Misspelled portal method** (`internal/agent/desktop/capture_pipewire_linux.go`): the call was `OpenPipeRemote`; the portal method is `OpenPipeWireRemote`.
+- **`active_driver_id` never written** (`internal/agent/desktop/pipewire/stream/stream.go` `onSetIO` and `publishActiveDriver`, `activation.go`): the stream did not copy `clock.id` from the Position I/O area (offset 4 of `struct spa_io_position`) into its activation at offset 548, so the driver skipped the node every cycle and it never ran. Debug-level traces (`trace`, `traceWake`, `traceActivation`) were added to the stream.
+
+### Verified later on 2026-10-31
+
+- The first session on a machine with no restore token: the helper now dials the bridge before it probes the capturer, the console shows "Waiting for the person at rmm-wayland to allow screen sharing" while GNOME's Share Screen prompt is up, the server's 30-second helper wait no longer fires, and frames arrive once the prompt is accepted (tested with the token deleted and the prompt left open for over 30 seconds).
+- `rmm-agent install` writes the uinput udev rule; after `uninstall` and `install` on the VM the rule was present and `/dev/uinput` carried the session user's ACL without a re-login.
+
+Two more, found while re-testing and fixed the same day:
+
+- **Reinstall kept the old slot binary** (`cmd/rmm-agent/main.go`, `internal/supervisor/slots.go`): `rmm-agent install` seeded the A/B slot only when it was empty, so an install from a newer binary left the supervisor running the previous build. Install now refreshes the active slot when the SHA-256 differs (verified on the VM) and refuses while an update is pending.
+- **Fast-start log spam** (`internal/agent/desktop/session.go`): "fast-start video encode failed; tiles only" was logged every 100 ms on Linux, which has no hardware encoder; it is logged once per session now.
+
+### Still unverified
+
+- KDE (Plasma) on Wayland.
+- Compositors that offer DMA-BUF only (the client offers MemFd and MemPtr, never DmaBuf).
+- Multi-monitor sessions.
+- HiDPI scaling (the `Bounds` correction after the first frame and monitor positions).
+- The retry, stall and session-closed paths against a real portal.
+- The portal code beyond the GNOME 50 happy path.
+
+First check on another machine: a Wayland session with `RMM_DEBUG=1`; see `docs/OPERATIONS.md`, "Wayland screen capture". Anything that fails falls back to the Screenshot portal as before.

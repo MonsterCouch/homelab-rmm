@@ -141,7 +141,7 @@ func checkUinputWritable() error {
 	case errors.Is(err, os.ErrNotExist):
 		return fmt.Errorf("%s does not exist (is the uinput kernel module loaded? try `modprobe uinput`)", uinputPath)
 	case errors.Is(err, os.ErrPermission):
-		return fmt.Errorf("%s is not writable by uid %d (grant access with a udev rule such as KERNEL==\"uinput\", GROUP=\"input\", MODE=\"0660\" and add the user to that group, or rely on logind's uaccess ACL): %w", uinputPath, os.Geteuid(), err)
+		return fmt.Errorf("%s is not writable by uid %d (`rmm-agent install` writes /etc/udev/rules.d/70-homelab-rmm-uinput.rules for this; otherwise grant access with a udev rule such as KERNEL==\"uinput\", GROUP=\"input\", MODE=\"0660\", TAG+=\"uaccess\" and reload udev, or add the user to that group): %w", uinputPath, os.Geteuid(), err)
 	}
 	return fmt.Errorf("open %s: %w", uinputPath, err)
 }

@@ -7,7 +7,8 @@ Audience: engineers who implement `internal/agent/desktop/pipewire/{pod,proto,st
 
 - Every file below was fetched from `https://gitlab.freedesktop.org/pipewire/pipewire/-/raw/1.2.7/<path>`
   (tag 1.2.7). The tag 1.0.0 and master were not needed. Paths are relative to the repository root.
-  Line numbers in this file are line numbers of those 1.2.7 files.
+  Line numbers in this file are line numbers of those 1.2.7 files. The implementation was verified
+  against PipeWire 1.6.2 on 2026-10-31 (section 8); the line numbers still refer to 1.2.7.
 - Where a fact says "symbol", search that symbol in the named file.
 - The POD byte examples in section 1.6 and the message examples in section 2.8 were produced by a
   small independent encoder (Python, written for this note) that follows `spa/pod/builder.h`. They
@@ -20,7 +21,8 @@ Audience: engineers who implement `internal/agent/desktop/pipewire/{pod,proto,st
   with gcc (x86-64) and printing `offsetof`.
 - All integers on the wire are host byte order. Every PipeWire target here is little endian (x86-64,
   arm64), so write little endian. Nothing in the protocol converts byte order.
-- Nothing here was tested against a running daemon. Section 7 lists what is unverified.
+- This file was written without a running daemon. Section 8 records what a real run on 2026-10-31 settled
+  and one step this file missed (the end of 4.5); section 7 is the list as it stood before that run.
 
 ## 1. SPA POD wire format
 
@@ -731,6 +733,18 @@ On deactivate the client exchanges INACTIVE (4) into the status (`do_node_unprep
 value was NOT_TRIGGERED, TRIGGERED or AWAKE (`PW_NODE_ACTIVATION_PENDING_TRIGGER`, status <= AWAKE) it also
 triggers its targets, so the driver's cycle can finish. The Go client does the same for a synchronous node.
 
+Setup step the first draft missed: `active_driver_id` (found by the first real run, 2026-10-31). When the
+server sends `ClientNode.SetIO` with id `Position` (7), the client maps the area. It lies inside the driver's
+activation block, at offset 560 (`position` in the table above), and is a `struct spa_io_position` whose first
+member is `struct spa_io_clock {uint32 flags; uint32 id; ...}`. The client must read `position->clock.id`
+(offset 4 of the area) and write it into its own activation's `active_driver_id` (offset 548 of the client's
+own activation block). Why it matters: the driver's `node_ready` (`impl-node.c`) walks its targets every cycle
+and skips each target whose `active_driver_id` differs from the driver's own id. A node that never writes the
+field is therefore never prepared (its status never becomes NOT_TRIGGERED and its `pending` count is never
+reset) and never triggered, so it receives no cycle at all, with no error on either side. Rewrite the field
+whenever a new Position SetIO arrives, and treat a SetIO with a null or `0xffffffff` mem id as the area going
+away.
+
 Wake up and process cycle, as run by `node_on_fd_events` (`impl-node.c:1544`) and `process_node`
 (`impl-node.c:1464`):
 
@@ -925,8 +939,12 @@ metadata is out of scope. A chunk size above the data block's maxsize is clamped
 9. Handle both `PortSetIO` ids 1 and 10; with 10 index by `clock.cycle & 1`.
 10. Do not rely on the order of server events; dispatch by (proxy id, opcode).
 11. Bound every count and size from the wire with the limits in 2.7 before allocating.
+12. On `SetIO` id Position (7), copy `position->clock.id` (offset 4 of the area) into the node's own activation
+    `active_driver_id` (offset 548). Without it the driver never prepares or triggers the node (4.5).
 
 ## 7. Not found, unverified, or derived
+
+This list is as written on 2026-10-25. Section 8 says which items a real run settled.
 
 - No byte vectors in PipeWire's tests (see section 0). All byte examples were produced by a separate
   encoder written from the builder source; nothing was compared with bytes captured from a real daemon.
@@ -955,3 +973,30 @@ metadata is out of scope. A chunk size above the data block's maxsize is clamped
   AddMem was not traced beyond `block->flags`.
 - Registry methods, Node/Port/Device/Link/Module/Factory interfaces were not documented: the client does
   not use them.
+
+## 8. Observed on a real run (2026-10-31)
+
+Verified 2026-10-31:
+
+- Compositor and driver: GNOME 50 on Wayland (mutter).
+- PipeWire 1.6.2 (this file's line numbers refer to 1.2.7; the protocol, opcodes and layouts used here held).
+- xdg-desktop-portal-gnome 50.
+- Ubuntu 26.04.1 in a Hyper-V VM. The client streamed real frames to the console and input worked.
+
+What the run showed:
+
+- The portal's fd accepted `CreateObject("client-node")`, and WirePlumber linked the node from `node.target` alone.
+  A synchronous node (not async) worked. Nothing needed `Async`.
+- Interface versions seen: ClientNode version 6, as in 3.3.
+- Buffers: the server offered 8 buffers of data type MemFd. Format: BGRx, 1024x768, framerate 0/1
+  (variable) and maxFramerate about 60.
+- Order of the first server messages: the first `PortSetParam(Format)` and `PortUseBuffers` arrived before
+  `Command Start`. `SetActivation` for the node itself arrived before `Transport`, and it is removed later with
+  mem id `0xffffffff`. Dispatch by (proxy id, opcode), as item 10 of section 6 says, and do not require a
+  fixed order.
+- Cycles: mutter is the driver (`node.async=true`, `node.driver=true`). It runs a cycle only when it has recorded
+  a frame, so an idle screen produces no cycles and no frames. A consumer that never returns buffers starves
+  the producer: mutter stops recording when it has no free buffer. Return every buffer (set `status = NEED_DATA`
+  after copying, 4.5) and treat a long silence as an idle screen, not as a dead stream.
+- The missing step: until the client wrote `active_driver_id` (end of 4.5, checklist item 12) the driver never
+  scheduled the node. That was the only protocol error found; everything else in sections 2 to 5 worked as written.
