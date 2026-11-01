@@ -624,6 +624,14 @@ func (a *Agent) dispatch(ctx context.Context, env protocol.Envelope) {
 			a.shells.close(in.Session)
 		}
 		return
+	case protocol.ReqShellRTC:
+		var in protocol.ShellRTC
+		if json.Unmarshal(env.D, &in) == nil {
+			if err := a.shells.rtcSignal(in); err != nil {
+				slog.Debug("shell webrtc: signal refused", "err", err)
+			}
+		}
+		return
 	case protocol.ReqScriptCancel:
 		var in struct {
 			RunID string `json:"run_id"`

@@ -1233,6 +1233,17 @@ export interface AgentUpdateResult {
   version?: string;
 }
 
+/** 200 from POST /api/agents/{id}/update. */
+export interface DispatchUpdateResult {
+  ok: boolean;
+  message: string;
+  /** the device is still downloading; it restarts on its own when done */
+  installing?: boolean;
+  /** the device already runs the pushed build, nothing was sent */
+  up_to_date?: boolean;
+  result?: AgentUpdateResult;
+}
+
 /** Devices per download source in one update batch. */
 export interface UpdateSourceCounts {
   cache: number;

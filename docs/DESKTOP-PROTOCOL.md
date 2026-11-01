@@ -72,6 +72,8 @@ The viewer opens `wss://server/ws/desktop/{agentId}` with:
 
 ## WebRTC transport (optional, with automatic fallback)
 
+The terminal uses the same scheme with a `term` data channel; see [TERMINAL-PROTOCOL.md](TERMINAL-PROTOCOL.md).
+
 When the viewer asks for it (`?webrtc=1`), video and input can travel peer-to-peer over WebRTC
 (UDP/SRTP) instead of through the server relay, cutting latency and server bandwidth. The JPEG
 tile stream stays up as both the **fast-start** (the first picture shows in <100 ms over the

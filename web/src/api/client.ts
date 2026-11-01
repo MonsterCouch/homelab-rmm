@@ -8,7 +8,7 @@ import type {
   AgentEvent,
   AgentPatches,
   AgentUpdate,
-  AgentUpdateResult,
+  DispatchUpdateResult,
   Alert,
   AlertRule,
   AuditRow,
@@ -609,7 +609,9 @@ export const api = {
   // ---- system & agent updates ----
   serverVersion: () => get<ServerVersionInfo>('/api/server/version'),
   updateServer: () => post<{ ok: boolean; message: string }>('/api/server/update'),
-  dispatchAgentUpdate: (agentId: string) => post<{ ok: boolean; message: string; installing?: boolean; up_to_date?: boolean; result?: AgentUpdateResult }>(`/api/agents/${enc(agentId)}/update`),
+  /** Resolves to ApprovalPending when more approvers are needed. force reinstalls a device that already runs the build. */
+  dispatchAgentUpdate: (agentId: string, opts?: { force?: boolean }) =>
+    post<DispatchUpdateResult | ApprovalPending>(`/api/agents/${enc(agentId)}/update${opts?.force ? '?force=1' : ''}`),
   /** Updates the devices of organizations that do not sign actions at once and
    *  returns the rest as groups; lib/fleetUpdate.ts asks for one signature per
    *  group through updateAgentBatch. */

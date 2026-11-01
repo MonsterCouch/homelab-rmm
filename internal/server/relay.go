@@ -134,6 +134,9 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 	defer keepViewerAlive(ws)()
 	sw := &wsWriter{c: ws}
 	send := func(v any) { sw.json(v) }
+	// ?webrtc=1: the viewer wants the terminal bytes over a WebRTC data
+	// channel (docs/TERMINAL-PROTOCOL.md); the relay stays the fallback.
+	wantRTC := r.URL.Query().Get("webrtc") == "1" || r.URL.Query().Get("webrtc") == "true"
 	uName := "technician"
 	if u != nil && u.Username != "" {
 		uName = u.Username
@@ -185,6 +188,9 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 			Data  string `json:"data"`
 			Cols  int    `json:"cols"`
 			Rows  int    `json:"rows"`
+			// WebRTC signaling from the viewer.
+			SDP       string          `json:"sdp"`
+			Candidate json.RawMessage `json:"candidate"`
 		}
 		if err := ws.ReadJSON(&msg); err != nil {
 			var ne net.Error
@@ -221,6 +227,18 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 			// first prompt - can reach it before Stream has even returned the
 			// session id. Anything it produces before the marker is queued
 			// and flushed straight after it, in order.
+			// Hand the viewer its ICE servers before the shell is asked for,
+			// the same message the desktop viewer gets, and give the agent
+			// the same servers (the desktop helper never gets them).
+			shellOpen := protocol.ShellOpen{Shell: msg.Shell, Cols: msg.Cols, Rows: msg.Rows}
+			if wantRTC {
+				ice := s.cfg.iceServersJSON()
+				send(map[string]any{"t": "webrtc_config", "ice_servers": ice})
+				var servers []protocol.ICEServer
+				if json.Unmarshal(ice, &servers) == nil {
+					shellOpen.RTC, shellOpen.ICEServers = true, servers
+				}
+			}
 			forward := func(v any) { // caller holds openMu
 				if flowing {
 					send(v)
@@ -228,6 +246,9 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 				}
 				queued = append(queued, v)
 			}
+			// A device can only move a session onto WebRTC once; repeated
+			// "switch" signals must not write more audit rows or events.
+			var rtcSwitchOnce sync.Once
 			settle := func() { // caller holds openMu
 				if flowing {
 					return
@@ -244,7 +265,7 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 				}
 				queued = nil
 			}
-			id, c, err := s.hub.StreamA(agentID, protocol.ReqShellOpen, protocol.ShellOpen{Shell: msg.Shell, Cols: msg.Cols, Rows: msg.Rows}, func(env protocol.Envelope) {
+			id, c, err := s.hub.StreamA(agentID, protocol.ReqShellOpen, shellOpen, func(env protocol.Envelope) {
 				openMu.Lock()
 				defer openMu.Unlock()
 				if env.Err != "" {
@@ -262,7 +283,16 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				agentSaw = true
-				if chunk.EOF || env.T == protocol.TypeReply {
+				if chunk.Sig != nil {
+					// WebRTC signaling, not output; it goes through the same
+					// queue so it never overtakes the "opened" marker.
+					if f := rtcFrame(chunk.Sig); f != nil {
+						forward(f)
+						if chunk.Sig.Kind == "switch" {
+							rtcSwitchOnce.Do(func() { s.shellRTCSwitched(r, agentID, uName) })
+						}
+					}
+				} else if chunk.EOF || env.T == protocol.TypeReply {
 					forward(map[string]any{"t": "closed"})
 				} else {
 					forward(map[string]any{"t": "out", "data": chunk.Data})
@@ -287,11 +317,65 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 			if session != "" {
 				s.hub.Notify(agentID, protocol.ReqShellResize, protocol.ShellResize{Session: session, Cols: msg.Cols, Rows: msg.Rows})
 			}
+		case "rtc_offer", "rtc_candidate", "rtc_fallback":
+			// Signaling is honoured only for a shell the device confirmed.
+			openMu.Lock()
+			opened := flowing && !refused && session != ""
+			openMu.Unlock()
+			if !opened || !wantRTC {
+				continue
+			}
+			sig := protocol.ShellRTC{Session: session}
+			switch msg.T {
+			case "rtc_offer":
+				if msg.SDP == "" || len(msg.SDP) > shellRTCSDPLimit {
+					send(map[string]any{"t": "rtc_unavailable", "reason": "offer rejected: missing or oversized SDP"})
+					continue
+				}
+				sig.Kind, sig.SDP = "offer", msg.SDP
+			case "rtc_candidate":
+				if len(msg.Candidate) == 0 || len(msg.Candidate) > shellRTCSDPLimit {
+					continue
+				}
+				sig.Kind, sig.Candidate = "candidate", msg.Candidate
+			default:
+				sig.Kind = "fallback"
+			}
+			s.hub.Notify(agentID, protocol.ReqShellRTC, sig)
 		case "close":
 			closeText = "session closed"
 			return
 		}
 	}
+}
+
+// shellRTCSDPLimit caps one SDP or candidate the viewer may forward to a
+// device.
+const shellRTCSDPLimit = 64 << 10
+
+// rtcFrame maps the device's signaling to the frame the viewer expects.
+func rtcFrame(sig *protocol.ShellSignal) map[string]any {
+	switch sig.Kind {
+	case "answer":
+		return map[string]any{"t": "rtc_answer", "sdp": sig.SDP}
+	case "candidate":
+		return map[string]any{"t": "rtc_candidate", "candidate": sig.Candidate}
+	case "switch":
+		return map[string]any{"t": "rtc_switch"}
+	case "unavailable":
+		return map[string]any{"t": "rtc_unavailable", "reason": sig.Reason}
+	}
+	return nil
+}
+
+// shellRTCSwitched records that a terminal moved onto a WebRTC data channel.
+func (s *Server) shellRTCSwitched(r *http.Request, agentID, user string) {
+	s.audit(r, "shell.rtc", agentID, nil)
+	msg := fmt.Sprintf("Terminal session upgraded to WebRTC by %s", user)
+	if _, err := s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,?)`, agentID, now(), "remote", msg, jsonText(map[string]any{"user": user, "type": "terminal", "transport": "webrtc"})); err != nil {
+		slog.Warn("terminal WebRTC event not recorded", "agent", agentID, "err", err)
+	}
+	s.hub.broadcast(hubEvent{Kind: "event", AgentID: agentID, Data: map[string]any{"ts": now(), "kind": "remote", "message": msg}})
 }
 
 // ---- remote desktop ----

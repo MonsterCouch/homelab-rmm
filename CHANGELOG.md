@@ -6,6 +6,14 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Remote terminal over WebRTC:** the terminal moves its bytes over a WebRTC data channel (`term`, raw pty bytes, no string
+  conversion) and keeps the WebSocket relay as the fallback; the switch is ordered so no byte is lost or reordered, and the
+  browser falls back after 4 s or on any failure. The ICE servers from `RMM_ICE_SERVERS`, credentials included, now reach the
+  agent in `shell.open` as well as the browser, so TURN works on both ends. The status line shows `WebRTC (direct)` or `Relay`;
+  see `docs/TERMINAL-PROTOCOL.md`.
+- **Update agent button on the device page:** confirms, then runs the single-device update (signed in organizations that sign
+  actions), offers a forced reinstall when the device already runs the build, and shows the outcome as a toast. The update event
+  is now broadcast live, so the Activity tab shows it without a reload.
 - **`/dev/uinput` access on Linux:** `rmm-agent install` writes `/etc/udev/rules.d/70-homelab-rmm-uinput.rules` and reloads udev so the
   desktop helper (running as the session user) can inject input on Wayland without manual steps; `rmm-agent uninstall` removes it.
 - **Wayland screen capture on Linux:** the desktop helper reads frames from the XDG ScreenCast portal through a pure-Go

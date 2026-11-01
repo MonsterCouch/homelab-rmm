@@ -233,3 +233,61 @@ func TestUpdateEventMessageWithoutSourceDoesNotClaimStaging(t *testing.T) {
 		t.Fatalf("message with a source = %q", got)
 	}
 }
+
+// A device that reported the pushed build's digest is not sent the update
+// unless the operator forces it, and the answer to a forced one is on the
+// device's event list and on the live event stream.
+func TestUpdateSingleDeviceSkipForceAndBroadcast(t *testing.T) {
+	withoutDevDist(t)
+	f := newSignFixture(t, "", 1, 10)
+	_, sum := stageAgentBinary(t, f.s, "linux", "amd64")
+	id := f.addSourceAgent("fresh", &protocol.AgentUpdateResult{Source: "origin", Bytes: 99, Version: "v2"})
+	f.s.db.Exec(`UPDATE agents SET binary_sha256 = ?, binary_sha256_at = ? WHERE id = ?`, sum, time.Now().Unix(), id)
+
+	st, raw := f.admin.do("POST", "/api/agents/"+id+"/update", nil)
+	var skip struct {
+		OK       bool                        `json:"ok"`
+		UpToDate bool                        `json:"up_to_date"`
+		Result   *protocol.AgentUpdateResult `json:"result"`
+	}
+	json.Unmarshal(raw, &skip)
+	if st != 200 || !skip.OK || !skip.UpToDate || skip.Result != nil {
+		t.Fatalf("unforced reply = %d %s, want up_to_date and nothing sent", st, raw)
+	}
+	time.Sleep(100 * time.Millisecond)
+	var n int
+	f.s.db.QueryRow(`SELECT COUNT(*) FROM agent_events WHERE agent_id = ? AND kind = 'update'`, id).Scan(&n)
+	if n != 0 {
+		t.Fatalf("%d update events after a skipped update, want 0", n)
+	}
+
+	ch, unsub := f.s.hub.subscribe()
+	defer unsub()
+	st, raw = f.admin.do("POST", "/api/agents/"+id+"/update?force=1", nil)
+	var forced struct {
+		OK       bool                       `json:"ok"`
+		UpToDate bool                       `json:"up_to_date"`
+		Result   protocol.AgentUpdateResult `json:"result"`
+	}
+	json.Unmarshal(raw, &forced)
+	if st != 200 || !forced.OK || forced.UpToDate || forced.Result.Source != "origin" || forced.Result.Bytes != 99 {
+		t.Fatalf("forced reply = %d %s, want the update sent", st, raw)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("no update event was broadcast")
+		case ev := <-ch:
+			if ev.Kind != "event" || ev.AgentID != id {
+				continue
+			}
+			data, _ := ev.Data.(map[string]any)
+			if data["kind"] != "update" || data["message"] == "" || data["ts"] == nil || data["fields"] == nil {
+				t.Fatalf("event data = %+v, want an update event", data)
+			}
+			return
+		}
+	}
+}

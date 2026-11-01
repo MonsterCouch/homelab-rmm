@@ -9,16 +9,47 @@ import { errMsg, useToast } from '../../state/toast';
 import type { TabProps } from './DeviceDetail';
 import { copyText, readClipboard } from './clipboard';
 import { KeyBar, KeyButton } from './KeyBar';
+import { TerminalRTC } from './termrtc';
 import { coarsePointer, useFillHeight } from './touch';
 import '../../styles/device-touch.css';
 
 type Status = 'idle' | 'connecting' | 'connected' | 'closed' | 'error';
 
 interface ShellMsg {
-  t: 'opened' | 'out' | 'closed' | 'error';
+  t:
+    | 'opened'
+    | 'out'
+    | 'closed'
+    | 'error'
+    | 'webrtc_config'
+    | 'rtc_answer'
+    | 'rtc_candidate'
+    | 'rtc_switch'
+    | 'rtc_unavailable';
   data?: string;
   message?: string;
   session?: string;
+  ice_servers?: RTCIceServer[];
+  sdp?: string;
+  candidate?: RTCIceCandidateInit;
+  reason?: string;
+}
+
+/** WebRTC gets this long after the offer to open its channel before the relay stays. */
+const RTC_CONNECT_MS = 4000;
+/** A connection that drops to "disconnected" gets this long to recover. */
+const RTC_DISCONNECT_GRACE_MS = 4000;
+/** Channel output held back until the relay's switch marker arrives; beyond this the transport is abandoned. */
+const RTC_HOLD_MAX_BYTES = 4 << 20;
+/** The WebRTC toggle, remembered per browser. */
+const RTC_PREF_KEY = 'rmm.webrtc';
+
+function loadRtcPref(): boolean {
+  try {
+    return localStorage.getItem(RTC_PREF_KEY) !== '0';
+  } catch {
+    return true;
+  }
 }
 
 interface StickyMods {
@@ -92,20 +123,147 @@ export function Terminal({ agent }: TabProps) {
   const modsRef = useRef(mods);
   modsRef.current = mods;
 
+  const [rtcOn, setRtcOn] = useState(loadRtcPref);
+  const rtcOnRef = useRef(rtcOn);
+  const [transport, setTransport] = useState<'relay' | 'rtc'>('relay');
+  // WebRTC byte path. `rtc` is the live peer connection, if any. `switched`
+  // is true once the relay announced rtc_switch: from then on the agent
+  // sends output on the data channel, and until then channel output is
+  // held in `held` so it can never overtake what the relay still carries.
+  const rtc = useRef<TerminalRTC | null>(null);
+  const switched = useRef(false);
+  const held = useRef<Uint8Array[]>([]);
+  const heldBytes = useRef(0);
+  const iceServers = useRef<RTCIceServer[]>([]);
+  const rtcTimer = useRef<number | null>(null); // connect watchdog, cleared only by the channel opening
+  const rtcGrace = useRef<number | null>(null); // disconnect grace
+  // Channel output held at fallback time. It is strictly after the switch
+  // marker and before any post-revert relay output, so it is written when
+  // the marker arrives rather than lost.
+  const pendingHeld = useRef<Uint8Array[]>([]);
+
   const send = useCallback((msg: Record<string, unknown>) => {
     const s = ws.current;
     if (s && s.readyState === WebSocket.OPEN) s.send(JSON.stringify(msg));
   }, []);
 
+  /** True when keystrokes and resizes should go over the data channel. */
+  const viaRTC = useCallback(() => !!rtc.current && switched.current && rtc.current.open, []);
+
+  const sendResize = useCallback(
+    (cols: number, rows: number) => {
+      if (viaRTC() && rtc.current?.sendControl({ t: 'resize', cols, rows })) return;
+      send({ t: 'resize', cols, rows });
+    },
+    [send, viaRTC],
+  );
+  const sendResizeRef = useRef(sendResize);
+  sendResizeRef.current = sendResize;
+
   /** Type raw bytes at the shell, consuming any armed sticky modifier. */
   const sendData = useCallback(
     (data: string) => {
       const m = modsRef.current;
-      send({ t: 'in', data: applyMods(data, m) });
+      const out = applyMods(data, m);
+      if (!(viaRTC() && rtc.current?.sendBytes(out))) send({ t: 'in', data: out });
       if (m.ctrl || m.alt) setMods({ ctrl: false, alt: false });
     },
-    [send],
+    [send, viaRTC],
   );
+
+  const clearRtcTimer = useCallback(() => {
+    if (rtcTimer.current !== null) {
+      window.clearTimeout(rtcTimer.current);
+      rtcTimer.current = null;
+    }
+  }, []);
+
+  const clearRtcGrace = useCallback(() => {
+    if (rtcGrace.current !== null) {
+      window.clearTimeout(rtcGrace.current);
+      rtcGrace.current = null;
+    }
+  }, []);
+
+  /** Tear the peer connection down and forget everything about it. */
+  const closeRTC = useCallback(() => {
+    clearRtcTimer();
+    clearRtcGrace();
+    rtc.current?.close();
+    rtc.current = null;
+    switched.current = false;
+    held.current = [];
+    heldBytes.current = 0;
+    setTransport('relay');
+  }, [clearRtcTimer, clearRtcGrace]);
+
+  /** WebRTC failed or dropped: tell the agent to resume the relay and keep using it. */
+  const rtcFallback = useCallback(
+    (r: TerminalRTC) => {
+      if (rtc.current !== r) return;
+      send({ t: 'rtc_fallback' });
+      // Output held for a switch marker that has not arrived yet is real
+      // screen output (the agent sent it on the channel); keep it, in order,
+      // for when the marker lands.
+      if (!switched.current && held.current.length > 0) {
+        pendingHeld.current.push(...held.current);
+      }
+      closeRTC();
+    },
+    [send, closeRTC],
+  );
+
+  const startRTC = useCallback(
+    (t: XTerm) => {
+      closeRTC();
+      let r: TerminalRTC;
+      try {
+        r = new TerminalRTC(iceServers.current, send, {
+          onOpen: () => {
+            if (rtc.current !== r) return;
+            clearRtcTimer();
+            if (switched.current) setTransport('rtc');
+          },
+          onData: (data) => {
+            if (rtc.current !== r) return;
+            if (switched.current) {
+              t.write(data);
+              return;
+            }
+            held.current.push(data);
+            heldBytes.current += data.length;
+            if (heldBytes.current > RTC_HOLD_MAX_BYTES) rtcFallback(r);
+          },
+          onState: (state) => {
+            if (rtc.current !== r) return;
+            if (state === 'failed' || state === 'closed') {
+              rtcFallback(r);
+            } else if (state === 'disconnected') {
+              clearRtcGrace();
+              rtcGrace.current = window.setTimeout(() => rtcFallback(r), RTC_DISCONNECT_GRACE_MS);
+            } else if (state === 'connected') {
+              // Only the channel opening ends the connect watchdog.
+              clearRtcGrace();
+            }
+          },
+        });
+      } catch (err) {
+        console.warn('terminal webrtc unavailable', err);
+        return;
+      }
+      rtc.current = r;
+      r.start().catch((err: unknown) => {
+        console.warn('terminal webrtc offer failed', err);
+        rtcFallback(r);
+      });
+      rtcTimer.current = window.setTimeout(() => {
+        if (!r.open) rtcFallback(r);
+      }, RTC_CONNECT_MS);
+    },
+    [send, closeRTC, clearRtcTimer, clearRtcGrace, rtcFallback],
+  );
+  const startRTCRef = useRef(startRTC);
+  startRTCRef.current = startRTC;
 
   // The terminal is created exactly once; anything the mount effect needs from
   // a later render is reached through a ref so the effect never re-runs and
@@ -129,13 +287,16 @@ export function Terminal({ agent }: TabProps) {
 
   const open = useCallback(
     (t: XTerm) => {
-      const s = new WebSocket(wsURL(`/ws/shell/${encodeURIComponent(agent.id)}`));
+      const wantRTC = rtcOnRef.current && typeof RTCPeerConnection !== 'undefined';
+      const s = new WebSocket(wsURL(`/ws/shell/${encodeURIComponent(agent.id)}${wantRTC ? '?webrtc=1' : ''}`));
       ws.current = s;
       s.onopen = () => {
         fit.current?.fit();
         send({ t: 'open', shell, cols: t.cols, rows: t.rows });
       };
       s.onmessage = (e: MessageEvent<string>) => {
+        // A superseded socket must not drive the new session's state.
+        if (ws.current !== s) return;
         let m: ShellMsg;
         try {
           m = JSON.parse(e.data) as ShellMsg;
@@ -143,9 +304,51 @@ export function Terminal({ agent }: TabProps) {
           return;
         }
         switch (m.t) {
+          case 'webrtc_config':
+            if (wantRTC) iceServers.current = m.ice_servers ?? [];
+            break;
           case 'opened':
             setStatus('connected');
             t.focus();
+            if (wantRTC && ws.current === s) startRTCRef.current(t);
+            break;
+          case 'rtc_answer':
+            if (rtc.current && m.sdp) {
+              const r = rtc.current;
+              r.applyAnswer(m.sdp).catch((err: unknown) => {
+                console.warn('terminal webrtc answer rejected', err);
+                rtcFallback(r);
+              });
+            }
+            break;
+          case 'rtc_candidate':
+            if (rtc.current && m.candidate) void rtc.current.addCandidate(m.candidate);
+            break;
+          case 'rtc_switch': {
+            const r = rtc.current;
+            if (!r) {
+              // Already fell back: the held channel output follows the relay
+              // output written so far and precedes anything sent after the revert.
+              for (const chunk of pendingHeld.current) t.write(chunk);
+              pendingHeld.current = [];
+              break;
+            }
+            if (switched.current) break;
+            // Everything the relay carried is already written; the channel
+            // output held until now follows it, then the channel is the route.
+            switched.current = true;
+            for (const chunk of held.current) t.write(chunk);
+            held.current = [];
+            heldBytes.current = 0;
+            // The size over the relay too, so the pty is right whichever path
+            // the agent reads its next frame from.
+            send({ t: 'resize', cols: t.cols, rows: t.rows });
+            if (r.open) setTransport('rtc');
+            break;
+          }
+          case 'rtc_unavailable':
+            // The agent could not build a peer connection: stay on the relay.
+            closeRTC();
             break;
           case 'out':
             if (m.data) t.write(m.data);
@@ -166,18 +369,23 @@ export function Terminal({ agent }: TabProps) {
         setDetail((d) => d || 'connection failed (is the device online?)');
       };
       s.onclose = (ev) => {
-        if (ws.current === s) ws.current = null;
+        // A stale socket's late close must not tear down the new session.
+        if (ws.current !== s) return;
+        ws.current = null;
+        closeRTC();
         setStatus((st) => (st === 'error' ? st : 'closed'));
         if (ev.code !== 1000 && ev.code !== 1005 && !ev.wasClean) setDetail((d) => d || `socket closed (${ev.code})`);
       };
     },
-    [agent.id, shell, send],
+    [agent.id, shell, send, closeRTC, rtcFallback],
   );
 
   const connect = useCallback(() => {
     const t = term.current;
     if (!t) return;
     ws.current?.close();
+    closeRTC();
+    pendingHeld.current = [];
     setStatus('connecting');
     setDetail('');
     t.reset();
@@ -195,7 +403,7 @@ export function Terminal({ agent }: TabProps) {
         t.write(`\r\n\x1b[31m[${errMsg(err)}]\x1b[0m\r\n`);
       },
     );
-  }, [agent.id, open]);
+  }, [agent.id, open, closeRTC]);
 
   // create the terminal once
   useEffect(() => {
@@ -233,7 +441,7 @@ export function Terminal({ agent }: TabProps) {
     t.onData((d) => sendDataRef.current(d));
     t.onResize(({ cols, rows }) => {
       setSize({ cols, rows });
-      send({ t: 'resize', cols, rows });
+      sendResizeRef.current(cols, rows);
     });
     // Ctrl+Shift+C copies, Ctrl+C with a selection copies (Windows habit),
     // Ctrl+Shift+V pastes; plain Ctrl+V is a browser paste that xterm handles.
@@ -276,12 +484,13 @@ export function Terminal({ agent }: TabProps) {
     );
     return () => {
       ro.disconnect();
+      closeRTC();
       ws.current?.close();
       ws.current = null;
       t.dispose();
       term.current = null;
     };
-  }, [send]);
+  }, [closeRTC]);
 
   // C8(d) SECURITY. Auto-connect spawns an audited shell session on a live
   // device. On a phone, merely opening the tab — a mis-tap in a pocket — is
@@ -304,6 +513,7 @@ export function Terminal({ agent }: TabProps) {
   const disconnect = () => {
     attempt.current++; // also cancels a connect that is still waiting for a signature
     send({ t: 'close' });
+    closeRTC();
     ws.current?.close();
     if (!ws.current) setStatus('closed');
   };
@@ -323,6 +533,20 @@ export function Terminal({ agent }: TabProps) {
     }
     if (txt) term.current?.paste(txt);
     term.current?.focus();
+  };
+
+  // The engine is chosen by query string when the socket opens, so the toggle
+  // reconnects, as the desktop viewer's does.
+  const toggleRtc = () => {
+    const next = !rtcOnRef.current;
+    rtcOnRef.current = next;
+    setRtcOn(next);
+    try {
+      localStorage.setItem(RTC_PREF_KEY, next ? '1' : '0');
+    } catch {
+      /* storage blocked: the choice lasts for this page only */
+    }
+    if (status === 'connected' || status === 'connecting') connect();
   };
 
   const toggleMod = (k: keyof StickyMods) => setMods((m) => ({ ...m, [k]: !m[k] }));
@@ -346,6 +570,10 @@ export function Terminal({ agent }: TabProps) {
             <IconRefresh /> {status === 'idle' ? 'Connect' : 'Reconnect'}
           </Button>
         )}
+        <label className="row small muted" style={{ gap: 6 }} title="Send the terminal over a direct WebRTC data channel with automatic fallback to the relay. Off forces the WebSocket relay only. Changing it reconnects.">
+          <input type="checkbox" checked={rtcOn} onChange={toggleRtc} aria-label="Use WebRTC" />
+          WebRTC
+        </label>
         <Button onClick={copySel} title="Copy selection (Ctrl+Shift+C)">
           <IconCopy /> Copy
         </Button>
@@ -374,7 +602,7 @@ export function Terminal({ agent }: TabProps) {
         <span>
           {status === 'idle' && 'Not connected'}
           {status === 'connecting' && 'Connecting…'}
-          {status === 'connected' && `Connected · ${shell}`}
+          {status === 'connected' && `Connected · ${shell} · ${transport === 'rtc' ? 'WebRTC (direct)' : 'Relay'}`}
           {status === 'closed' && 'Session closed'}
           {status === 'error' && 'Error'}
         </span>

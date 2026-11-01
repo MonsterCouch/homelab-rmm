@@ -49,6 +49,7 @@ var classes = map[string]Class{
 	"shell.input":  ClassRead,
 	"shell.resize": ClassRead,
 	"shell.close":  ClassRead,
+	"shell.rtc":    ClassRead,
 
 	// Staging an upload writes only into the agent's own staging area,
 	// which no request can read; the bytes reach a real path only through

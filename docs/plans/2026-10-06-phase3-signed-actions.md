@@ -397,7 +397,7 @@ The `tlog`-backed log, tree heads, proof endpoints, agent proof verification and
 - a validly signed manifest sent without `L`, and one sent with another manifest's leaf index, are both refused with a `log proof` reason, raise a security alert, add no `executed.log` line and leave the device head where it was;
 - the `script.run` audit rows carry a `log_index` whose leaf is an `audit` entry for the same action, target and id.
 
-**Not verified:** a real browser with a real security key or passkey, and the certificate and hostname prerequisites in §7.
+**Verified 2026-11-01** in Edge against a throwaway server (`--insecure`, `RMM_WEBAUTHN_RP_ID=localhost`, `RMM_WEBAUTHN_ORIGINS=http://localhost:18080`, browsed as `http://localhost:18080`) with a Chromium virtual authenticator attached over CDP: `/account` key registration (ES256), first bundle (audit, log proofs on, in-browser recovery key) proposed and signed, agent pinned epoch 1; ad hoc script run → 428 → "Sign this action" → ran, the agent accepted the first log head and appended to `executed.log`; "Continue without signing" in audit mode ran and raised the security alert; epoch 2 enforce signed and rotated on the agent; `X-Action-Auth: skip` then 403, the dialog lost its skip button, signed runs executed; a signed high-risk `agent.update` from the device page swapped the agent's A/B slot. **Not verified:** a physical security key or passkey, and the certificate prerequisites in §7 over HTTPS.
 
 **Decisions made while implementing:**
 - **Device environment.** A signed `script.run` takes only `RMM_*` variables from the envelope, and never overrides a signed one. A standing approval refuses any non-`RMM_*` variable, because it does not bind the environment.

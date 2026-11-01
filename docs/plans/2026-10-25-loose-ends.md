@@ -43,6 +43,7 @@ Built as designed: `protocol.AgentUpdateResult`, `selfUpdateResult` (with `selfU
 Deviations:
 - **Late replies are recorded.** The single-device and batch handlers still stop waiting after `fleetUpdateReplyWindow` (20 seconds) and answer "installing", but the request stays open for `lateUpdateWindow` and the event is written when the device answers. The fleet summary's `by_source` still counts only answers that came inside the window. Event inserts are serialised by one mutex.
 - **No single-device update button.** `api.dispatchAgentUpdate` exists in the console but nothing calls it, so there is no device-page result to change. The source is shown under each update event on the device's activity tab instead. A device-page "Update agent" button is a separate change.
+  - Done 2026-11-01: the device page has an "Update agent" button (confirm, forced reinstall, signed flow), and the update event is broadcast live.
 - **`update-all` is not waited on.** Waiting would add up to 20 seconds to the call. Its goroutine keeps the request open for `lateUpdateWindow` (15 minutes) and records the source as a device event when the reply arrives, but the call's reply has no sources, and the fleet summary counts only devices updated through signed groups and `update-batch`.
 - **Event wording.** An answer with no source (an older agent, or a device that already runs the build and skipped the download) is worded "Agent update accepted by ...; no download source reported", not "staged". A reply that arrives after the handler stopped waiting is still recorded for up to 15 minutes.
 - **Test scope.** The agent test covers `selfUpdateResult`, which the handler passes straight through, not the dispatcher.
@@ -95,12 +96,16 @@ Two more, found while re-testing and fixed the same day:
 - **Reinstall kept the old slot binary** (`cmd/rmm-agent/main.go`, `internal/supervisor/slots.go`): `rmm-agent install` seeded the A/B slot only when it was empty, so an install from a newer binary left the supervisor running the previous build. Install now refreshes the active slot when the SHA-256 differs (verified on the VM) and refuses while an update is pending.
 - **Fast-start log spam** (`internal/agent/desktop/session.go`): "fast-start video encode failed; tiles only" was logged every 100 ms on Linux, which has no hardware encoder; it is logged once per session now.
 
+### Verified later (2026-11-01, same VM)
+
+- KDE Plasma 6.6 (KWin Wayland, xdg-desktop-portal-kde 6.6.6): the "Share screen with" dialog once, then frames, mouse and keyboard; the restore token made the second session silent (portal session ready 0.7 s after the helper started). KWin re-announced the driver node once mid-session (`active driver published` twice), which the client followed.
+- HiDPI at 200% on GNOME and KDE: the portal reports the logical 960×540, the first frame is 1920×1080, the `Bounds` correction logged "PipeWire frame size differs from the portal's monitor size; using the frame size" and the console showed 1920×1080; clicks at (0.5,0.5), (0.8,0.3) and (0.7,0.4) of the canvas landed at those fractions of the screen.
+- An unanswered KDE ScreenCast prompt times out after 2 minutes (`ScreenCast.Start: no response from the portal within 2m0s`) and the helper falls back to the Screenshot portal for that session, which then shows KDE's own "Allow Apps to Take Screenshots?" prompt.
+
 ### Still unverified
 
-- KDE (Plasma) on Wayland.
 - Compositors that offer DMA-BUF only (the client offers MemFd and MemPtr, never DmaBuf).
 - Multi-monitor sessions.
-- HiDPI scaling (the `Bounds` correction after the first frame and monitor positions).
 - The retry, stall and session-closed paths against a real portal.
 - The portal code beyond the GNOME 50 happy path.
 

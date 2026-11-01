@@ -79,6 +79,7 @@ const (
 	ReqShellInput        = "shell.input"
 	ReqShellResize       = "shell.resize"
 	ReqShellClose        = "shell.close"
+	ReqShellRTC          = "shell.rtc"
 	ReqScriptRun         = "script.run"
 	ReqScriptCancel      = "script.cancel"
 	ReqProcList          = "proc.list"
@@ -301,6 +302,37 @@ type ShellOpen struct {
 	Shell string `json:"shell"` // "powershell", "cmd", "bash", "sh", "" = default
 	Cols  int    `json:"cols"`
 	Rows  int    `json:"rows"`
+	// RTC asks the agent to accept a WebRTC data channel for this session's
+	// byte path (see ReqShellRTC); ICEServers are the servers it should use.
+	RTC        bool        `json:"rtc,omitempty"`
+	ICEServers []ICEServer `json:"ice_servers,omitempty"`
+}
+
+// ICEServer is one STUN/TURN server, in the shape the browser's
+// RTCConfiguration uses.
+type ICEServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+}
+
+// ShellRTC is the payload of ReqShellRTC: WebRTC signaling from the browser
+// for an open shell session. Kind is "offer", "candidate" or "fallback".
+type ShellRTC struct {
+	Session   string          `json:"session"`
+	Kind      string          `json:"kind"`
+	SDP       string          `json:"sdp,omitempty"`
+	Candidate json.RawMessage `json:"candidate,omitempty"`
+}
+
+// ShellSignal is the agent's WebRTC signaling, carried on a ShellChunk. Kind is
+// "answer", "candidate", "switch" (output now flows over the data channel) or
+// "unavailable" (no peer connection could be created; Reason says why).
+type ShellSignal struct {
+	Kind      string          `json:"kind"`
+	SDP       string          `json:"sdp,omitempty"`
+	Candidate json.RawMessage `json:"candidate,omitempty"`
+	Reason    string          `json:"reason,omitempty"`
 }
 
 type ShellInput struct {
@@ -323,6 +355,8 @@ type ShellChunk struct {
 	Session string `json:"session"`
 	Data    string `json:"data,omitempty"`
 	EOF     bool   `json:"eof,omitempty"`
+	// Sig, when set, is WebRTC signaling and the chunk carries no output.
+	Sig *ShellSignal `json:"sig,omitempty"`
 }
 
 // Default script execution resource quotas.

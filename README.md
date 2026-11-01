@@ -48,7 +48,7 @@ and its own script library and baseline kinds. It is simply not where the depth 
   and the check allows it — fix the drift themselves. Drift opens an alert and fires
   `drift_detected` / `drift_fixed` automations; a dry-run preview shows what a draft would do
   before you save it. Fleet and per-device compliance scores.
-- **Remote terminal** — PowerShell, cmd, bash or sh in a real pseudo-terminal (ConPTY on Windows)
+- **Remote terminal** — PowerShell, cmd, bash or sh in a real pseudo-terminal (ConPTY on Windows); bytes go over a WebRTC data channel with the WebSocket relay as fallback, and the device page has an Update agent button
   from the browser.
 - **Remote desktop** — screen streaming with tile diffing, mouse and keyboard, multi-monitor display switching, privacy session banner overlay, clipboard paste, Ctrl-Alt-Del; works on the logon screen and UAC prompts on Windows; X11 on Linux.
 - **Device tools** — processes (kill), services (start/stop/restart/enable/disable), Windows event log and journald viewer, file browser with upload/download/rename/delete, device network isolation / quarantine (firewall lockdown with management channel retention), reboot, shutdown, lock, log off, and **Wake-on-LAN** relayed through another agent on the same subnet.
@@ -455,7 +455,7 @@ stopping the service, putting the files back and starting it. More in
   with `rmm-server user add`.
 - **Remote desktop on Linux shows a frozen or black picture under Wayland.** Wayland capture goes
   through the ScreenCast portal and a built-in PipeWire client, and it is verified on GNOME 50 on
-  Wayland (KDE, DMA-BUF-only compositors, multi-monitor and HiDPI are not). The first session asks the person at the machine to allow screen sharing once. See
+  Wayland and on KDE Plasma 6.6, both at 100% and 200% scaling (DMA-BUF-only compositors and multi-monitor are not). The first session asks the person at the machine to allow screen sharing once. See
   [docs/OPERATIONS.md](docs/OPERATIONS.md), "Wayland screen capture", for the log lines to read and
   for `RMM_WAYLAND_PORTAL=0`, which falls back to the Screenshot portal. An X11/Xorg session needs
   none of this. On Windows the helper needs an interactive console session; the logon screen and
@@ -509,7 +509,7 @@ The full threat model, what is and is not protected, and recommendations are in
 ## Roadmap
 
 - Native endpoint & cloud backups, mobile device management (MDM), and commercial EDR orchestration (see [docs/ROADMAP.md](docs/ROADMAP.md)).
-- Confirm Wayland capture for the Linux remote desktop beyond GNOME 50 (verified there on Ubuntu 26.04.1, PipeWire 1.6.2): KDE, DMA-BUF-only compositors, multi-monitor and HiDPI are open.
+- Confirm Wayland capture for the Linux remote desktop beyond GNOME 50 and KDE Plasma 6.6 (both verified on Ubuntu 26.04.1, PipeWire 1.6.2, at 100% and 200% scaling): DMA-BUF-only compositors and multi-monitor are open.
 - macOS agent (the platform contract in `internal/agent/platform_other.go` is ready for it).
 - Published container images and signed releases.
 - More notification channels for alerts (webhooks are available through automations today).

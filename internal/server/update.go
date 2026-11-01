@@ -719,15 +719,20 @@ func updateEventMessage(label string, res protocol.AgentUpdateResult) string {
 // the list says the device accepted the update.
 func (s *Server) recordAgentUpdate(agentID, label string, res protocol.AgentUpdateResult) {
 	msg := updateEventMessage(label, res)
-	fields := jsonText(map[string]any{
+	fieldMap := map[string]any{
 		"source": res.Source, "source_kind": updateSourceKind(res.Source), "bytes": res.Bytes, "resumed_chunks": res.ResumedChunks, "version": res.Version,
-	})
+	}
+	fields := jsonText(fieldMap)
+	ts := now()
 	updateEventMu.Lock()
 	defer updateEventMu.Unlock()
 	if _, err := s.db.Exec(`INSERT INTO agent_events(agent_id, ts, kind, message, fields) VALUES(?,?,?,?,?)`,
-		agentID, now(), "update", msg, fields); err != nil {
+		agentID, ts, "update", msg, fields); err != nil {
 		slog.Warn("record agent update event", "agent_id", agentID, "err", err)
+		return
 	}
+	// The Activity tab refetches on this, so the answer shows without a reload.
+	s.hub.broadcast(hubEvent{Kind: "event", AgentID: agentID, Data: map[string]any{"ts": ts, "kind": "update", "message": msg, "fields": fieldMap}})
 }
 
 // Most failures one fleet.update audit entry names, and the longest reason it
