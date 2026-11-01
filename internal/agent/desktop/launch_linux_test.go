@@ -4,6 +4,7 @@ package desktop
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -178,8 +179,13 @@ func TestFindSessionPrefersTheConfig(t *testing.T) {
 func TestLaunchWithoutASessionNamesTheConfigKeys(t *testing.T) {
 	t.Setenv("RMM_AGENT_DIR", t.TempDir())
 	t.Setenv("DISPLAY", "")
+	t.Setenv("XDG_SESSION_TYPE", "") // a test run from a desktop terminal must not take the in-process path
 	if s, err := findSession(); err == nil {
 		t.Skipf("this machine has a usable graphical session (%s); nothing to assert", s.display)
+	} else if errors.Is(err, errWayland) && !errors.Is(err, errWaylandGreeter) {
+		// launch serves a user's Wayland session through launchWayland, so
+		// there is no "no session" error to assert on this machine.
+		t.Skipf("this machine has a user Wayland session (%v); nothing to assert", err)
 	}
 	_, err := launch("/nonexistent/rmm-agent", Config{ServerURL: "https://rmm.example:8443", Token: "tok", Fingerprint: "fp", Quality: 60})
 	if err == nil {

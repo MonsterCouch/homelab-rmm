@@ -7,6 +7,7 @@ import (
 	"os"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // socketPair returns two SocketTransports over a socketpair.
@@ -104,16 +105,36 @@ func TestSocketTransportRecvErrorClosesQueuedFds(t *testing.T) {
 	defer syscall.Close(p[0])
 	defer syscall.Close(p[1])
 	before := openFdCount(t)
-	// One byte (less than a header) and one descriptor per sendmsg, so the
-	// reader never has a complete message and keeps queueing descriptors.
-	oob := syscall.UnixRights(p[0])
-	for i := 0; i < MaxFds+1; i++ {
-		if _, _, err := a.conn.WriteMsgUnix([]byte{0}, oob, nil); err != nil {
-			t.Fatal(err)
-		}
+	// A header that promises a payload which never arrives, then one byte and
+	// one descriptor per sendmsg, so the reader never has a complete message
+	// and keeps queueing descriptors. (Bare zero bytes would not do: sixteen of
+	// them are a valid empty message.) The kernel hands these back one per
+	// read and each holds a socket-buffer slot, so they are written while Recv
+	// drains them; written up front, the writer blocks long before the limit.
+	hdr := Header{ID: 1, Opcode: 1, Size: 64 * 1024}.Pack()
+	if _, err := a.conn.Write(hdr[:]); err != nil {
+		t.Fatal(err)
 	}
-	if _, _, _, err := b.Recv(); err == nil {
+	oob := syscall.UnixRights(p[0])
+	wrote := make(chan error, 1)
+	go func() {
+		for i := 0; i < MaxFds+1; i++ {
+			if _, _, err := a.conn.WriteMsgUnix([]byte{0}, oob, nil); err != nil {
+				wrote <- err
+				return
+			}
+		}
+		wrote <- nil
+	}()
+	_, _, _, err := b.Recv()
+	// Should Recv stop early for another reason, unblock the writer rather
+	// than hang on a full socket.
+	_ = a.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err == nil {
 		t.Fatal("Recv succeeded with more descriptors than the limit")
+	}
+	if werr := <-wrote; werr != nil {
+		t.Fatalf("write %v (Recv: %v)", werr, err)
 	}
 	if after := openFdCount(t); after > before {
 		t.Fatalf("%d descriptors stayed open after the failed Recv", after-before)

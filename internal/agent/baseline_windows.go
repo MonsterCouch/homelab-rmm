@@ -98,7 +98,9 @@ func winServiceCheck(ctx context.Context, c *checkCtx) kindResult {
 			if isPresent {
 				return blFail(want, "not installed", "the service is not installed on this device")
 			}
-			return blFail(want, "not installed", "the service does not exist")
+			// running/stopped against a service that is not there is a wrong
+			// name, not drift (docs/BASELINES.md): an error, as on Linux.
+			return blError(want, "no such service", err.Error())
 		}
 		return blError(want, "unknown", err.Error())
 	}
@@ -776,7 +778,7 @@ func errString(err error) string {
 }
 
 const (
-	wtsMBYesNo          = 0x00000004
+	wtsMBYesNo           = 0x00000004
 	wtsMBIconExclamation = 0x00000030
 	wtsIDOK              = 1
 	wtsIDCANCEL          = 2
