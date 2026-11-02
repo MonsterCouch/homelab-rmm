@@ -46,7 +46,8 @@ const (
 // launch is the Windows service path: the agent lives in session 0, which
 // has no desktop of its own, so the helper is created inside the console
 // session with a token that can see everything on it.
-func launch(exe, serverURL, token, fingerprint string, quality int) (string, error) {
+func launch(exe string, cfg Config) (string, error) {
+	token := cfg.Token
 	isService, err := svc.IsWindowsService()
 	if err != nil {
 		slog.Debug("desktop: cannot tell whether this is a service; assuming interactive", "err", err)
@@ -59,7 +60,7 @@ func launch(exe, serverURL, token, fingerprint string, quality int) (string, err
 	// capture can only fail. What decides this is the session we are actually
 	// in, so ask that; IsWindowsService stays as a hint for the normal case.
 	if !isService && !inSessionZero() {
-		serveInProcess(serverURL, token, fingerprint, quality)
+		serveInProcess(cfg)
 		return "running in-process", nil
 	}
 
@@ -95,7 +96,7 @@ func launch(exe, serverURL, token, fingerprint string, quality int) (string, err
 	if err != nil {
 		return "", fmt.Errorf("executable path: %w", err)
 	}
-	cmd16, err := windows.UTF16PtrFromString(windows.ComposeCommandLine(append([]string{exe}, helperArgs(serverURL, fingerprint, quality)...)))
+	cmd16, err := windows.UTF16PtrFromString(windows.ComposeCommandLine(append([]string{exe}, helperArgs(cfg)...)))
 	if err != nil {
 		return "", fmt.Errorf("command line: %w", err)
 	}

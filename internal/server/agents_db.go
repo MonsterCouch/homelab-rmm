@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
+	"sync/atomic"
 
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
+	"github.com/MonsterCouch/homelab-rmm/internal/telemetry"
 )
 
 // Agent is the API shape of a device.
@@ -43,6 +46,9 @@ type Agent struct {
 	Isolated          bool                `json:"isolated"`
 	IsolatedAt        int64               `json:"isolated_at"`
 	IsolatedBy        string              `json:"isolated_by,omitempty"`
+	// ExecutedHead is the head of the device's hash-chained executed.log as it
+	// last reported it, for the console's Device logs table.
+	ExecutedHead string `json:"executed_head,omitempty"`
 }
 
 const agentCols = `a.id, a.hostname, a.display_name, a.os, a.platform, a.arch, a.version, a.group_id, COALESCE(g.name,''),
@@ -50,7 +56,8 @@ const agentCols = `a.id, a.hostname, a.display_name, a.os, a.platform, a.arch, a
 	a.tags, a.custom_fields, a.notes, a.last_ip, a.last_seen, a.online, a.monitored_services, a.maintenance_until, a.enrolled_at,
 	a.pending_reboot, a.isolated, a.isolated_at, a.isolated_by, a.last_metrics,
 	(SELECT COUNT(*) FROM alerts al WHERE al.agent_id = a.id AND al.status != 'resolved'),
-	(SELECT COUNT(*) FROM patches p WHERE p.agent_id = a.id AND p.status IN ('available','approved'))`
+	(SELECT COUNT(*) FROM patches p WHERE p.agent_id = a.id AND p.status IN ('available','approved')),
+	a.executed_head`
 
 func scanAgent(rows interface{ Scan(...any) error }, withInventory bool) (*Agent, error) {
 	var a Agent
@@ -60,7 +67,7 @@ func scanAgent(rows interface{ Scan(...any) error }, withInventory bool) (*Agent
 	dest := []any{&a.ID, &a.Hostname, &a.DisplayName, &a.OS, &a.Platform, &a.Arch, &a.Version, &gid, &a.GroupName,
 		&a.OrgID, &a.OrgName, &a.SiteID, &a.SiteName,
 		&tags, &cf, &a.Notes, &a.LastIP, &a.LastSeen, &a.Online, &ms, &a.MaintenanceUntil, &a.EnrolledAt,
-		&a.PendingReboot, &isoInt, &a.IsolatedAt, &a.IsolatedBy, &lm, &a.OpenAlerts, &a.PatchesAvailable}
+		&a.PendingReboot, &isoInt, &a.IsolatedAt, &a.IsolatedBy, &lm, &a.OpenAlerts, &a.PatchesAvailable, &a.ExecutedHead}
 	if withInventory {
 		dest = append(dest, &inv)
 	}
@@ -280,80 +287,40 @@ func (d *DB) saveInventory(id string, inv *protocol.Inventory) error {
 }
 
 func (d *DB) saveMetrics(id string, m *protocol.Metrics) error {
-	_, err := d.Exec(`INSERT OR REPLACE INTO metrics(agent_id, ts, cpu, mem_used, mem_total, disks, net_rx, net_tx, uptime, load1, procs)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, m.TS, m.CPUPct, m.MemUsed, m.MemTotal, jsonText(m.Disks), m.NetRxBps, m.NetTxBps, m.Uptime, m.Load1, m.ProcCount)
-	if err != nil {
-		return err
+	// The series is best effort. A full disk or an unreachable ClickHouse must
+	// not stop last_seen, the live view and the alert rules, which are what
+	// would tell the operator about it.
+	if err := d.telemetry.WriteMetrics(id, *m); err != nil {
+		d.warnTelemetry(err)
 	}
-	_, err = d.Exec(`UPDATE agents SET last_metrics = ?, last_seen = ?, pending_reboot = ? WHERE id = ?`, jsonText(m), now(), m.PendingReboot, id)
+	// last_metrics is the device's current value, not a series, so it stays
+	// in the transactional database whichever engine keeps the history.
+	_, err := d.Exec(`UPDATE agents SET last_metrics = ?, last_seen = ?, pending_reboot = ? WHERE id = ?`, jsonText(m), now(), m.PendingReboot, id)
 	return err
 }
 
-// MetricRow is one sample as returned to the UI.
-type MetricRow struct {
-	TS       int64                `json:"ts"`
-	CPU      float64              `json:"cpu"`
-	MemUsed  uint64               `json:"mem_used"`
-	MemTotal uint64               `json:"mem_total"`
-	Disks    []protocol.DiskUsage `json:"disks"`
-	NetRx    uint64               `json:"net_rx"`
-	NetTx    uint64               `json:"net_tx"`
-	Uptime   uint64               `json:"uptime"`
-	Load1    float64              `json:"load1"`
-	Procs    int                  `json:"procs"`
+var lastTelemetryWarn atomic.Int64
+
+// warnTelemetry logs a telemetry write failure at most once a minute: it
+// repeats for every sample of every device while the engine is down.
+func (d *DB) warnTelemetry(err error) {
+	t := now()
+	if prev := lastTelemetryWarn.Load(); t-prev >= 60 && lastTelemetryWarn.CompareAndSwap(prev, t) {
+		slog.Warn("the telemetry store did not take a sample; history has a gap until it recovers (further failures are not logged for a minute)", "err", err)
+	}
 }
 
-// maxMetricPoints caps the buckets one chart may ask for. Without it
-// ?points=100000000 made the bucket 1 second wide and streamed every stored
-// sample for the device - tens of thousands of rows with embedded disks JSON -
-// through the single database connection, blocking everything else.
-const maxMetricPoints = 2000
+// MetricRow is one sample as returned to the UI. The type lives in the
+// telemetry package; the alias keeps handlers and tests unchanged.
+type MetricRow = telemetry.MetricRow
 
+// maxMetricPoints caps the buckets one chart may ask for.
+const maxMetricPoints = telemetry.MaxPoints
+
+// MetricsRange returns a device's history from the configured telemetry
+// engine, bucketed to at most maxPoints rows.
 func (d *DB) MetricsRange(id string, from, to int64, maxPoints int) ([]MetricRow, error) {
-	if maxPoints <= 0 {
-		maxPoints = 600
-	}
-	if maxPoints > maxMetricPoints {
-		maxPoints = maxMetricPoints
-	}
-	if from < 0 {
-		from = 0
-	}
-	// Bucket to at most maxPoints by averaging within buckets; SQLite does the
-	// grouping so a 30-day range does not ship a million rows to the browser.
-	span := to - from
-	if span <= 0 {
-		span = 1
-	}
-	bucket := span / int64(maxPoints)
-	if bucket < 1 {
-		bucket = 1
-	}
-	// disks and uptime are bare columns beside exactly one max() aggregate,
-	// which SQLite defines as coming from the row that produced that maximum:
-	// the LAST sample in the bucket. MAX(disks) was a lexicographic maximum
-	// over JSON text, so the disk series was an arbitrary sample that
-	// corresponded to no real point in time.
-	rows, err := d.Query(`SELECT (ts / ?) * ?, AVG(cpu), AVG(mem_used), AVG(mem_total), AVG(net_rx), AVG(net_tx), AVG(load1), AVG(procs), MAX(ts), disks, uptime
-		FROM metrics WHERE agent_id = ? AND ts BETWEEN ? AND ? GROUP BY 1 ORDER BY 1`, bucket, bucket, id, from, to)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []MetricRow{}
-	for rows.Next() {
-		var r MetricRow
-		var disks string
-		var mem, memTotal, rx, tx, procs float64
-		var lastTS int64
-		if err := rows.Scan(&r.TS, &r.CPU, &mem, &memTotal, &rx, &tx, &r.Load1, &procs, &lastTS, &disks, &r.Uptime); err != nil {
-			return nil, err
-		}
-		r.MemUsed, r.MemTotal, r.NetRx, r.NetTx, r.Procs = uint64(mem), uint64(memTotal), uint64(rx), uint64(tx), int(procs)
-		json.Unmarshal([]byte(disks), &r.Disks)
-		out = append(out, r)
-	}
-	return out, rows.Err()
+	return d.telemetry.MetricHistory(id, from, to, maxPoints)
 }
 
 // AgentUpdate is the editable subset of an agent.
@@ -466,6 +433,12 @@ func (d *DB) UpdateAgent(id string, u AgentUpdate) error {
 }
 
 func (d *DB) DeleteAgent(id string) error {
+	// The series first: if the engine refuses, the device row is still there
+	// and the operator can retry, rather than leaving samples nobody can
+	// reach until retention sweeps them. SQLite's own rows also cascade.
+	if err := d.telemetry.DeleteAgent(id); err != nil {
+		return fmt.Errorf("deleting the device's telemetry: %w", err)
+	}
 	_, err := d.Exec(`DELETE FROM agents WHERE id = ?`, id)
 	return err
 }
@@ -627,4 +600,3 @@ func (d *DB) SetAgentIsolated(id string, isolated bool, by string) error {
 	_, err := d.Exec(`UPDATE agents SET isolated = ?, isolated_at = ?, isolated_by = ? WHERE id = ?`, isoInt, isoAt, by, id)
 	return err
 }
-

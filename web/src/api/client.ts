@@ -1,3 +1,6 @@
+import { b64urlEncode, utf8 } from '../lib/webauthn';
+import { requestSigning, SigningCancelled, signerCommand } from '../lib/signing';
+import { PARKED_MESSAGE, toast } from '../state/toast';
 import type {
   Agent,
   AgentBaselineHistory,
@@ -5,9 +8,11 @@ import type {
   AgentEvent,
   AgentPatches,
   AgentUpdate,
+  DispatchUpdateResult,
   Alert,
   AlertRule,
   AuditRow,
+  LogHead,
   AuthState,
   Automation,
   Baseline,
@@ -18,6 +23,8 @@ import type {
   BaselinePreviewSpec,
   BaselineRemediateResult,
   BaselineStatus,
+  ApprovalPending,
+  SignObjectResult,
   ComplianceSummary,
   Dashboard,
   DiscoveredDevice,
@@ -26,6 +33,7 @@ import type {
   EnrollList,
   EventLogEntry,
   FsListResult,
+  GrantResult,
   Group,
   LoginResponse,
   MailSettings,
@@ -34,9 +42,13 @@ import type {
   Organization,
   Patch,
   PatchPolicy,
+  ServicingRecord,
+  ServicingRepairRequest,
+  PendingApproval,
   PortalConfig,
   PortalSoftwareActionReq,
   PortalSoftwareItem,
+  ProposalSignResult,
   PowerAction,
   Process,
   Run,
@@ -55,9 +67,18 @@ import type {
   TicketComment,
   TicketWithComments,
   TOTPBegin,
+  TrustInfo,
+  TrustProposal,
+  TrustProposalInput,
+  UnsignedObject,
+  UnsignedType,
+  UpdateAllResult,
+  UpdateBatchResult,
   User,
+  WebAuthnCredential,
   WolResult,
 } from './types';
+import type { Assertion, CreationOptionsJSON, RegistrationResult } from '../lib/webauthn';
 
 /** ApiError carries the HTTP status so callers can branch on 401/403/409. */
 export class ApiError extends Error {
@@ -66,6 +87,16 @@ export class ApiError extends Error {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+  }
+}
+
+/** A 428 the operator parked for rmm-signer: a cancel as far as loops are concerned, so it is a 428 too. */
+export class SigningParkedError extends ApiError {
+  readonly manifestId: string;
+  constructor(manifestId: string) {
+    super(428, PARKED_MESSAGE);
+    this.name = 'SigningParkedError';
+    this.manifestId = manifestId;
   }
 }
 
@@ -87,17 +118,57 @@ export function setUnauthorizedHandler(fn: (() => void) | null): void {
   onUnauthorized = fn;
 }
 
-async function request<T>(method: Method, url: string, opts: RequestOptions = {}): Promise<T> {
+/** What a 428 carries: the stored manifest the operator must sign (§4.1). */
+interface Challenge428 {
+  manifest_id: string;
+  manifest: string;
+  summary?: string;
+  required?: boolean;
+  rp_id?: string;
+  allow_credentials?: string[];
+  user_verification?: UserVerificationRequirement;
+}
+
+function asChallenge(data: unknown): Challenge428 | null {
+  if (!data || typeof data !== 'object') return null;
+  const d = data as Record<string, unknown>;
+  if (typeof d.manifest_id !== 'string' || !d.manifest_id || typeof d.manifest !== 'string' || !d.manifest) return null;
+  return {
+    manifest_id: d.manifest_id,
+    manifest: d.manifest,
+    summary: typeof d.summary === 'string' ? d.summary : undefined,
+    // Unknown means required: never offer to skip a signature the server did not say is optional.
+    required: d.required !== false,
+    rp_id: typeof d.rp_id === 'string' ? d.rp_id : undefined,
+    allow_credentials: Array.isArray(d.allow_credentials) ? d.allow_credentials.filter((x): x is string => typeof x === 'string') : undefined,
+    user_verification: d.user_verification === 'required' || d.user_verification === 'discouraged' || d.user_verification === 'preferred' ? d.user_verification : undefined,
+  };
+}
+
+/** True for the 202 body of a request that still needs other operators' signatures. */
+export function isPending(v: unknown): v is ApprovalPending {
+  return !!v && typeof v === 'object' && (v as { pending?: unknown }).pending === true;
+}
+
+interface Sent {
+  res: Response;
+  data: unknown;
+}
+
+async function send(method: Method, url: string, opts: RequestOptions, raw: BodyInit | undefined, extra?: Record<string, string>): Promise<Sent> {
   const headers: Record<string, string> = {
     // CSRF guard: the server rejects state-changing requests without this header.
     'X-Requested-With': 'fetch',
     Accept: 'application/json',
+    ...extra,
   };
   let body: BodyInit | undefined;
-  if (opts.raw !== undefined) {
-    body = opts.raw;
+  if (raw !== undefined) {
+    body = raw;
     headers['Content-Type'] = 'application/octet-stream';
   } else if (opts.body !== undefined) {
+    // serialized afresh each time from the same value, so a signed retry
+    // carries the identical bytes
     body = JSON.stringify(opts.body);
     headers['Content-Type'] = 'application/json';
   }
@@ -120,6 +191,87 @@ async function request<T>(method: Method, url: string, opts: RequestOptions = {}
       data = text;
     }
   }
+  return { res, data };
+}
+
+/**
+ * Ask the operator to sign a 428 challenge and return the headers for the
+ * retry. Cancelling becomes an ApiError so callers' existing catch blocks see
+ * an ordinary failed request.
+ */
+async function signHeaders(ch: Challenge428, signal?: AbortSignal): Promise<Record<string, string>> {
+  let decision;
+  try {
+    decision = await requestSigning(
+      {
+        docKind: 'manifest',
+        doc: ch.manifest,
+        manifestId: ch.manifest_id,
+        summary: ch.summary,
+        required: ch.required !== false,
+        rpId: ch.rp_id,
+        allowCredentials: ch.allow_credentials,
+        userVerification: ch.user_verification,
+      },
+      signal,
+    );
+  } catch (err) {
+    if (err instanceof SigningCancelled) {
+      if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+      throw new ApiError(428, 'Signature required: nothing was sent because the action was not signed.');
+    }
+    throw err;
+  }
+  if (decision.kind === 'park') {
+    announceParked(ch.manifest_id);
+    throw new SigningParkedError(ch.manifest_id);
+  }
+  if (decision.kind === 'skip') return { 'X-Action-Auth': 'skip' };
+  return { 'X-Action-Auth': b64urlEncode(utf8(JSON.stringify({ manifest_id: ch.manifest_id, assertion: decision.assertion }))) };
+}
+
+/** Tell the operator how to finish a parked manifest; it stays until dismissed because the id is needed later. */
+export function announceParked(manifestId: string): void {
+  try {
+    toast().push('info', 'Waiting for rmm-signer', 'Nothing was sent. The request waits until it expires; sign it with rmm-signer or from the Approvals page.', {
+      sticky: true,
+      copy: signerCommand(manifestId),
+    });
+  } catch {
+    /* no toast host (tests) */
+  }
+}
+
+async function request<T>(method: Method, url: string, opts: RequestOptions = {}): Promise<T> {
+  // A stream body is single-use; the signed retry has to resend it.
+  const raw = typeof ReadableStream !== 'undefined' && opts.raw instanceof ReadableStream ? await new Response(opts.raw).blob() : opts.raw;
+  let { res, data } = await send(method, url, opts, raw);
+
+  // Phase 3: a protected action in an organisation with a trust bundle answers
+  // 428 with the manifest it will dispatch. Show it, have the operator sign
+  // it, then repeat the identical request carrying the assertion. The server
+  // dispatches the stored manifest, not this request's body.
+  // (The auth and portal endpoints, which pass noRedirect, are never signed.)
+  if (res.status === 428 && !opts.noRedirect) {
+    const ch = asChallenge(data);
+    if (ch) {
+      const extra = await signHeaders(ch, opts.signal);
+      ({ res, data } = await send(method, url, opts, raw, extra));
+    }
+  }
+
+  // 202: signed, but the policy wants more operators. Not an error; the
+  // caller gets the body (see isPending) and the operator is told once.
+  if (res.status === 202 && isPending(data)) {
+    const more = Math.max(1, data.need - data.have);
+    try {
+      toast().info(`Waiting for ${more} more approver${more === 1 ? '' : 's'}`, 'Other operators can add their signature under Approvals.');
+    } catch {
+      /* no toast host (tests) */
+    }
+    return data as T;
+  }
+
   if (!res.ok) {
     const msg =
       data && typeof data === 'object' && 'error' in data && typeof (data as { error: unknown }).error === 'string'
@@ -152,6 +304,16 @@ const enc = encodeURIComponent;
 
 interface Ok {
   ok: boolean;
+}
+
+/** The upload reply from a device that checks signatures: the bytes are staged
+ *  on the device, and moving them into place needs a signed commit. */
+interface StagedUpload {
+  staged: true;
+  commit_required: boolean;
+  upload_id: string;
+  bytes: number;
+  sha256: string;
 }
 
 // Go encodes a nil slice as null. Every list column on the server is
@@ -217,8 +379,17 @@ export const api = {
   fsList: (id: string, path: string, signal?: AbortSignal) =>
     get<FsListResult>(`/api/agents/${enc(id)}/fs${qs({ path })}`, { signal }),
   fsDownloadURL: (id: string, path: string) => `/api/agents/${enc(id)}/fs/download${qs({ path })}`,
-  fsUpload: (id: string, path: string, file: File) =>
-    request<Ok>('POST', `/api/agents/${enc(id)}/fs/upload${qs({ path })}`, { raw: file }),
+  /** Uploads a file. To a device that checks signatures the bytes are staged
+   *  first, then a small commit naming their size and SHA-256 is sent through
+   *  the signing flow, so the file itself is never re-sent for a signature.
+   *  Resolves to ApprovalPending when more approvers are needed. */
+  fsUpload: async (id: string, path: string, file: File): Promise<Ok | ApprovalPending> => {
+    const r = await request<Ok | StagedUpload>('POST', `/api/agents/${enc(id)}/fs/upload${qs({ path })}`, { raw: file });
+    if ('commit_required' in r && r.commit_required) {
+      return post<Ok | ApprovalPending>(`/api/agents/${enc(id)}/fs/commit`, { upload_id: r.upload_id });
+    }
+    return r as Ok;
+  },
   fsDelete: (id: string, path: string) => post<Ok>(`/api/agents/${enc(id)}/fs/delete`, { path }),
   fsMkdir: (id: string, path: string) => post<Ok>(`/api/agents/${enc(id)}/fs/mkdir`, { path }),
   fsRename: (id: string, from: string, to: string) => post<Ok>(`/api/agents/${enc(id)}/fs/rename`, { from, to }),
@@ -232,6 +403,8 @@ export const api = {
   patchScan: (id: string) => post<AgentPatches>(`/api/agents/${enc(id)}/patches/scan`).then((r) => ({ ...r, patches: arr(r.patches).map((p) => ({ ...p, categories: arr(p.categories) })) })),
   patchInstall: (id: string, body: { ids?: string[]; all?: boolean; reboot_if_required: boolean }) =>
     post<Ok>(`/api/agents/${enc(id)}/patches/install`, body),
+  servicingRecords: (id: string, limit = 20) => list(get<ServicingRecord[] | null>(`/api/agents/${enc(id)}/servicing?limit=${limit}`)),
+  servicingRepair: (id: string, body: ServicingRepairRequest) => post<Ok & { id: number }>(`/api/agents/${enc(id)}/servicing/repair`, body),
 
   // ---- organizations & sites ----
   organizations: () => list(get<Organization[] | null>('/api/organizations')),
@@ -404,11 +577,48 @@ export const api = {
   portalAddComment: (id: number, req: { body: string }) =>
     post<TicketComment>(`/api/portal/tickets/${id}/comments`, req, { noRedirect: true }),
 
+  // ---- Phase 3: security keys, trust bundles, approvals, grants ----
+  // See docs/plans/2026-10-06-phase3-signed-actions.md §4.1. Calls that the
+  // server protects with a signature (grant, signObject, any destructive
+  // action) answer 428 and request() runs the signing dialog; none of these
+  // wrappers needs to know.
+  webauthnCredentials: () => list(get<WebAuthnCredential[] | null>('/api/webauthn/credentials')),
+  webauthnRegisterBegin: () => post<CreationOptionsJSON | { publicKey: CreationOptionsJSON }>('/api/webauthn/register/begin'),
+  webauthnRegisterFinish: (name: string, r: RegistrationResult) => post<WebAuthnCredential>('/api/webauthn/register/finish', { name, ...r }),
+  deleteWebauthnCredential: (id: string) => del<Ok>(`/api/webauthn/credentials/${enc(id)}`),
+  trust: (orgId: string) =>
+    get<TrustInfo>(`/api/organizations/${enc(orgId)}/trust`).then((r) => ({ ...r, current: r.current ?? null, proposals: arr(r.proposals) })),
+  createTrustProposal: (orgId: string, p: TrustProposalInput) =>
+    post<TrustProposal>(`/api/organizations/${enc(orgId)}/trust/proposals`, p),
+  logHead: () => get<LogHead>('/api/log/head'),
+  trustProposal: (pid: string) => get<TrustProposal>(`/api/trust/proposals/${enc(pid)}`),
+  signTrustProposal: (pid: string, assertion: Assertion) =>
+    post<ProposalSignResult>(`/api/trust/proposals/${enc(pid)}/sign`, { assertion }),
+  recoverTrustProposal: (pid: string, r: { id: string; sig: string }) =>
+    post<{ active: boolean }>(`/api/trust/proposals/${enc(pid)}/recovery`, r),
+  approvals: () => list(get<PendingApproval[] | null>('/api/approvals')),
+  signApproval: (manifestId: string, assertion: Assertion) =>
+    post<ProposalSignResult | ApprovalPending>(`/api/approvals/${enc(manifestId)}/sign`, { assertion }),
+  unsignedApprovals: (org: string) => list(get<UnsignedObject[] | null>(`/api/approvals/unsigned${qs({ org })}`)),
+  // goes through the 428 flow itself: the standing manifest is built from the object's current content
+  // org and purpose name one unit of the object; without them the server signs the first one that needs it
+  signObject: (type: UnsignedType, id: string | number, opts?: { org?: string; purpose?: string }) =>
+    post<SignObjectResult>(`/api/approvals/objects/${enc(type)}/${enc(String(id))}/sign${qs({ org: opts?.org, purpose: opts?.purpose })}`),
+  grant: (agentId: string, ops: string[]) => post<GrantResult | ApprovalPending>(`/api/agents/${enc(agentId)}/grant`, { ops }),
+
   // ---- system & agent updates ----
   serverVersion: () => get<ServerVersionInfo>('/api/server/version'),
   updateServer: () => post<{ ok: boolean; message: string }>('/api/server/update'),
-  dispatchAgentUpdate: (agentId: string) => post<{ ok: boolean; message: string }>(`/api/agents/${enc(agentId)}/update`),
-  updateAllAgents: () => post<{ ok: boolean; dispatched_to: number; message: string }>('/api/agents/update-all'),
+  /** Resolves to ApprovalPending when more approvers are needed. force reinstalls a device that already runs the build. */
+  dispatchAgentUpdate: (agentId: string, opts?: { force?: boolean }) =>
+    post<DispatchUpdateResult | ApprovalPending>(`/api/agents/${enc(agentId)}/update${opts?.force ? '?force=1' : ''}`),
+  /** Updates the devices of organizations that do not sign actions at once and
+   *  returns the rest as groups; lib/fleetUpdate.ts asks for one signature per
+   *  group through updateAgentBatch. */
+  updateAllAgents: () => post<UpdateAllResult>('/api/agents/update-all'),
+  /** One signed update for the devices of one group, through the signing flow.
+   *  Resolves to ApprovalPending when more approvers are needed. */
+  updateAgentBatch: (agentIds: string[]) => post<UpdateBatchResult | ApprovalPending>('/api/agents/update-batch', { agent_ids: agentIds }),
 };
 
 export type Api = typeof api;

@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from 'react';
-import { api } from '../../api/client';
+import { api, isPending } from '../../api/client';
 import type { FsEntry } from '../../api/types';
 import { DataTable, textMatch, type Column } from '../../components/DataTable';
 import { IconDownload, IconFile, IconFolder, IconPlus, IconRefresh, IconUpload } from '../../components/Icons';
@@ -7,6 +7,7 @@ import { PromptDialog, useConfirm } from '../../components/Modal';
 import { Button, ErrorBox } from '../../components/ui';
 import { useAsync } from '../../hooks/useAsync';
 import { bytes, dateTime } from '../../lib/format';
+import { GRANT_OPS, ensureGrant } from '../../lib/grants';
 import { errMsg, useToast } from '../../state/toast';
 import type { TabProps } from './DeviceDetail';
 
@@ -47,7 +48,17 @@ export function Files({ agent, canWrite }: TabProps) {
   const [path, setPath] = useState('');
   const [pathInput, setPathInput] = useState('');
   const [q, setQ] = useState('');
-  const listing = useAsync((signal) => api.fsList(agent.id, path, signal), [agent.id, path]);
+  // Phase 3: the file browser needs a signed grant first. ensureGrant answers
+  // from its cache while the grant is live, so only the first listing (and the
+  // first one after expiry) asks the operator to sign; cancelling shows the
+  // error with Retry instead of a listing.
+  const listing = useAsync(
+    async (signal) => {
+      await ensureGrant(agent.id, GRANT_OPS.files);
+      return api.fsList(agent.id, path, signal);
+    },
+    [agent.id, path],
+  );
   const [dialog, setDialog] = useState<{ kind: 'mkdir' } | { kind: 'rename'; entry: FsEntry } | null>(null);
   const [uploading, setUploading] = useState<string | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -66,7 +77,10 @@ export function Files({ agent, canWrite }: TabProps) {
     const dest = join(cur, file.name);
     setUploading(file.name);
     try {
-      await api.fsUpload(agent.id, dest, file);
+      const res = await api.fsUpload(agent.id, dest, file);
+      // Waiting for other approvers: request() has already said so, and the
+      // file lands once the last one signs.
+      if (isPending(res)) return;
       toast.success('Uploaded', `${file.name} (${bytes(file.size)})`);
       void listing.reload();
     } catch (err) {

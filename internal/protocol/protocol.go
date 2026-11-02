@@ -19,6 +19,15 @@ type Envelope struct {
 	ID  string          `json:"id,omitempty"`
 	D   json.RawMessage `json:"d,omitempty"`
 	Err string          `json:"err,omitempty"`
+	// A carries the operator signatures that authorize a protected request
+	// (docs/plans/2026-10-06-phase3-signed-actions.md). Agents without a
+	// trust bundle ignore it; old agents never see it as anything but an
+	// unknown field.
+	A *ActionAuth `json:"a,omitempty"`
+	// Log is set on an agent's reply to a protected request: the size of the
+	// transparency log head the device holds now, so the server can send the
+	// next consistency proof from the right place.
+	Log int64 `json:"log,omitempty"`
 }
 
 // Message types sent by the agent.
@@ -30,7 +39,36 @@ const (
 	TypeStream    = "stream"    // chunk of a long-running request (shell, script)
 	TypeEvent     = "event"     // unsolicited notification (service change, reboot required)
 	TypePong      = "pong"
+	// TypeAuth is the agent's first frame on a QUIC control stream, ahead of
+	// hello. It carries the credentials the WebSocket path sends as HTTP
+	// headers, because a QUIC stream has no headers to put them in.
+	TypeAuth = "auth"
 )
+
+// QUICALPN is the TLS application protocol both ends must name for the agent
+// transport; a server that does not see it refuses the handshake, so a stray
+// HTTP/3 client never reaches the agent endpoint.
+const QUICALPN = "homelab-rmm-agent/1"
+
+// Refusal sentences the server puts in the Err of an "error" frame when it
+// turns an agent away during authentication. They are the same text the
+// WebSocket path returns in its 401 body, and an agent matches on them to tell
+// a rejected key (re-enroll, never a transport failure) from a transport fault.
+const (
+	ErrUnknownAgentKey    = "unknown agent key"
+	ErrMissingCredentials = "missing credentials"
+	// ErrEnrollmentRefused prefixes the reason an enrollment token was refused.
+	ErrEnrollmentRefused = "enrollment refused: "
+)
+
+// Auth is the payload of a TypeAuth frame: an enrolled device's key, or the
+// enrollment token of a first contact. When both are set the key is used, the
+// same precedence the WebSocket path gives the Authorization header. Neither is
+// ever logged or stored by the server.
+type Auth struct {
+	Key   string `json:"key,omitempty"`
+	Token string `json:"token,omitempty"`
+}
 
 // Message types sent by the server. Each is a request the agent answers with a
 // TypeReply carrying the same ID (or a sequence of TypeStream then TypeReply).
@@ -41,6 +79,7 @@ const (
 	ReqShellInput        = "shell.input"
 	ReqShellResize       = "shell.resize"
 	ReqShellClose        = "shell.close"
+	ReqShellRTC          = "shell.rtc"
 	ReqScriptRun         = "script.run"
 	ReqScriptCancel      = "script.cancel"
 	ReqProcList          = "proc.list"
@@ -67,6 +106,10 @@ const (
 	ReqDeviceIsolate     = "device.isolate"     // firewall isolate or release endpoint
 	ReqNetworkScan       = "network.scan"       // agent-driven subnet probe
 	ReqSNMPPoll          = "snmp.poll"          // agent-driven SNMP query
+	ReqTrustUpdate       = "trust.update"       // replace the agent's trust bundle (signed by the current bundle's signers or a recovery key)
+	ReqFsStage           = "fs.stage"           // append a chunk of an upload to an agent-private staging file; nothing reads it until fs.commit
+	ReqFsCommit          = "fs.commit"          // move a staged upload into place once its size and SHA-256 match
+	ReqServicingRepair   = "servicing.repair"   // Windows only: DISM, SFC and Windows Update component reset; reply ServicingRepairResult
 )
 
 // TypeBaseline is sent by the agent after every evaluation pass (scheduled,
@@ -82,6 +125,22 @@ type Hello struct {
 	Arch            string `json:"arch"`
 	Version         string `json:"version"`
 	ProtocolVersion int    `json:"protocol_version"`
+	// TrustEpoch and TrustHash identify the trust bundle the agent holds
+	// (zero / empty: none yet). The server replays the bundles the agent
+	// is missing as trust.update requests after the welcome.
+	TrustEpoch int64  `json:"trust_epoch,omitempty"`
+	TrustHash  string `json:"trust_hash,omitempty"`
+	// LogSize is the size of the last transparency log head the device
+	// accepted (0: none yet). ExecutedHead is the head of the device's
+	// hash-chained executed.log.
+	LogSize      int64  `json:"log_size,omitempty"`
+	ExecutedHead string `json:"executed_head,omitempty"`
+	// CacheCapable says the agent has a cache directory and could bind the
+	// subnet cache port, so the server may make it a leader; CacheFingerprint
+	// is the SHA-256 of the self-signed certificate it would serve with, which
+	// members pin (docs/plans/2026-10-24-phase4b-mesh-cache.md).
+	CacheCapable     bool   `json:"cache_capable,omitempty"`
+	CacheFingerprint string `json:"cache_fingerprint,omitempty"`
 }
 
 // AgentConfig is pushed by the server after hello and whenever settings change.
@@ -94,6 +153,46 @@ type AgentConfig struct {
 	// agent evaluates them on their own interval, offline too, and reports
 	// with TypeBaseline. An empty list clears every assignment.
 	Baselines []BaselineSpec `json:"baselines,omitempty"`
+	// BaselineAuth holds each spec's standing approval, keyed by the spec's
+	// ID in decimal. An agent holding a trust bundle keeps only the specs
+	// whose approval verifies (in enforce mode; audit keeps and reports).
+	BaselineAuth map[string]*ActionAuth `json:"baseline_auth,omitempty"`
+	// QUIC and QUICPort advertise the server's optional QUIC agent transport
+	// (docs/plans/2026-10-24-phase3e-quic.md). QUICPort is the UDP port on the
+	// host the agent already uses; zero or QUIC false means the server only
+	// speaks WebSocket.
+	QUIC     bool `json:"quic,omitempty"`
+	QUICPort int  `json:"quic_port,omitempty"`
+	// Cache assigns the device its subnet cache role; nil means no cache, and
+	// a device that had one stops serving and fetching through it.
+	Cache *CacheConfig `json:"cache,omitempty"`
+}
+
+// CacheConfig is a device's place in its subnet's artifact cache. Every member
+// gets the leader's address, certificate pin and the day's token; the leader
+// also gets Serve, the port to bind and its storage budget.
+type CacheConfig struct {
+	LeaderAddr  string `json:"leader_addr"` // host:port the members dial
+	LeaderID    string `json:"leader_id"`
+	Fingerprint string `json:"fingerprint"` // SHA-256 of the leader certificate, hex
+	Token       string `json:"token"`       // daily bearer token; the leader checks it on every request
+	Serve       bool   `json:"serve,omitempty"`
+	Port        int    `json:"port,omitempty"`
+	MaxBytes    int64  `json:"max_bytes,omitempty"`
+}
+
+// CacheStats is what the agent reports about its cache role in inventory.
+type CacheStats struct {
+	Role        string `json:"role"` // "leader", "member" or "" when off
+	Hits        int64  `json:"hits"`
+	Misses      int64  `json:"misses"`
+	BytesServed int64  `json:"bytes_served"`
+	BytesStored int64  `json:"bytes_stored"`
+	// Serving is true while the device really listens as a leader. ServeFailed
+	// says the server assigned it to lead and it could not (port taken, store
+	// unusable), so the planner should choose another leader.
+	Serving     bool `json:"serving,omitempty"`
+	ServeFailed bool `json:"serve_failed,omitempty"`
 }
 
 // Inventory is the full description of a device.
@@ -121,13 +220,19 @@ type Inventory struct {
 	Software      []Software `json:"software"`
 	GPUs          []string   `json:"gpus"`
 	PublicIP      string     `json:"public_ip,omitempty"`
-	PendingReboot bool       `json:"pending_reboot"`
-	AntivirusName string     `json:"antivirus,omitempty"`
-	LastUser      string     `json:"last_user,omitempty"`
-	AgentVersion  string     `json:"agent_version"`
-	AgentPath     string     `json:"agent_path"`
-	CollectedAt   int64      `json:"collected_at"`
-	Extra         Extra      `json:"extra,omitempty"`
+	// ExecutedHead is the head of the device's hash-chained executed.log,
+	// reported so the server cannot quietly drop an executed manifest.
+	ExecutedHead  string `json:"executed_head,omitempty"`
+	PendingReboot bool   `json:"pending_reboot"`
+	AntivirusName string `json:"antivirus,omitempty"`
+	LastUser      string `json:"last_user,omitempty"`
+	AgentVersion  string `json:"agent_version"`
+	AgentPath     string `json:"agent_path"`
+	CollectedAt   int64  `json:"collected_at"`
+	Extra         Extra  `json:"extra,omitempty"`
+	// Cache is the device's subnet cache role and counters; nil when the
+	// feature is off for it.
+	Cache *CacheStats `json:"cache,omitempty"`
 }
 
 // Extra holds free-form platform specifics.
@@ -197,6 +302,37 @@ type ShellOpen struct {
 	Shell string `json:"shell"` // "powershell", "cmd", "bash", "sh", "" = default
 	Cols  int    `json:"cols"`
 	Rows  int    `json:"rows"`
+	// RTC asks the agent to accept a WebRTC data channel for this session's
+	// byte path (see ReqShellRTC); ICEServers are the servers it should use.
+	RTC        bool        `json:"rtc,omitempty"`
+	ICEServers []ICEServer `json:"ice_servers,omitempty"`
+}
+
+// ICEServer is one STUN/TURN server, in the shape the browser's
+// RTCConfiguration uses.
+type ICEServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+}
+
+// ShellRTC is the payload of ReqShellRTC: WebRTC signaling from the browser
+// for an open shell session. Kind is "offer", "candidate" or "fallback".
+type ShellRTC struct {
+	Session   string          `json:"session"`
+	Kind      string          `json:"kind"`
+	SDP       string          `json:"sdp,omitempty"`
+	Candidate json.RawMessage `json:"candidate,omitempty"`
+}
+
+// ShellSignal is the agent's WebRTC signaling, carried on a ShellChunk. Kind is
+// "answer", "candidate", "switch" (output now flows over the data channel) or
+// "unavailable" (no peer connection could be created; Reason says why).
+type ShellSignal struct {
+	Kind      string          `json:"kind"`
+	SDP       string          `json:"sdp,omitempty"`
+	Candidate json.RawMessage `json:"candidate,omitempty"`
+	Reason    string          `json:"reason,omitempty"`
 }
 
 type ShellInput struct {
@@ -219,18 +355,28 @@ type ShellChunk struct {
 	Session string `json:"session"`
 	Data    string `json:"data,omitempty"`
 	EOF     bool   `json:"eof,omitempty"`
+	// Sig, when set, is WebRTC signaling and the chunk carries no output.
+	Sig *ShellSignal `json:"sig,omitempty"`
 }
+
+// Default script execution resource quotas.
+const (
+	DefaultScriptMaxMemoryMB     uint64 = 1024 // Default memory ceiling: 1024 MB (1 GB)
+	DefaultScriptCPULimitPercent uint32 = 80   // Default CPU rate hard cap: 80%
+)
 
 // ---- Scripts ----
 
 type ScriptRun struct {
-	RunID    string            `json:"run_id"`
-	Language string            `json:"language"` // powershell, cmd, bash, sh, python
-	Body     string            `json:"body"`
-	Args     []string          `json:"args,omitempty"`
-	Env      map[string]string `json:"env,omitempty"`
-	Timeout  int               `json:"timeout_sec"`
-	RunAs    string            `json:"run_as,omitempty"` // "" (system) or "user"
+	RunID           string            `json:"run_id"`
+	Language        string            `json:"language"` // powershell, cmd, bash, sh, python
+	Body            string            `json:"body"`
+	Args            []string          `json:"args,omitempty"`
+	Env             map[string]string `json:"env,omitempty"`
+	Timeout         int               `json:"timeout_sec"`
+	RunAs           string            `json:"run_as,omitempty"`            // "" (system) or "user"
+	MaxMemoryMB     uint64            `json:"max_memory_mb,omitempty"`     // 0 = default (1024 MB)
+	CPULimitPercent uint32            `json:"cpu_limit_percent,omitempty"` // 0 = default (80%)
 }
 
 type ScriptChunk struct {
@@ -318,6 +464,51 @@ type UpdatesInstallResult struct {
 	Log       string            `json:"log"`
 }
 
+// ---- Servicing repair ----
+
+// Servicing repair step names, in the order a technician would run them.
+const (
+	ServicingDismRestore     = "dism_restore"
+	ServicingSFC             = "sfc"
+	ServicingResetComponents = "reset_components"
+	ServicingAddPackage      = "add_package"
+	ServicingRescan          = "rescan"
+)
+
+// ServicingPackage is a .cab or .msu the agent fetches (through the subnet
+// cache when it has a leader) and adds with DISM; SHA256 is mandatory.
+type ServicingPackage struct {
+	URL    string `json:"url"`
+	SHA256 string `json:"sha256"`
+}
+
+// ServicingRepair is the payload of servicing.repair. Empty Steps means the
+// default set (dism_restore, reset_components, rescan). Reboot is "never"
+// (default) or "if_required".
+type ServicingRepair struct {
+	Steps   []string          `json:"steps"`
+	Package *ServicingPackage `json:"package,omitempty"`
+	Reboot  string            `json:"reboot,omitempty"`
+}
+
+// ServicingStep is one step's outcome. Status is ok, failed or skipped; Tail
+// keeps the end of the command's output.
+type ServicingStep struct {
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	ExitCode   int    `json:"exit_code"`
+	DurationMS int64  `json:"duration_ms"`
+	Tail       string `json:"tail,omitempty"`
+}
+
+// ServicingRepairResult is the reply: every step that ran or was skipped, and
+// the ordinary update scan taken at the end (nil when rescan was not run).
+type ServicingRepairResult struct {
+	Steps          []ServicingStep    `json:"steps"`
+	RebootRequired bool               `json:"reboot_required"`
+	Scan           *UpdatesScanResult `json:"scan,omitempty"`
+}
+
 // ---- Event log ----
 
 type EventLogQuery struct {
@@ -379,6 +570,27 @@ type FsWrite struct {
 	Append bool   `json:"append"`
 }
 
+// FsStage appends Data at Offset of the staging file for UploadID. Offset
+// must equal the bytes staged so far (0 starts the upload over), so a chunk
+// that arrives twice or out of order is refused rather than corrupting it.
+type FsStage struct {
+	UploadID string `json:"upload_id"`
+	Offset   int64  `json:"offset"`
+	Data     []byte `json:"data"`
+}
+
+// FsCommit moves the staged upload UploadID to Path, but only when the
+// staged bytes are exactly Size long and hash to SHA256 (lowercase hex). It
+// is what an operator signs for an upload: a destination and a digest,
+// rather than the file itself, so a signed upload is not limited by the size
+// of a manifest.
+type FsCommit struct {
+	UploadID string `json:"upload_id"`
+	Path     string `json:"path"`
+	Size     int64  `json:"size"`
+	SHA256   string `json:"sha256"`
+}
+
 type FsPath struct {
 	Path string `json:"path"`
 }
@@ -398,17 +610,39 @@ type Power struct {
 
 // ---- Desktop ----
 
+// DesktopMode defines the operational target desktop.
+type DesktopMode string
+
+const (
+	DesktopModeConsole   DesktopMode = "console"   // Interactive user screen (winsta0\default)
+	DesktopModeBackstage DesktopMode = "backstage" // Isolated administrative desktop (winsta0\HomelabRMM_Backstage)
+)
+
 // DesktopStart asks the agent to spawn its desktop helper in the interactive
 // session. The helper connects back to the server on its own WebSocket using
 // Token, and the server bridges it to the operator's browser.
 type DesktopStart struct {
-	Token   string `json:"token"`
-	Quality int    `json:"quality"` // JPEG quality 1-100
+	Token        string      `json:"token"`
+	Quality      int         `json:"quality"`                 // JPEG quality 1-100
+	Mode         DesktopMode `json:"mode,omitempty"`          // console (default) or backstage
+	EnableWebRTC bool        `json:"enable_webrtc,omitempty"` // true if viewer supports WebRTC
 }
 
 type DesktopStartResult struct {
-	Started bool   `json:"started"`
-	Note    string `json:"note,omitempty"`
+	Started     bool        `json:"started"`
+	Note        string      `json:"note,omitempty"`
+	Mode        DesktopMode `json:"mode,omitempty"`
+	WebRTCAvail bool        `json:"webrtc_avail,omitempty"`
+}
+
+// WebRTCSignalingMessage encapsulates JSON signaling messages exchanged between
+// the browser viewer and the agent desktop helper via the server WebSocket bridge.
+type WebRTCSignalingMessage struct {
+	Type       string          `json:"t"`                     // "webrtc_offer", "webrtc_answer", "webrtc_candidate", "webrtc_config", "webrtc_active", "fallback_tiles"
+	SDP        string          `json:"sdp,omitempty"`         // For offer and answer
+	Candidate  json.RawMessage `json:"candidate,omitempty"`   // For trickle ICE candidate
+	Reason     string          `json:"reason,omitempty"`      // For fallback notification
+	ICEServers json.RawMessage `json:"ice_servers,omitempty"` // For webrtc_config
 }
 
 // ---- Device Isolation ----
@@ -498,6 +732,18 @@ type AgentUpdate struct {
 	Version string `json:"version"`
 }
 
+// AgentUpdateResult is the reply to agent.update once the new binary is staged.
+// Source says where the bytes came from: "origin", "cache <leader> over h3|https",
+// or "origin (the cache failed: <reason>)". It is empty when nothing was
+// downloaded (the device already ran the build) and in the reply of an agent
+// that predates this struct, which answers with no body at all.
+type AgentUpdateResult struct {
+	Source        string `json:"source"`
+	Bytes         int64  `json:"bytes,omitempty"`
+	ResumedChunks int    `json:"resumed_chunks,omitempty"`
+	Version       string `json:"version,omitempty"`
+}
+
 // ---- Network Discovery & SNMP ----
 
 type NetworkScanReq struct {
@@ -542,3 +788,62 @@ func Must(v any) json.RawMessage {
 	}
 	return b
 }
+
+// ---- Action authorization (Phase 3) ----
+//
+// See internal/actionauth for the verification rules and
+// docs/plans/2026-10-06-phase3-signed-actions.md for the design. Every
+// binary field is unpadded base64url.
+
+// Assertion is one WebAuthn assertion used as a signature: the authenticator
+// signed authenticatorData || SHA-256(clientDataJSON), and clientDataJSON's
+// challenge is SHA-256 of the signed document.
+type Assertion struct {
+	Cred string `json:"cred"` // credential ID
+	AD   string `json:"ad"`   // authenticatorData
+	CD   string `json:"cd"`   // clientDataJSON
+	Sig  string `json:"sig"`  // signature
+}
+
+// ActionAuth is a signed manifest and its detached signatures. M is the
+// exact manifest bytes; nobody re-serializes them.
+type ActionAuth struct {
+	M string      `json:"m"`
+	S []Assertion `json:"s"`
+	// L proves the manifest is in the server's transparency log. The
+	// handler sets only Index; the hub completes the proof per send.
+	L *LogProof `json:"l,omitempty"`
+}
+
+// LogProof is an inclusion proof for a manifest leaf against a signed tree
+// head, optionally with a consistency proof from the head the device last
+// accepted.
+type LogProof struct {
+	Head        string   `json:"head"`                  // base64 of the signed tree head note
+	Index       int64    `json:"index"`                 // the manifest's leaf
+	Proof       []string `json:"proof"`                 // inclusion proof, base64 hashes
+	From        int64    `json:"from,omitempty"`        // size of the head the consistency proof starts from, 0 = none
+	Consistency []string `json:"consistency,omitempty"` // consistency proof, base64 hashes
+}
+
+// RecoverySig is an Ed25519 signature by an offline recovery key over the
+// exact bundle bytes.
+type RecoverySig struct {
+	ID  string `json:"id"`
+	Sig string `json:"sig"`
+}
+
+// TrustUpdate replaces the agent's trust bundle. Bundle is the exact bundle
+// bytes; S are WebAuthn assertions by signers of the agent's CURRENT bundle,
+// R are recovery-key signatures.
+type TrustUpdate struct {
+	Bundle string        `json:"bundle"`
+	S      []Assertion   `json:"s,omitempty"`
+	R      []RecoverySig `json:"r,omitempty"`
+}
+
+// Security events are TypeEvent frames with Event.Kind "security". Fields:
+// "op" (the request type), "mode" (audit | enforce), "executed" ("true" or
+// "false"), "reason" (why verification failed, or what changed) and
+// "manifest" (the manifest ID, when one was presented).
+const EventKindSecurity = "security"

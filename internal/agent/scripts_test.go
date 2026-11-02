@@ -2,8 +2,10 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -311,5 +313,242 @@ func TestRemoveScriptDirReportsFailure(t *testing.T) {
 	removeScriptDir(dir)
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("the run directory is still there: %v", err)
+	}
+}
+
+// ============================================================================
+// Streaming Chunk Boundary & Redaction Integration Tests (Milestone 2 - R4)
+// ============================================================================
+
+func TestStreamingChunkBoundary(t *testing.T) {
+	t.Run("Secret Keyword Split Across Write Calls", func(t *testing.T) {
+		// Secret keyword "password" is split between "pass" and "word="
+		// "Bearer" is split between "Bear" and "er "
+		chunks := []string{
+			"User authenticated with pass",
+			"word=SuperSecretPass999; and Bear",
+			"er my_jwt_token_123456\n",
+			"Next line is clean\n",
+		}
+
+		s, lines := collectStream(t, chunks...)
+
+		if len(lines) != 2 {
+			t.Fatalf("Expected 2 lines, got %d: %v", len(lines), lines)
+		}
+
+		firstLine := lines[0]
+		if strings.Contains(firstLine, "SuperSecretPass999") || strings.Contains(firstLine, "my_jwt_token_123456") {
+			t.Fatalf("CRITICAL LEAK: Chunk split resulted in leaked secret! Line: %q", firstLine)
+		}
+
+		expectedFirstLine := "User authenticated with password=[REDACTED]; and Bearer [REDACTED]\n"
+		if firstLine != expectedFirstLine {
+			t.Errorf("Reconstituted line mismatch:\nExpected: %q\nActual:   %q", expectedFirstLine, firstLine)
+		}
+
+		if lines[1] != "Next line is clean\n" {
+			t.Errorf("Clean line corrupted: %q", lines[1])
+		}
+
+		// Also verify captured buffer String()
+		if strings.Contains(s.String(), "SuperSecretPass999") || strings.Contains(s.String(), "my_jwt_token_123456") {
+			t.Fatalf("CRITICAL LEAK in captured buffer: %q", s.String())
+		}
+	})
+
+	t.Run("Secret Value Split Across Write Calls", func(t *testing.T) {
+		chunks := []string{
+			"Connecting with token=ghp_",
+			"1234567890abcdefghijklmnopqrstuvwxyz\n",
+		}
+
+		s, lines := collectStream(t, chunks...)
+		if len(lines) != 1 {
+			t.Fatalf("Expected 1 line, got %d", len(lines))
+		}
+
+		expected := "Connecting with token=[REDACTED]\n"
+		if lines[0] != expected {
+			t.Errorf("Mismatch:\nExpected: %q\nActual:   %q", expected, lines[0])
+		}
+		if strings.Contains(s.String(), "1234567890abcdef") {
+			t.Fatalf("Secret leaked in stream capture: %q", s.String())
+		}
+	})
+
+	t.Run("Secret Split Flushed Without Trailing Newline", func(t *testing.T) {
+		// Output terminates without newline, flushed at process exit
+		chunks := []string{
+			"Diagnostic api_",
+			"key=sk_live_998877",
+		}
+
+		s, lines := collectStream(t, chunks...)
+		if len(lines) != 1 {
+			t.Fatalf("Expected 1 line from flush, got %d", len(lines))
+		}
+
+		expected := "Diagnostic api_key=[REDACTED]\n"
+		if lines[0] != expected {
+			t.Errorf("Mismatch:\nExpected: %q\nActual:   %q", expected, lines[0])
+		}
+		if strings.Contains(s.String(), "sk_live_998877") {
+			t.Fatalf("Secret leaked after flush: %q", s.String())
+		}
+	})
+
+	t.Run("PEM Header Split Across Write Calls", func(t *testing.T) {
+		chunks := []string{
+			"Key dump: -----BEGIN RSA ",
+			"PRIVATE KEY-----\n",
+		}
+
+		s, lines := collectStream(t, chunks...)
+		if len(lines) != 1 {
+			t.Fatalf("Expected 1 line, got %d", len(lines))
+		}
+
+		expected := "Key dump: [REDACTED PRIVATE KEY]\n"
+		if lines[0] != expected {
+			t.Errorf("Mismatch:\nExpected: %q\nActual:   %q", expected, lines[0])
+		}
+		if strings.Contains(s.String(), "RSA PRIVATE KEY") {
+			t.Fatalf("PEM header leaked: %q", s.String())
+		}
+	})
+}
+
+func TestScriptStreamMultiLinePEMStreaming(t *testing.T) {
+	// A multi-line private key streamed line-by-line across multiple Write calls
+	chunks := []string{
+		"Certificate loaded:\n",
+		"-----BEGIN RSA PRIVATE KEY-----\n",
+		"MIIEowIBAAKCAQEA0Y1W9Z5l\n",
+		"uE9O5bK0Jk1M2N3P4Q5R6S7T\n",
+		"-----END RSA PRIVATE KEY-----\n",
+		"Status: Key loaded successfully\n",
+	}
+
+	s, lines := collectStream(t, chunks...)
+	if len(lines) != 6 {
+		t.Fatalf("Expected 6 lines, got %d: %v", len(lines), lines)
+	}
+
+	// Line 0: Certificate loaded:
+	if lines[0] != "Certificate loaded:\n" {
+		t.Errorf("Line 0 corrupted: %q", lines[0])
+	}
+	// Lines 1-4: all private key lines must be redacted
+	for idx := 1; idx <= 4; idx++ {
+		if lines[idx] != "[REDACTED PRIVATE KEY]\n" {
+			t.Errorf("Line %d not redacted: %q", idx, lines[idx])
+		}
+	}
+	// Line 5: Status: Key loaded successfully
+	if lines[5] != "Status: Key loaded successfully\n" {
+		t.Errorf("Line 5 corrupted: %q", lines[5])
+	}
+
+	captured := s.String()
+	leaks := []string{
+		"MIIEowIBAAKCAQEA0Y1W9Z5l",
+		"uE9O5bK0Jk1M2N3P4Q5R6S7T",
+	}
+	for _, lk := range leaks {
+		if strings.Contains(captured, lk) {
+			t.Fatalf("CRITICAL LEAK: Private key material found in capture buffer: %q", captured)
+		}
+	}
+}
+
+func TestScriptStreamRedactsCapturedBuffer(t *testing.T) {
+	s, _ := collectStream(t, "user=admin password=SecretAdminPass123! token=ghp_tok789\n")
+	captured := s.String()
+	expected := "user=admin password=[REDACTED] token=[REDACTED]\n"
+	if captured != expected {
+		t.Errorf("Captured buffer mismatch:\nExpected: %q\nActual:   %q", expected, captured)
+	}
+	if strings.Contains(captured, "SecretAdminPass123!") || strings.Contains(captured, "ghp_tok789") {
+		t.Fatalf("Secret leaked in captured stream buffer: %q", captured)
+	}
+}
+
+func TestScriptStreamConcurrentWrites(t *testing.T) {
+	var mu sync.Mutex
+	var lines []string
+	s := newScriptStream(func(l string) {
+		mu.Lock()
+		lines = append(lines, l)
+		mu.Unlock()
+	})
+
+	var wg sync.WaitGroup
+	numWorkers := 8
+	linesPerWorker := 25
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for j := 0; j < linesPerWorker; j++ {
+				chunk := fmt.Sprintf("Worker %d Line %d: password=Secret_%d_%d token=Tok_%d_%d\n", workerID, j, workerID, j, workerID, j)
+				_, _ = s.Write([]byte(chunk))
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	s.flush()
+
+	mu.Lock()
+	collected := append([]string(nil), lines...)
+	mu.Unlock()
+
+	if len(collected) != numWorkers*linesPerWorker {
+		t.Fatalf("Expected %d lines, got %d", numWorkers*linesPerWorker, len(collected))
+	}
+
+	for idx, line := range collected {
+		if strings.Contains(line, "Secret_") || strings.Contains(line, "Tok_") {
+			t.Fatalf("Leak in line %d: %q", idx, line)
+		}
+		if !strings.Contains(line, "password=[REDACTED]") || !strings.Contains(line, "token=[REDACTED]") {
+			t.Fatalf("Missing redaction marker in line %d: %q", idx, line)
+		}
+	}
+}
+
+func TestScriptRunnerRedactsSecretsInOutput(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("cmd script runner test for windows")
+	}
+	r := newScriptRunner()
+	body := "@echo off\r\n" +
+		"echo user=admin password=SecretPassword123! host=db.internal\r\n" +
+		"echo Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.test.tok\r\n"
+	var (
+		mu       sync.Mutex
+		streamed []string
+	)
+	res := r.run(context.Background(), protocol.ScriptRun{RunID: "redact-run", Language: "cmd", Body: body, Timeout: 30}, func(c protocol.ScriptChunk) {
+		mu.Lock()
+		streamed = append(streamed, c.Data)
+		mu.Unlock()
+	})
+	if res.ExitCode != 0 || res.Error != "" {
+		t.Fatalf("run failed: exit=%d err=%q", res.ExitCode, res.Error)
+	}
+	if strings.Contains(res.Stdout, "SecretPassword123!") || strings.Contains(res.Stdout, "eyJhbGciOiJIUzI1NiJ9") {
+		t.Fatalf("CRITICAL LEAK in res.Stdout: %q", res.Stdout)
+	}
+	if !strings.Contains(res.Stdout, "password=[REDACTED]") || !strings.Contains(res.Stdout, "Bearer [REDACTED]") {
+		t.Fatalf("Redaction marker missing in res.Stdout: %q", res.Stdout)
+	}
+	mu.Lock()
+	allStreamed := strings.Join(streamed, "")
+	mu.Unlock()
+	if strings.Contains(allStreamed, "SecretPassword123!") || strings.Contains(allStreamed, "eyJhbGciOiJIUzI1NiJ9") {
+		t.Fatalf("CRITICAL LEAK in streamed chunks: %q", allStreamed)
 	}
 }

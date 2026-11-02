@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, NavLink, useNavigate, useParams } from 'react-router-dom';
-import { api, ApiError } from '../../api/client';
+import { api, ApiError, isPending } from '../../api/client';
 import type { Agent, Metrics, PowerAction } from '../../api/types';
-import { IconMore, IconPower, IconRefresh, IconWifi } from '../../components/Icons';
+import { IconMore, IconPower, IconRefresh, IconUpload, IconWifi } from '../../components/Icons';
 import { useConfirm } from '../../components/Modal';
 import { PowerDialog } from '../../components/PowerDialog';
 import { RunDialog } from '../../components/RunDialog';
@@ -10,6 +10,7 @@ import { Button, Chip, Dropdown, ErrorBox, Loading, OnlineDot } from '../../comp
 import { useAsync } from '../../hooks/useAsync';
 import { useEvents, useLiveReload } from '../../hooks/useEvents';
 import { osLabel, relTime } from '../../lib/format';
+import { summarizeDeviceUpdate } from '../../lib/deviceUpdate';
 import { useAuth } from '../../state/auth';
 import { errMsg, useToast } from '../../state/toast';
 import { OSIcon } from '../Devices';
@@ -67,6 +68,18 @@ export function DeviceDetail() {
   });
   const [power, setPower] = useState<PowerAction | null>(null);
   const [runOpen, setRunOpen] = useState(false);
+  const [updating, setUpdating] = useState(false);
+  const [serverVersion, setServerVersion] = useState('');
+  useEffect(() => {
+    let live = true;
+    api
+      .serverVersion()
+      .then((v) => live && setServerVersion(v.version))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
 
   const activeTab: TabId = (TABS.find((t) => t.id === tab)?.id ?? 'overview') as TabId;
   // Twelve tabs are 985px of strip in a 366px box, so opening
@@ -132,6 +145,38 @@ export function DeviceDetail() {
       toast.error('Delete failed', errMsg(err));
     }
   };
+  const doUpdate = async () => {
+    if (updating) return;
+    const ok = await confirm({
+      title: 'Update agent',
+      message: `Update the agent on ${a.display_name}? It downloads the server's build${serverVersion ? ` (${serverVersion})` : ''}, verifies its SHA-256, installs it and restarts. In an organization that signs actions you will be asked to sign.`,
+      confirmLabel: 'Update agent',
+    });
+    if (!ok) return;
+    setUpdating(true);
+    try {
+      let res = await api.dispatchAgentUpdate(a.id);
+      if (!isPending(res) && res.up_to_date) {
+        const again = await confirm({
+          title: 'Already on this build',
+          message: `${res.message}. Reinstall anyway?`,
+          confirmLabel: 'Reinstall',
+        });
+        if (!again) return;
+        res = await api.dispatchAgentUpdate(a.id, { force: true });
+      }
+      // request() already toasts a request that waits for more approvers.
+      if (isPending(res)) return;
+      const s = summarizeDeviceUpdate(res, a.display_name);
+      toast[s.tone](s.title, s.detail);
+    } catch (err) {
+      // 428: the operator cancelled signing or it is parked for rmm-signer
+      if (err instanceof ApiError && err.status === 428) return;
+      toast.error('Update failed', errMsg(err));
+    } finally {
+      setUpdating(false);
+    }
+  };
   const doPower = async (delay: number, message: string) => {
     if (!power) return;
     try {
@@ -173,6 +218,11 @@ export function DeviceDetail() {
           </Link>
           <span className="faint">/</span>
           <OnlineDot online={a.online} />
+          {a.online && a.transport && (
+            <span className="muted small" title="Transport of the agent connection">
+              {a.transport === 'quic' ? 'QUIC' : 'WebSocket'}
+            </span>
+          )}
           <h1>{a.display_name}</h1>
           {/* Both the OS label and the last IP are on the Overview tab; on a
               phone they cost a row of a head that repeats on all twelve
@@ -194,6 +244,15 @@ export function DeviceDetail() {
                 is one row: breadcrumb + dot + name, Power, More. */}
             <Button size="sm" className="dev-head-btn" onClick={() => setRunOpen(true)} disabled={!a.online}>
               Run script
+            </Button>
+            <Button
+              size="sm"
+              className="dev-head-btn"
+              onClick={doUpdate}
+              disabled={!a.online || updating}
+              title={serverVersion ? `Server build ${serverVersion}, agent ${a.version || 'unknown'}` : 'Update the agent to the server build'}
+            >
+              <IconUpload /> {updating ? 'Updating…' : 'Update agent'}
             </Button>
             <Button size="sm" className="dev-head-btn" onClick={doRefresh} disabled={!a.online} title="Refresh inventory">
               <IconRefresh /> Inventory
@@ -227,6 +286,9 @@ export function DeviceDetail() {
                   media-query state in JS. */}
               <button className="phone-only" disabled={!a.online} onClick={() => setRunOpen(true)}>
                 Run script
+              </button>
+              <button className="phone-only" disabled={!a.online || updating} onClick={doUpdate}>
+                {updating ? 'Updating…' : 'Update agent'}
               </button>
               <button className="phone-only" disabled={!a.online} onClick={doRefresh}>
                 Refresh inventory

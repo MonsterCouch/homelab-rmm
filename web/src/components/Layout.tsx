@@ -20,7 +20,9 @@ import {
   IconBuilding,
   IconDashboard,
   IconDevices,
+  IconKey,
   IconKeyboard,
+  IconLock,
   IconLogout,
   IconMenu,
   IconMoon,
@@ -56,6 +58,7 @@ const NAV_OPS = [
   { to: '/baselines', label: 'Baselines', icon: IconBaseline },
   { to: '/patches', label: 'Patches', icon: IconPatch },
   { to: '/software-catalog', label: 'Software Drawer', icon: IconPackage },
+  { to: '/approvals', label: 'Approvals', icon: IconLock },
 ];
 const NAV_MONITOR = [
   { to: '/alerts', label: 'Alerts', icon: IconAlert, badge: true },
@@ -63,6 +66,7 @@ const NAV_MONITOR = [
 ];
 const ADMIN_NAV = [
   { to: '/organizations', label: 'Organizations', icon: IconBuilding },
+  { to: '/trust', label: 'Trust & signing', icon: IconKey },
   { to: '/settings', label: 'Settings', icon: IconSettings },
   { to: '/users', label: 'Users', icon: IconUsers },
   { to: '/audit', label: 'Audit', icon: IconAudit },

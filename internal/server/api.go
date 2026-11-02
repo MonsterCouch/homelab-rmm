@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/MonsterCouch/homelab-rmm/internal/telemetry"
 )
 
 // routes builds the HTTP mux. Everything under /api requires a session
@@ -49,10 +51,18 @@ func (s *Server) routes() http.Handler {
 
 	mux.HandleFunc("GET /api/agent/update-check", s.handleAgentUpdateCheck)
 
+	// Transparency log heads and proofs hold only hashes and sizes, and an
+	// outside auditor has no session. The leaves themselves are admin only
+	// (below).
+	mux.HandleFunc("GET /api/log/head", s.handleLogHead)
+	mux.HandleFunc("GET /api/log/proof", s.handleLogProof)
+	mux.HandleFunc("GET /api/log/consistency", s.handleLogConsistency)
+
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/server/version", s.handleServerVersionInfo)
 	api.HandleFunc("POST /api/server/update", s.requireAdmin(s.handleServerUpdate))
 	api.HandleFunc("POST /api/agents/update-all", s.requireAdmin(s.handleDispatchAllAgentsUpdate))
+	api.HandleFunc("POST /api/agents/update-batch", s.requireAdmin(s.handleDispatchAgentBatchUpdate))
 	api.HandleFunc("GET /api/me", s.handleMe)
 	api.HandleFunc("POST /api/me/password", s.handleChangePassword)
 	api.HandleFunc("POST /api/me/totp/begin", s.handleTOTPBegin)
@@ -77,6 +87,7 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("GET /api/agents/{id}/fs", s.handleFsList)
 	api.HandleFunc("GET /api/agents/{id}/fs/download", s.requireWrite(s.handleFsDownload))
 	api.HandleFunc("POST /api/agents/{id}/fs/upload", s.requireWrite(s.handleFsUpload))
+	api.HandleFunc("POST /api/agents/{id}/fs/commit", s.requireWrite(s.handleFsCommit))
 	api.HandleFunc("POST /api/agents/{id}/fs/delete", s.requireWrite(s.handleFsDelete))
 	api.HandleFunc("POST /api/agents/{id}/fs/mkdir", s.requireWrite(s.handleFsMkdir))
 	api.HandleFunc("POST /api/agents/{id}/fs/rename", s.requireWrite(s.handleFsRename))
@@ -87,6 +98,8 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("GET /api/agents/{id}/patches", s.handleAgentPatches)
 	api.HandleFunc("POST /api/agents/{id}/patches/scan", s.requireWrite(s.handlePatchScan))
 	api.HandleFunc("POST /api/agents/{id}/patches/install", s.requireWrite(s.handlePatchInstall))
+	api.HandleFunc("GET /api/agents/{id}/servicing", s.handleListServicing)
+	api.HandleFunc("POST /api/agents/{id}/servicing/repair", s.requireWrite(s.handleServicingRepair))
 	api.HandleFunc("GET /ws/shell/{id}", s.requireWrite(s.handleShellWS))
 	api.HandleFunc("GET /ws/desktop/{id}", s.requireWrite(s.handleDesktopViewerWS))
 
@@ -99,6 +112,28 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("POST /api/organizations/{id}/sites", s.requireAdmin(s.handleCreateSite))
 	api.HandleFunc("PUT /api/sites/{id}", s.requireAdmin(s.handleUpdateSite))
 	api.HandleFunc("DELETE /api/sites/{id}", s.requireAdmin(s.handleDeleteSite))
+
+	// Phase 3 signed actions. Security keys belong to whoever registers them;
+	// the trust bundle is the fleet's root of trust and admin only.
+	api.HandleFunc("POST /api/webauthn/register/begin", s.handleWebAuthnBegin)
+	api.HandleFunc("POST /api/webauthn/register/finish", s.handleWebAuthnFinish)
+	api.HandleFunc("GET /api/webauthn/credentials", s.handleListCredentials)
+	api.HandleFunc("DELETE /api/webauthn/credentials/{id}", s.handleDeleteCredential)
+	api.HandleFunc("GET /api/organizations/{id}/trust", s.requireAdmin(s.handleGetOrgTrust))
+	api.HandleFunc("POST /api/organizations/{id}/trust/proposals", s.requireAdmin(s.handleCreateTrustProposal))
+	api.HandleFunc("GET /api/trust/proposals/{pid}", s.requireAdmin(s.handleGetTrustProposal))
+	api.HandleFunc("POST /api/trust/proposals/{pid}/sign", s.requireAdmin(s.handleSignTrustProposal))
+	api.HandleFunc("POST /api/trust/proposals/{pid}/recovery", s.requireAdmin(s.handleRecoverTrustProposal))
+	api.HandleFunc("GET /api/log/entries/{index}", s.requireAdmin(s.handleLogEntry))
+
+	// Signed actions: the approvals queue, standing approvals of unattended
+	// objects, and the grants behind the shell, desktop and file browser.
+	api.HandleFunc("GET /api/approvals", s.handleListApprovals)
+	api.HandleFunc("GET /api/approvals/unsigned", s.handleUnsignedApprovals)
+	api.HandleFunc("POST /api/approvals/objects/{type}/{id}/sign", s.requireWrite(s.handleSignObject))
+	api.HandleFunc("GET /api/approvals/{manifest_id}", s.handleGetApproval)
+	api.HandleFunc("POST /api/approvals/{manifest_id}/sign", s.requireWrite(s.handleSignApproval))
+	api.HandleFunc("POST /api/agents/{id}/grant", s.requireWrite(s.handleGrant))
 
 	api.HandleFunc("GET /api/groups", s.handleListGroups)
 	api.HandleFunc("POST /api/groups", s.requireWrite(s.handleCreateGroup))
@@ -294,6 +329,8 @@ func fail(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusNotFound, "not found")
 	case errors.Is(err, ErrAgentOffline):
 		writeErr(w, http.StatusConflict, "agent is offline")
+	case errors.Is(err, ErrSignedRunOffline):
+		writeErr(w, http.StatusConflict, err.Error())
 	default:
 		writeErr(w, http.StatusBadRequest, err.Error())
 	}
@@ -330,8 +367,20 @@ func actor(r *http.Request) string {
 	return "anonymous"
 }
 
+// audit records what a request did in the name of the person it speaks for,
+// at their address.
 func (s *Server) audit(r *http.Request, action, target string, details any) {
-	s.db.Audit(actor(r), s.clientIP(r), action, target, details)
+	s.db.Audit(actor(r), s.requesterIP(r), action, target, details)
+}
+
+// requesterIP is the address of the person a request speaks for: the client's,
+// unless the request runs a signed action for the operator who asked for it,
+// whose address the pending entry kept (see withIssuer).
+func (s *Server) requesterIP(r *http.Request) string {
+	if from, ok := r.Context().Value(issuerAddrKey{}).(string); ok && from != "" {
+		return from
+	}
+	return s.clientIP(r)
 }
 
 // ---- auth handlers ----
@@ -703,8 +752,19 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 	var dbSize int64
 	s.db.QueryRow(`SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()`).Scan(&dbSize)
+	// The metrics series may live outside rmm.db, so its engine and size are
+	// reported next to the database's. telemetry_bytes is -1 when the engine
+	// cannot say (SQLite builds without the dbstat table).
+	engine, teleBytes := s.cfg.TelemetryEngine(), int64(-1)
+	if in, ok := s.db.telemetry.(telemetry.Inspector); ok {
+		engine = in.Engine()
+		if n, err := in.SizeBytes(); err == nil {
+			teleBytes = n
+		}
+	}
 	writeJSON(w, 200, map[string]any{
 		"version": Version, "public_url": s.PublicURL(), "fingerprint": s.Fingerprint(), "pin_fingerprint": s.PinFingerprint(),
+		"telemetry_engine": engine, "telemetry_bytes": teleBytes,
 		"data_dir": s.cfg.DataDir, "db_bytes": dbSize, "uptime": int64(time.Since(s.startedAt).Seconds()),
 		"agents_connected": len(s.hub.OnlineIDs()),
 		// "" unless the certificate does not cover public_url, in which case
@@ -718,7 +778,7 @@ func (s *Server) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "limit", 200)
-	rows, err := s.db.Query(`SELECT id, ts, user, ip, action, target, details FROM audit ORDER BY ts DESC, id DESC LIMIT ?`, limit)
+	rows, err := s.db.Query(`SELECT id, ts, user, ip, action, target, details, log_index FROM audit ORDER BY ts DESC, id DESC LIMIT ?`, limit)
 	if err != nil {
 		fail(w, err)
 		return
@@ -732,11 +792,14 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 		Action  string `json:"action"`
 		Target  string `json:"target"`
 		Details string `json:"details"`
+		// LogIndex is the row's leaf in the transparency log, -1 for rows from
+		// before the log or whose append failed.
+		LogIndex int64 `json:"log_index"`
 	}
 	out := []row{}
 	for rows.Next() {
 		var x row
-		rows.Scan(&x.ID, &x.TS, &x.User, &x.IP, &x.Action, &x.Target, &x.Details)
+		rows.Scan(&x.ID, &x.TS, &x.User, &x.IP, &x.Action, &x.Target, &x.Details, &x.LogIndex)
 		out = append(out, x)
 	}
 	writeJSON(w, 200, out)

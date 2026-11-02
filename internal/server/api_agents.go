@@ -126,6 +126,23 @@ func (s *Server) canAccessTargets(u *User, t Targets) bool {
 	return s.validateTargetsScope(u, t) == nil
 }
 
+// agentRow is a device as the device list and detail endpoints return it: the
+// stored Agent plus how it is connected right now. Transport is only the hub's
+// to know, so it is stamped here rather than stored; it is absent for a device
+// that is offline.
+type agentRow struct {
+	*Agent
+	Transport string `json:"transport,omitempty"` // "websocket" or "quic"
+}
+
+func (s *Server) agentRowFor(a *Agent) agentRow {
+	row := agentRow{Agent: a}
+	if ac, ok := s.hub.get(a.ID); ok {
+		row.Transport = ac.transportName()
+	}
+	return row
+}
+
 func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	agents, err := s.agentsWithLiveness()
 	if err != nil {
@@ -149,7 +166,11 @@ func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request) {
 		}
 		filtered = append(filtered, a)
 	}
-	writeJSON(w, 200, filtered)
+	rows := make([]agentRow, len(filtered))
+	for i, a := range filtered {
+		rows[i] = s.agentRowFor(a)
+	}
+	writeJSON(w, 200, rows)
 }
 
 func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
@@ -158,7 +179,7 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.Online = s.hub.IsOnline(a.ID)
-	writeJSON(w, 200, a)
+	writeJSON(w, 200, s.agentRowFor(a))
 }
 
 func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
@@ -302,7 +323,8 @@ func (s *Server) handleProcesses(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleProcKill(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := s.getScopedAgent(w, r, id); !ok {
+	a, ok := s.getScopedAgent(w, r, id)
+	if !ok {
 		return
 	}
 	var in protocol.ProcKill
@@ -310,18 +332,32 @@ func (s *Server) handleProcKill(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
-	defer cancel()
-	if err := s.hub.Request(ctx, id, protocol.ReqProcKill, in, nil); err != nil {
-		// A refusal is audited too. "Nobody tried" and "someone tried and the
-		// device said no" are different answers to the question this log is
-		// read to answer, and the attempt is fully attributed right here.
-		s.audit(r, "process.kill", r.PathValue("id"), auditFailure(map[string]any{"pid": in.PID}, err))
-		fail(w, err)
-		return
+	s.runSigned(w, r, signedAction{
+		Org: a.OrgID, Op: protocol.ReqProcKill, Targets: []string{id}, Payload: in,
+		Summary: fmt.Sprintf("Kill process %d on %s", in.PID, agentLabel(a)),
+		Run: func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth) {
+			ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
+			defer cancel()
+			if err := s.hub.RequestA(ctx, id, protocol.ReqProcKill, in, nil, auth); err != nil {
+				// A refusal is audited too. "Nobody tried" and "someone tried and the
+				// device said no" are different answers to the question this log is
+				// read to answer, and the attempt is fully attributed right here.
+				s.audit(r, "process.kill", id, auditFailure(map[string]any{"pid": in.PID}, err))
+				fail(w, err)
+				return
+			}
+			s.audit(r, "process.kill", id, in)
+			writeJSON(w, 200, map[string]any{"ok": true})
+		},
+	})
+}
+
+// agentLabel is how a device is named in what an operator is asked to sign.
+func agentLabel(a *Agent) string {
+	if a.DisplayName != "" {
+		return a.DisplayName
 	}
-	s.audit(r, "process.kill", r.PathValue("id"), in)
-	writeJSON(w, 200, map[string]any{"ok": true})
+	return a.Hostname
 }
 
 // ---- services ----
@@ -346,7 +382,8 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleServiceAction(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := s.getScopedAgent(w, r, id); !ok {
+	a, ok := s.getScopedAgent(w, r, id)
+	if !ok {
 		return
 	}
 	var in protocol.SvcAction
@@ -354,19 +391,25 @@ func (s *Server) handleServiceAction(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
-	defer cancel()
-	var out protocol.Service
-	if err := s.hub.Request(ctx, id, protocol.ReqSvcAction, in, &out); err != nil {
-		// Audited on the way out as well: a stop the SCM denied is exactly
-		// what somebody probing which security services they can turn off
-		// looks like, and only the failure path sees it.
-		s.audit(r, "service."+in.Action, id, auditFailure(map[string]any{"name": in.Name}, err))
-		fail(w, err)
-		return
-	}
-	s.audit(r, "service."+in.Action, id, in.Name)
-	writeJSON(w, 200, out)
+	s.runSigned(w, r, signedAction{
+		Org: a.OrgID, Op: protocol.ReqSvcAction, Targets: []string{id}, Payload: in,
+		Summary: fmt.Sprintf("%s service %q on %s", in.Action, in.Name, agentLabel(a)),
+		Run: func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth) {
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+			defer cancel()
+			var out protocol.Service
+			if err := s.hub.RequestA(ctx, id, protocol.ReqSvcAction, in, &out, auth); err != nil {
+				// Audited on the way out as well: a stop the SCM denied is exactly
+				// what somebody probing which security services they can turn off
+				// looks like, and only the failure path sees it.
+				s.audit(r, "service."+in.Action, id, auditFailure(map[string]any{"name": in.Name}, err))
+				fail(w, err)
+				return
+			}
+			s.audit(r, "service."+in.Action, id, in.Name)
+			writeJSON(w, 200, out)
+		},
+	})
 }
 
 // auditFailure labels an audit detail as an attempt that did not happen and
@@ -412,10 +455,15 @@ func (s *Server) handleFsList(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.getScopedAgent(w, r, id); !ok {
 		return
 	}
+	auth, deny := s.grantAuth(r, id, protocol.ReqFsList)
+	if deny != "" {
+		writeErr(w, http.StatusForbidden, deny)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
 	defer cancel()
 	var out protocol.FsListResult
-	if err := s.hub.Request(ctx, id, protocol.ReqFsList, protocol.FsList{Path: r.URL.Query().Get("path")}, &out); err != nil {
+	if err := s.hub.RequestA(ctx, id, protocol.ReqFsList, protocol.FsList{Path: r.URL.Query().Get("path")}, &out, auth); err != nil {
 		fail(w, err)
 		return
 	}
@@ -438,10 +486,15 @@ func (s *Server) handleFsDownload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "path required")
 		return
 	}
+	auth, deny := s.grantAuth(r, id, protocol.ReqFsRead)
+	if deny != "" {
+		writeErr(w, http.StatusForbidden, deny)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), longTimeout)
 	defer cancel()
 	var first protocol.FsReadResult
-	if err := s.hub.Request(ctx, id, protocol.ReqFsRead, protocol.FsRead{Path: p, Offset: 0, Length: fsChunk}, &first); err != nil {
+	if err := s.hub.RequestA(ctx, id, protocol.ReqFsRead, protocol.FsRead{Path: p, Offset: 0, Length: fsChunk}, &first, auth); err != nil {
 		// A download the device refused is exactly what someone sweeping for
 		// SAM, a KeePass database or an .ssh key produces, so record it.
 		s.audit(r, "file.download", id, auditFailure(map[string]any{"path": p}, err))
@@ -457,7 +510,7 @@ func (s *Server) handleFsDownload(w http.ResponseWriter, r *http.Request) {
 	off := int64(len(first.Data))
 	for !first.EOF && off < first.Size {
 		var chunk protocol.FsReadResult
-		if err := s.hub.Request(ctx, id, protocol.ReqFsRead, protocol.FsRead{Path: p, Offset: off, Length: fsChunk}, &chunk); err != nil {
+		if err := s.hub.RequestA(ctx, id, protocol.ReqFsRead, protocol.FsRead{Path: p, Offset: off, Length: fsChunk}, &chunk, auth); err != nil {
 			return
 		}
 		if len(chunk.Data) == 0 {
@@ -473,7 +526,8 @@ func (s *Server) handleFsDownload(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleFsUpload(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := s.getScopedAgent(w, r, id); !ok {
+	a, ok := s.getScopedAgent(w, r, id)
+	if !ok {
 		return
 	}
 	dest := r.URL.Query().Get("path")
@@ -481,13 +535,20 @@ func (s *Server) handleFsUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "path required")
 		return
 	}
+	if s.activeBundle(a.OrgID) != nil {
+		// Devices in this organisation check signatures: stage the bytes and
+		// have the operator sign the commit (uploads.go).
+		s.stageUpload(w, r, a, dest)
+		return
+	}
+	body := io.Reader(r.Body)
 	ctx, cancel := context.WithTimeout(r.Context(), longTimeout)
 	defer cancel()
 	buf := make([]byte, fsChunk)
 	first := true
 	var total int64
 	for {
-		n, err := io.ReadFull(r.Body, buf)
+		n, err := io.ReadFull(body, buf)
 		if n > 0 {
 			req := protocol.FsWrite{Path: dest, Data: buf[:n], Append: !first}
 			if err := s.hub.Request(ctx, id, protocol.ReqFsWrite, req, nil); err != nil {
@@ -517,7 +578,8 @@ func (s *Server) handleFsUpload(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) fsSimple(w http.ResponseWriter, r *http.Request, typ, action string) {
 	id := r.PathValue("id")
-	if _, ok := s.getScopedAgent(w, r, id); !ok {
+	a, ok := s.getScopedAgent(w, r, id)
+	if !ok {
 		return
 	}
 	var in json.RawMessage
@@ -525,17 +587,23 @@ func (s *Server) fsSimple(w http.ResponseWriter, r *http.Request, typ, action st
 		fail(w, err)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
-	defer cancel()
-	if err := s.hub.Request(ctx, id, typ, in, nil); err != nil {
-		// Audit the attempt, not only the success: probing a fleet for paths
-		// that cannot be read or removed otherwise leaves no trace at all.
-		s.audit(r, action, id, auditFailure(map[string]any{"request": string(in)}, err))
-		fail(w, err)
-		return
-	}
-	s.audit(r, action, id, string(in))
-	writeJSON(w, 200, map[string]any{"ok": true})
+	s.runSigned(w, r, signedAction{
+		Org: a.OrgID, Op: typ, Targets: []string{id}, Payload: in,
+		Summary: fmt.Sprintf("%s on %s: %s", typ, agentLabel(a), clip(string(in), 300)),
+		Run: func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth) {
+			ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
+			defer cancel()
+			if err := s.hub.RequestA(ctx, id, typ, in, nil, auth); err != nil {
+				// Audit the attempt, not only the success: probing a fleet for paths
+				// that cannot be read or removed otherwise leaves no trace at all.
+				s.audit(r, action, id, auditFailure(map[string]any{"request": string(in)}, err))
+				fail(w, err)
+				return
+			}
+			s.audit(r, action, id, string(in))
+			writeJSON(w, 200, map[string]any{"ok": true})
+		},
+	})
 }
 
 func (s *Server) handleFsDelete(w http.ResponseWriter, r *http.Request) {
@@ -560,7 +628,8 @@ var validPowerActions = map[string]bool{
 
 func (s *Server) handlePower(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := s.getScopedAgent(w, r, id); !ok {
+	a, ok := s.getScopedAgent(w, r, id)
+	if !ok {
 		return
 	}
 	var in protocol.Power
@@ -576,24 +645,30 @@ func (s *Server) handlePower(w http.ResponseWriter, r *http.Request) {
 	if in.Delay < 0 {
 		in.Delay = 0
 	}
-	// Audited BEFORE dispatch: a destructive request must be on record
-	// whatever happens next, and a delay_sec=0 reboot can take the device down
-	// before it answers, which used to be recorded as nothing at all.
-	s.audit(r, "power.requested", id, in)
-	ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
-	defer cancel()
-	if err := s.hub.Request(ctx, id, protocol.ReqPower, in, nil); err != nil {
-		s.audit(r, "power.failed", id, map[string]any{"action": in.Action, "error": err.Error()})
-		if errors.Is(err, ErrAgentOffline) {
-			fail(w, err)
-			return
-		}
-		// the request was well formed; the device could not carry it out
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	s.audit(r, "power."+in.Action, id, in)
-	writeJSON(w, 200, map[string]any{"ok": true})
+	s.runSigned(w, r, signedAction{
+		Org: a.OrgID, Op: protocol.ReqPower, Targets: []string{id}, Payload: in,
+		Summary: fmt.Sprintf("%s %s", strings.ToUpper(in.Action[:1])+in.Action[1:], agentLabel(a)),
+		Run: func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth) {
+			// Audited BEFORE dispatch: a destructive request must be on record
+			// whatever happens next, and a delay_sec=0 reboot can take the device down
+			// before it answers, which used to be recorded as nothing at all.
+			s.audit(r, "power.requested", id, in)
+			ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
+			defer cancel()
+			if err := s.hub.RequestA(ctx, id, protocol.ReqPower, in, nil, auth); err != nil {
+				s.audit(r, "power.failed", id, map[string]any{"action": in.Action, "error": err.Error()})
+				if errors.Is(err, ErrAgentOffline) {
+					fail(w, err)
+					return
+				}
+				// the request was well formed; the device could not carry it out
+				writeErr(w, http.StatusBadGateway, err.Error())
+				return
+			}
+			s.audit(r, "power."+in.Action, id, in)
+			writeJSON(w, 200, map[string]any{"ok": true})
+		},
+	})
 }
 
 // handleWakeOnLan sends the magic packet from another online agent on the
@@ -877,25 +952,34 @@ func (s *Server) handleIsolateAgent(w http.ResponseWriter, r *http.Request) {
 		actionName = "device.release"
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
-	var res protocol.DeviceIsolateResult
-	err := s.hub.Request(ctx, id, protocol.ReqDeviceIsolate, reqPayload, &res)
-	if err != nil && !errors.Is(err, ErrAgentOffline) {
-		writeErr(w, http.StatusBadGateway, err.Error())
-		return
+	verb := "Isolate"
+	if !in.Isolate {
+		verb = "Release"
 	}
+	s.runSigned(w, r, signedAction{
+		Org: target.OrgID, Op: protocol.ReqDeviceIsolate, Targets: []string{id}, Payload: reqPayload,
+		Summary: fmt.Sprintf("%s %s from the network", verb, agentLabel(target)),
+		Run: func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth) {
+			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+			defer cancel()
 
-	if err := s.db.SetAgentIsolated(id, in.Isolate, username); err != nil {
-		fail(w, err)
-		return
-	}
+			var res protocol.DeviceIsolateResult
+			err := s.hub.RequestA(ctx, id, protocol.ReqDeviceIsolate, reqPayload, &res, auth)
+			if err != nil && !errors.Is(err, ErrAgentOffline) {
+				writeErr(w, http.StatusBadGateway, err.Error())
+				return
+			}
 
-	s.audit(r, actionName, id, map[string]any{"isolated": in.Isolate, "by": username, "target": target.DisplayName})
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"isolated": in.Isolate,
+			if err := s.db.SetAgentIsolated(id, in.Isolate, username); err != nil {
+				fail(w, err)
+				return
+			}
+
+			s.audit(r, actionName, id, map[string]any{"isolated": in.Isolate, "by": username, "target": target.DisplayName})
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok":       true,
+				"isolated": in.Isolate,
+			})
+		},
 	})
 }
-

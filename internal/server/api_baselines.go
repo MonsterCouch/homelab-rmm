@@ -618,20 +618,32 @@ func (s *Server) handleBaselineRemediate(w http.ResponseWriter, r *http.Request)
 			accepted = append(accepted, cid)
 		}
 	}
-	if len(accepted) > 0 {
-		ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
-		defer cancel()
-		if err := s.hub.Request(ctx, a.ID, protocol.ReqBaselineRemediate, protocol.BaselineRemediate{BaselineID: b.ID, CheckIDs: accepted}, nil); err != nil {
-			fail(w, err)
-			return
+	respond := func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth) {
+		if len(accepted) > 0 {
+			ctx, cancel := context.WithTimeout(r.Context(), quickTimeout)
+			defer cancel()
+			if err := s.hub.RequestA(ctx, a.ID, protocol.ReqBaselineRemediate, protocol.BaselineRemediate{BaselineID: b.ID, CheckIDs: accepted}, nil, auth); err != nil {
+				fail(w, err)
+				return
+			}
 		}
+		s.audit(r, "baseline.remediate", strconv.FormatInt(id, 10), map[string]any{"name": b.Name, "agent_id": a.ID, "checks": accepted})
+		writeJSON(w, 200, map[string]any{
+			"baseline_id": b.ID, "agent_id": a.ID, "accepted": accepted, "refused": refused,
+			// Always null: the agent ACKs and the pass arrives as a TypeBaseline
+			// frame, which becomes a `baseline` SSE event the console refetches on.
+			"report": nil,
+		})
 	}
-	s.audit(r, "baseline.remediate", strconv.FormatInt(id, 10), map[string]any{"name": b.Name, "agent_id": a.ID, "checks": accepted})
-	writeJSON(w, 200, map[string]any{
-		"baseline_id": b.ID, "agent_id": a.ID, "accepted": accepted, "refused": refused,
-		// Always null: the agent ACKs and the pass arrives as a TypeBaseline
-		// frame, which becomes a `baseline` SSE event the console refetches on.
-		"report": nil,
+	if len(accepted) == 0 {
+		respond(w, r, nil) // nothing is sent, so there is nothing to sign
+		return
+	}
+	s.runSigned(w, r, signedAction{
+		Org: a.OrgID, Op: protocol.ReqBaselineRemediate, Targets: []string{a.ID},
+		Payload: protocol.BaselineRemediate{BaselineID: b.ID, CheckIDs: accepted},
+		Summary: fmt.Sprintf("Remediate %d check(s) of baseline %q on %s", len(accepted), b.Name, agentLabel(a)),
+		Run:     respond,
 	})
 }
 
@@ -729,12 +741,10 @@ func (s *Server) handleBaselinePreview(w http.ResponseWriter, r *http.Request) {
 		specChecks = append(specChecks, previewSpecCheck{Index: i, ID: synthetic, Name: c.Name, Kind: c.Kind, OSFilter: c.OSFilter})
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
-	defer cancel()
 	devices := make([]previewDeviceOut, len(in.AgentIDs))
-	var wg sync.WaitGroup
+	var online []int // indexes into devices of the ones that will be sent the spec
+	var onlineIDs []string
 	for i, agentID := range in.AgentIDs {
-		i, agentID := i, agentID
 		d := previewDeviceOut{AgentID: agentID, Results: []previewResultOut{}}
 		a, err := s.db.GetAgent(agentID)
 		if err != nil || !s.canAccessAgent(userFrom(r.Context()), a.OrgID) {
@@ -749,49 +759,71 @@ func (s *Server) handleBaselinePreview(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		devices[i] = d
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			devCtx, devCancel := context.WithTimeout(ctx, 60*time.Second)
-			defer devCancel()
-			started := time.Now()
-			var rep protocol.BaselineReport
-			err := s.hub.Request(devCtx, agentID, protocol.ReqBaselinePreview, protocol.BaselinePreview{Spec: spec}, &rep)
-			d := devices[i]
-			d.DurationMs = time.Since(started).Milliseconds()
-			switch {
-			case err == nil:
-				d.Status = "ok"
-				for _, res := range rep.Results {
-					d.Results = append(d.Results, previewResultOut{
-						CheckID: res.CheckID, State: res.State, Expected: baselines.Truncate(res.Expected, maxExpectedObservedBytes),
-						Observed: baselines.Truncate(res.Observed, maxExpectedObservedBytes), Detail: baselines.Truncate(res.Detail, maxDetailBytes),
-						// A preview never fixes anything, whatever the agent says.
-						Fixed: false, DurationMs: res.DurationMs,
-					})
-				}
-			case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
-				d.Status, d.Error = "timeout", "the device did not answer in time"
-			case errors.Is(err, ErrAgentOffline):
-				d.Status, d.Error = "offline", ErrAgentOffline.Error()
-			default:
-				d.Status, d.Error = "error", err.Error()
-			}
-			devices[i] = d
-		}()
+		online = append(online, i)
+		onlineIDs = append(onlineIDs, agentID)
 	}
-	wg.Wait()
 
-	s.audit(r, "baseline.preview", "", map[string]any{"name": draft.Name, "checks": len(draft.Checks), "agents": in.AgentIDs})
-	// A previewed `command` check ran code on those devices. It gets the same
-	// audit action a saved one does, so "who made a device run a script"
-	// stays one grep, with no baseline id because there is no baseline yet.
-	for _, c := range draftChecks {
-		if c.Kind == "command" {
-			s.audit(r, "baseline.command_check", "", map[string]any{"check": c.Name, "preview": true, "agents": in.AgentIDs})
+	run := func(w http.ResponseWriter, r *http.Request, auth *protocol.ActionAuth) {
+		ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+		defer cancel()
+		var wg sync.WaitGroup
+		for _, i := range online {
+			i, agentID := i, in.AgentIDs[i]
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				devCtx, devCancel := context.WithTimeout(ctx, 60*time.Second)
+				defer devCancel()
+				started := time.Now()
+				var rep protocol.BaselineReport
+				err := s.hub.RequestA(devCtx, agentID, protocol.ReqBaselinePreview, protocol.BaselinePreview{Spec: spec}, &rep, auth)
+				d := devices[i]
+				d.DurationMs = time.Since(started).Milliseconds()
+				switch {
+				case err == nil:
+					d.Status = "ok"
+					for _, res := range rep.Results {
+						d.Results = append(d.Results, previewResultOut{
+							CheckID: res.CheckID, State: res.State, Expected: baselines.Truncate(res.Expected, maxExpectedObservedBytes),
+							Observed: baselines.Truncate(res.Observed, maxExpectedObservedBytes), Detail: baselines.Truncate(res.Detail, maxDetailBytes),
+							// A preview never fixes anything, whatever the agent says.
+							Fixed: false, DurationMs: res.DurationMs,
+						})
+					}
+				case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+					d.Status, d.Error = "timeout", "the device did not answer in time"
+				case errors.Is(err, ErrAgentOffline):
+					d.Status, d.Error = "offline", ErrAgentOffline.Error()
+				default:
+					d.Status, d.Error = "error", err.Error()
+				}
+				devices[i] = d
+			}()
 		}
+		wg.Wait()
+
+		s.audit(r, "baseline.preview", "", map[string]any{"name": draft.Name, "checks": len(draft.Checks), "agents": in.AgentIDs})
+		// A previewed `command` check ran code on those devices. It gets the same
+		// audit action a saved one does, so "who made a device run a script"
+		// stays one grep, with no baseline id because there is no baseline yet.
+		for _, c := range draftChecks {
+			if c.Kind == "command" {
+				s.audit(r, "baseline.command_check", "", map[string]any{"check": c.Name, "preview": true, "agents": in.AgentIDs})
+			}
+		}
+		writeJSON(w, 200, map[string]any{"spec_checks": specChecks, "devices": devices})
 	}
-	writeJSON(w, 200, map[string]any{"spec_checks": specChecks, "devices": devices})
+	if len(onlineIDs) == 0 {
+		run(w, r, nil) // nothing is sent
+		return
+	}
+	// baseline.preview RUNS the unsaved spec's check scripts, so it is signed
+	// like a script: one manifest, every online device named in it.
+	s.runSigned(w, r, signedAction{
+		Op: protocol.ReqBaselinePreview, Targets: onlineIDs, Payload: protocol.BaselinePreview{Spec: spec},
+		Summary: fmt.Sprintf("Preview the unsaved baseline %q (%d checks) on %d device(s); its check scripts will run", draft.Name, len(draft.Checks), len(onlineIDs)),
+		Run:     run,
+	})
 }
 
 // ---- device view ----

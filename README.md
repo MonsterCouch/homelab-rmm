@@ -48,7 +48,7 @@ and its own script library and baseline kinds. It is simply not where the depth 
   and the check allows it — fix the drift themselves. Drift opens an alert and fires
   `drift_detected` / `drift_fixed` automations; a dry-run preview shows what a draft would do
   before you save it. Fleet and per-device compliance scores.
-- **Remote terminal** — PowerShell, cmd, bash or sh in a real pseudo-terminal (ConPTY on Windows)
+- **Remote terminal** — PowerShell, cmd, bash or sh in a real pseudo-terminal (ConPTY on Windows); bytes go over a WebRTC data channel with the WebSocket relay as fallback, and the device page has an Update agent button
   from the browser.
 - **Remote desktop** — screen streaming with tile diffing, mouse and keyboard, multi-monitor display switching, privacy session banner overlay, clipboard paste, Ctrl-Alt-Del; works on the logon screen and UAC prompts on Windows; X11 on Linux.
 - **Device tools** — processes (kill), services (start/stop/restart/enable/disable), Windows event log and journald viewer, file browser with upload/download/rename/delete, device network isolation / quarantine (firewall lockdown with management channel retention), reboot, shutdown, lock, log off, and **Wake-on-LAN** relayed through another agent on the same subnet.
@@ -57,6 +57,11 @@ and its own script library and baseline kinds. It is simply not where the depth 
 - **Software Catalog** — repository of approved software applications (winget and custom installers) with fleet deployment and end-user self-service availability.
 - **Client Portal & Companion** — `rmm-desktop` client companion in the Windows notification area communicating over local Named Pipe IPC (`\\.\pipe\homelab-rmm-portal`); end-user self-service software installation and ticket submission.
 - **Network Discovery & SNMP** — subnet sweeps (ARP/ICMP ping sweeps) and SNMP hardware polling (v2c) for switches, routers, printers, and unmanaged devices.
+- **QUIC transport (optional)** — `--quic` adds a UDP listener so each request rides its own stream (no head-of-line blocking); agents fall back to WebSocket on their own ([docs/OPERATIONS.md](docs/OPERATIONS.md#quic-transport-optional)).
+- **Metrics storage engines** — the metrics series stays in SQLite by default, or moves to an embedded Pebble store or a ClickHouse server with `--telemetry`; `rmm-server telemetry migrate` copies existing history ([docs/OPERATIONS.md](docs/OPERATIONS.md#metrics-storage-telemetry-engines)). ClickHouse is tested against a protocol fake only.
+- **Subnet update cache (optional)** — devices on one subnet fetch an agent update once across the WAN; the server picks a leader per subnet, members verify every chunk and the whole hash and fall back to the server ([docs/OPERATIONS.md](docs/OPERATIONS.md#update-cache-subnet-mesh)).
+- **Windows servicing repair** — DISM RestoreHealth, SFC, Windows Update component reset and CAB/MSU injection, run by hand (signed like any action) or automatically by a patch policy that sees a known servicing error, at most once a day per device ([docs/OPERATIONS.md](docs/OPERATIONS.md#windows-servicing-repair)).
+- **Signed actions** — in organizations with a trust bundle, devices run destructive requests only when an operator's security key signed them; `rmm-signer`, a Windows command-line signer, prints the exact manifest and signs it with Windows Hello or a key outside the browser ([docs/SECURITY.md](docs/SECURITY.md#signed-actions)).
 - **Users** — admin / tech / viewer roles (a viewer looks at everything and changes nothing: no writes, and no terminal, remote desktop, file download or enrollment token either; technicians can be scoped to specific organizations), TOTP two-factor authentication, session management, password reset from the CLI.
 - **Audit log** of every action with user and source address.
 
@@ -389,7 +394,8 @@ state machine, the API and the console.
   place (it holds the device identity). Delete the binary and the config yourself, or use
   `deploy/uninstall.ps1` / `deploy/uninstall.sh` (`-Purge` / `--purge` removes the config too).
   Then delete the device in the console so it does not linger as offline.
-- **Update**: update agents directly from the web console (*Devices → Actions → Update Agent* or fleet-wide *Update All Agents* via `POST /api/agents/update-all`), which checks staged agent binaries on the server, verifies SHA-256 hashes, swaps the binary, and restarts the service. Alternatively, re-run an enrollment package or one-liner with a fresh token. Because `agent.json` already exists for the same server, the device keeps its identity and history.
+- **Transparency log**: every manifest the server releases, every trust bundle and every audit row goes into an append-only Merkle log with signed heads; devices verify inclusion and consistency before acting, keep a hash-chained record of what they ran, and `rmm-server log verify` checks from outside that the log only grew ([docs/SECURITY.md](docs/SECURITY.md#transparency-log)).
+- **Update**: update agents directly from the web console (*Update Agents* on the Devices page, or *Broadcast Update to All Online Agents* under *Server & Fleet Updates*, both via `POST /api/agents/update-all`), which checks staged agent binaries on the server, verifies SHA-256 hashes, swaps the binary, and restarts the service; in organizations that sign actions ([docs/SECURITY.md](docs/SECURITY.md#signed-actions)), each organization and agent build (2000 devices at most) is one signature. Alternatively, re-run an enrollment package or one-liner with a fresh token. Because `agent.json` already exists for the same server, the device keeps its identity and history.
 - **Re-enroll** (after a server certificate change or a deleted device): run the one-liner or package again. An agent whose key was revoked on the server and that still has its original token re-enrolls by itself.
 
 ## Upgrading the server
@@ -447,9 +453,13 @@ stopping the service, putting the files back and starting it. More in
   user's sessions **and disables that user's TOTP** (re-enroll the authenticator under *Account*
   afterwards). An admin can also reset another user's 2FA under *Users*, or create a new admin
   with `rmm-server user add`.
-- **Remote desktop shows "Wayland sessions are not supported".** The Linux desktop is running
-  Wayland; log in with an X11/Xorg session. On Windows the helper needs an interactive console
-  session; the logon screen and UAC prompts are captured through the SYSTEM token.
+- **Remote desktop on Linux shows a frozen or black picture under Wayland.** Wayland capture goes
+  through the ScreenCast portal and a built-in PipeWire client, and it is verified on GNOME 50 on
+  Wayland and on KDE Plasma 6.6, both at 100% and 200% scaling (DMA-BUF-only compositors and multi-monitor are not). The first session asks the person at the machine to allow screen sharing once. See
+  [docs/OPERATIONS.md](docs/OPERATIONS.md), "Wayland screen capture", for the log lines to read and
+  for `RMM_WAYLAND_PORTAL=0`, which falls back to the Screenshot portal. An X11/Xorg session needs
+  none of this. On Windows the helper needs an interactive console session; the logon screen and
+  UAC prompts are captured through the SYSTEM token.
 - **Terminal fails to open.** The agent needs `powershell.exe`/`pwsh` (Windows) or `bash`/`sh`
   (Linux) on PATH. PowerShell scripts prefer `pwsh` and fall back to Windows PowerShell 5.1.
 - **A Linux device shows no patches.** No supported package manager was found (apt-get, dnf,
@@ -499,7 +509,7 @@ The full threat model, what is and is not protected, and recommendations are in
 ## Roadmap
 
 - Native endpoint & cloud backups, mobile device management (MDM), and commercial EDR orchestration (see [docs/ROADMAP.md](docs/ROADMAP.md)).
-- Wayland capture for the Linux remote desktop.
+- Confirm Wayland capture for the Linux remote desktop beyond GNOME 50 and KDE Plasma 6.6 (both verified on Ubuntu 26.04.1, PipeWire 1.6.2, at 100% and 200% scaling): DMA-BUF-only compositors and multi-monitor are open.
 - macOS agent (the platform contract in `internal/agent/platform_other.go` is ready for it).
 - Published container images and signed releases.
 - More notification channels for alerts (webhooks are available through automations today).
@@ -532,6 +542,9 @@ all. `make`, `tools/build.sh` and `tools/build.ps1` therefore refuse to build `r
 `web/dist/index.html` is missing and tell you to run `make web` first; `ALLOW_EMPTY_WEB=1`
 overrides that for a binary you intend to run with `--dev-web`. `tools/build.ps1` is the Windows
 twin of the Makefile. See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
+`make signer` builds `rmm-signer` for Windows (amd64 and arm64); `make all` includes it, but `make package`
+and `tools/build.*` do not archive it yet. Usage: `rmm-signer login|list|show|sign|logout|selftest`.
 
 
 ### Windows installers

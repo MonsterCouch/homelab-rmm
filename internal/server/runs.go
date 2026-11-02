@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -229,16 +230,92 @@ type RunRequest struct {
 	RunBy    string
 	TaskID   *int64
 	Name     string // display name for ad hoc
+	// Auth is the operator's signed action (Phase 3), attached to the request
+	// the agent receives. One manifest can authorize a run on many agents;
+	// each agent takes only its own run_id from its envelope.
+	Auth *protocol.ActionAuth
+	// Standing names the object (task, automation, catalog item) whose stored
+	// standing approval should authorize this unattended run. It is attached
+	// only when the approval still covers the exact body being sent.
+	Standing *standingRef
 }
 
 const maxOutput = 2 << 20
+
+// ErrSignedRunOffline is what a run answers when it carries an operator's
+// signature but its device is not connected. A queued run would start minutes
+// or days later, long after the signature (five minutes) has expired, and
+// nothing records it, so the device would receive the run unsigned: an audit
+// mode org would see a forgery alarm and an enforce mode device would refuse
+// it. Refusing up front lets the operator run it again when it can be sent.
+var ErrSignedRunOffline = errors.New("device is offline: a signed run cannot wait for it, because its signature expires before the device is back; run it again when the device is online")
+
+// standingString and parseStanding store a standing reference in a queued
+// row as "<type>:<id>" so releaseQueued can find the approval again.
+func standingString(r *standingRef) string {
+	if r == nil {
+		return ""
+	}
+	return r.Type + ":" + r.ID
+}
+
+func parseStanding(v string) *standingRef {
+	typ, id, ok := strings.Cut(v, ":")
+	if !ok || typ == "" || id == "" {
+		return nil
+	}
+	return &standingRef{Type: typ, ID: id}
+}
 
 // Start launches the script on one agent. Offline agents get a queued run
 // that the scheduler releases when they connect. The returned id is stable
 // either way.
 func (t *runTracker) Start(agentID string, req RunRequest) (string, error) {
-	lang, body, timeout, name := req.Language, req.Body, req.Timeout, req.Name
-	var scriptID *int64
+	lang, body, timeout, name, scriptID, err := resolveRun(&req)
+	if err != nil {
+		return "", err
+	}
+	id := randomHex(8)
+	status := "running"
+	if !t.s.hub.IsOnline(agentID) {
+		if req.Script == nil {
+			return "", ErrAgentOffline // ad hoc bodies are not persisted, so they cannot be queued
+		}
+		if req.Auth != nil {
+			// The device can drop between the challenge and the last
+			// signature, so this check is the authoritative one.
+			return "", ErrSignedRunOffline
+		}
+		status = "queued"
+	}
+	standing := ""
+	if status == "queued" {
+		standing = standingString(req.Standing)
+	}
+	if _, err := t.s.db.Exec(`INSERT INTO script_runs(id, script_id, script_name, agent_id, task_id, trigger, run_by, args, status, started_at, standing)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, id, scriptID, name, agentID, req.TaskID, req.Trigger, req.RunBy, jsonText(req.Args), status, now(), standing); err != nil {
+		return "", err
+	}
+	if status == "queued" {
+		return id, nil
+	}
+	env := t.deviceEnv(agentID, req.Trigger, req.RunBy)
+	for k, v := range req.Env {
+		env[k] = v
+	}
+	auth := req.Auth
+	if auth == nil && req.Standing != nil {
+		auth = t.s.standingAuthForScript(agentID, *req.Standing, lang, body, req.Args)
+	}
+	t.launch(id, agentID, protocol.ScriptRun{RunID: id, Language: lang, Body: body, Args: req.Args, Env: env, Timeout: timeout}, auth)
+	return id, nil
+}
+
+// resolveRun settles what a request will actually execute: the library
+// script's own language, body and timeout, or the ad hoc ones. It is shared
+// with the signing path, which must sign exactly what Start will send.
+func resolveRun(req *RunRequest) (lang, body string, timeout int, name string, scriptID *int64, err error) {
+	lang, body, timeout, name = req.Language, req.Body, req.Timeout, req.Name
 	if req.Script != nil {
 		lang, body, name = req.Script.Language, req.Script.Body, req.Script.Name
 		if timeout <= 0 {
@@ -247,7 +324,7 @@ func (t *runTracker) Start(agentID string, req RunRequest) (string, error) {
 		scriptID = &req.Script.ID
 	}
 	if !validLanguages[lang] {
-		return "", errors.New("invalid language")
+		return "", "", 0, "", nil, errors.New("invalid language")
 	}
 	if timeout <= 0 {
 		timeout = 300
@@ -258,30 +335,10 @@ func (t *runTracker) Start(agentID string, req RunRequest) (string, error) {
 	if req.Args == nil {
 		req.Args = []string{}
 	}
-	id := randomHex(8)
-	status := "running"
-	if !t.s.hub.IsOnline(agentID) {
-		if req.Script == nil {
-			return "", ErrAgentOffline // ad hoc bodies are not persisted, so they cannot be queued
-		}
-		status = "queued"
-	}
-	if _, err := t.s.db.Exec(`INSERT INTO script_runs(id, script_id, script_name, agent_id, task_id, trigger, run_by, args, status, started_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?)`, id, scriptID, name, agentID, req.TaskID, req.Trigger, req.RunBy, jsonText(req.Args), status, now()); err != nil {
-		return "", err
-	}
-	if status == "queued" {
-		return id, nil
-	}
-	env := t.deviceEnv(agentID, req.Trigger, req.RunBy)
-	for k, v := range req.Env {
-		env[k] = v
-	}
-	t.launch(id, agentID, protocol.ScriptRun{RunID: id, Language: lang, Body: body, Args: req.Args, Env: env, Timeout: timeout})
-	return id, nil
+	return lang, body, timeout, name, scriptID, nil
 }
 
-func (t *runTracker) launch(id, agentID string, sr protocol.ScriptRun) {
+func (t *runTracker) launch(id, agentID string, sr protocol.ScriptRun, auth *protocol.ActionAuth) {
 	lr := &liveRun{agentID: agentID}
 	t.mu.Lock()
 	if _, already := t.live[id]; already {
@@ -293,7 +350,7 @@ func (t *runTracker) launch(id, agentID string, sr protocol.ScriptRun) {
 	t.mu.Unlock()
 	t.s.hub.broadcast(hubEvent{Kind: "run", AgentID: agentID, Data: map[string]any{"run_id": id, "status": "running"}})
 
-	_, cancel, err := t.s.hub.Stream(agentID, protocol.ReqScriptRun, sr, func(env protocol.Envelope) {
+	_, cancel, err := t.s.hub.StreamA(agentID, protocol.ReqScriptRun, sr, func(env protocol.Envelope) {
 		switch env.T {
 		case protocol.TypeStream:
 			var c protocol.ScriptChunk
@@ -314,7 +371,7 @@ func (t *runTracker) launch(id, agentID string, sr protocol.ScriptRun) {
 			}
 			t.finish(id, agentID, status, res, lr)
 		}
-	})
+	}, auth)
 	if err != nil {
 		t.finish(id, agentID, "failed", protocol.ScriptResult{Error: err.Error(), ExitCode: -1}, lr)
 		return
@@ -434,7 +491,7 @@ func (t *runTracker) Cancel(id string) error {
 
 // releaseQueued launches queued runs for an agent that just connected.
 func (t *runTracker) releaseQueued(agentID string) {
-	rows, err := t.s.db.Query(`SELECT id, script_id, args, task_id FROM script_runs WHERE agent_id = ? AND status = 'queued' ORDER BY started_at`, agentID)
+	rows, err := t.s.db.Query(`SELECT id, script_id, args, task_id, standing FROM script_runs WHERE agent_id = ? AND status = 'queued' ORDER BY started_at`, agentID)
 	if err != nil {
 		return
 	}
@@ -442,12 +499,13 @@ func (t *runTracker) releaseQueued(agentID string) {
 		id   string
 		sid  sql.NullInt64
 		args string
+		tid  sql.NullInt64
+		ref  string
 	}
 	var list []q
 	for rows.Next() {
 		var x q
-		var tid sql.NullInt64
-		rows.Scan(&x.id, &x.sid, &x.args, &tid)
+		rows.Scan(&x.id, &x.sid, &x.args, &x.tid, &x.ref)
 		list = append(list, x)
 	}
 	rows.Close()
@@ -473,7 +531,18 @@ func (t *runTracker) releaseQueued(agentID string) {
 		if n, _ := res.RowsAffected(); n != 1 {
 			continue
 		}
-		t.launch(x.id, agentID, protocol.ScriptRun{RunID: x.id, Language: sc.Language, Body: sc.Body, Args: args, Env: t.deviceEnv(agentID, "task", "queue"), Timeout: sc.TimeoutSec})
+		// A queued run was started by someone who has gone: only a standing
+		// approval can still vouch for it. Rows queued since the standing
+		// column existed name theirs; older ones only have a task id.
+		var auth *protocol.ActionAuth
+		ref := parseStanding(x.ref)
+		if ref == nil && x.tid.Valid {
+			ref = &standingRef{Type: approvalTask, ID: strconv.FormatInt(x.tid.Int64, 10)}
+		}
+		if ref != nil {
+			auth = t.s.standingAuthForScript(agentID, *ref, sc.Language, sc.Body, args)
+		}
+		t.launch(x.id, agentID, protocol.ScriptRun{RunID: x.id, Language: sc.Language, Body: sc.Body, Args: args, Env: t.deviceEnv(agentID, "task", "queue"), Timeout: sc.TimeoutSec}, auth)
 	}
 }
 

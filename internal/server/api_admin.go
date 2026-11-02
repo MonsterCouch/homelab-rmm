@@ -15,7 +15,11 @@ type Settings struct {
 	PublicURL     string               `json:"public_url"`
 	SMTP          MailSettings         `json:"smtp"`
 	AgentDefaults protocol.AgentConfig `json:"agent_defaults"`
-	Retention     struct {
+	// MeshCache switches the local subnet cache (cache_assign.go). A pointer so
+	// that a PUT which leaves it out keeps what is configured instead of
+	// switching the cache off.
+	MeshCache *MeshCacheSettings `json:"mesh_cache,omitempty"`
+	Retention struct {
 		MetricsDays int `json:"metrics_days"`
 		RunsDays    int `json:"runs_days"`
 		AuditDays   int `json:"audit_days"`
@@ -34,6 +38,9 @@ func (s *Server) loadSettings() Settings {
 	// from their targets and must never travel through here: a set frozen into
 	// this row would be pushed to every device whatever its targets say.
 	st.AgentDefaults.Baselines = nil
+	st.AgentDefaults.Cache = nil
+	mc := s.meshSettings()
+	st.MeshCache = &mc
 	st.Retention.MetricsDays, st.Retention.RunsDays, st.Retention.AuditDays, st.Retention.EventsDays = 30, 90, 365, 30
 	s.db.SettingJSON("retention", &st.Retention)
 	return st
@@ -88,13 +95,29 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 			*f.in = *f.cur
 		}
 	}
+	in.AgentDefaults.Cache = nil // assigned per device, see agentConfig
+	if in.MeshCache == nil {
+		in.MeshCache = cur.MeshCache
+	} else {
+		mc := normalizeMesh(*in.MeshCache)
+		if msg := validateMesh(mc); msg != "" {
+			writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+		in.MeshCache = &mc
+	}
 	in.PublicURL = strings.TrimRight(strings.TrimSpace(in.PublicURL), "/")
 	changes := settingsDiff(cur, in)
 	s.db.SetSetting("public_url", in.PublicURL)
 	s.db.SetSettingJSON("smtp", in.SMTP)
 	in.AgentDefaults.Baselines = nil // never stored in settings; see loadSettings
+	in.AgentDefaults.BaselineAuth = nil
 	s.db.SetSettingJSON("agent_defaults", in.AgentDefaults)
 	s.db.SetSettingJSON("retention", in.Retention)
+	s.db.SetSettingJSON("mesh_cache", *in.MeshCache)
+	// Recomputed before the push below, so every device's config already
+	// carries the new assignment (or none, when the cache was switched off).
+	s.meshRecompute()
 	// The audit log is the one place that answers "who changed what", and a
 	// row with an empty Target and empty Details answered neither. A save
 	// that changed nothing writes no row at all, so repeated saves of an
@@ -136,6 +159,11 @@ func settingsDiff(before, after Settings) []string {
 	add("agent_defaults.metrics_interval_sec", before.AgentDefaults.MetricsIntervalSec, after.AgentDefaults.MetricsIntervalSec)
 	add("agent_defaults.inventory_interval_sec", before.AgentDefaults.InventoryIntervalSec, after.AgentDefaults.InventoryIntervalSec)
 	add("agent_defaults.patch_scan_interval_sec", before.AgentDefaults.PatchScanIntervalSec, after.AgentDefaults.PatchScanIntervalSec)
+	if before.MeshCache != nil && after.MeshCache != nil {
+		add("mesh_cache.enabled", before.MeshCache.Enabled, after.MeshCache.Enabled)
+		add("mesh_cache.port", before.MeshCache.Port, after.MeshCache.Port)
+		add("mesh_cache.max_bytes", before.MeshCache.MaxBytes, after.MeshCache.MaxBytes)
+	}
 	add("retention.metrics_days", before.Retention.MetricsDays, after.Retention.MetricsDays)
 	add("retention.runs_days", before.Retention.RunsDays, after.Retention.RunsDays)
 	add("retention.audit_days", before.Retention.AuditDays, after.Retention.AuditDays)

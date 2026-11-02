@@ -2,6 +2,7 @@ package svc
 
 import (
 	"errors"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -125,5 +126,41 @@ func TestInitScriptStatusIgnoresOtherPlatforms(t *testing.T) {
 	}
 	if _, ok := initScriptStatus("HomelabRMMNoSuchService", "unix-systemv"); ok {
 		t.Fatal("a service with no init script must not report a status")
+	}
+}
+
+// TestSystemdUnitUsesLibraryTemplateSyntax guards the unit template against
+// the text/template syntax kardianos/service dropped in v1.3: a dotted key
+// such as {{.Description}} renders nothing and fails the install on every
+// Linux machine, which no Windows test run would notice.
+func TestSystemdUnitUsesLibraryTemplateSyntax(t *testing.T) {
+	allowed := map[string]bool{
+		"Description": true, "Path": true, "Arguments": true, "WorkingDirectory": true,
+		"EnvVars": true, "Name": true, "Dependencies": true, "UserName": true,
+		"Restart": true, "LimitNOFILE": true, "LogDirectory": true, ".": true,
+	}
+	for _, m := range regexp.MustCompile(`{{\s*(/?\w+)?\s*([^}]*)}}`).FindAllStringSubmatch(systemdUnit, -1) {
+		expr := strings.TrimSpace(m[2])
+		key := m[1]
+		switch key {
+		case "range", "if":
+			key = strings.Fields(expr)[0]
+		case "end", "":
+			if key == "end" {
+				continue
+			}
+			key = strings.TrimSpace(strings.Split(expr, "|")[0])
+		default:
+			// a bare key possibly followed by a pipeline
+		}
+		if key == "" {
+			key = strings.TrimSpace(strings.Split(m[0][2:len(m[0])-2], "|")[0])
+		}
+		if strings.HasPrefix(key, ".") && key != "." {
+			t.Fatalf("systemd unit template uses a dotted key %q in %q; the service library's engine wants bare keys", key, m[0])
+		}
+		if !allowed[key] {
+			t.Fatalf("systemd unit template uses key %q in %q, which the service library does not define", key, m[0])
+		}
 	}
 }

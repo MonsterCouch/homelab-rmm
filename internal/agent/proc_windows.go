@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -113,32 +114,103 @@ func jobFor(cmd *exec.Cmd) *killJob {
 	return cmdJobs[cmd]
 }
 
-// superviseCommand puts a command that has just started into a kill-on-close
-// job object, so cancelling it reaches every descendant: job membership is
-// inherited by grandchildren, survives a re-parenting and cannot be broken
-// away from unless the job allows it, none of which is true of taskkill's
-// walk of the live parent chain. It matters most for a script run, whose
-// stdout pipe an escaped descendant would otherwise hold open long after the
-// timeout, wedging the run.
-//
-// The caller must call the returned release when the command is done (defer
-// it next to Wait); it detaches the job without killing anything.
-//
-// exec.Cmd offers no hook between CreateProcess and Start returning, so the
-// assignment lands a moment after the process was created and a child that
-// spawns a grandchild in its very first instants could still escape - the
-// same window the ConPTY shell accepts in shell_windows.go. cmd.Cancel's
-// taskkill fallback covers that case, and a job object the OS refused to
-// create.
-func superviseCommand(cmd *exec.Cmd) (release func()) {
+const (
+	defaultMaxMemoryMB     uint64 = 1024
+	defaultCPULimitPercent uint32 = 80
+
+	// Job Object CPU rate control flags from winnt.h:
+	jobObjectCPURateControlEnable  uint32 = 0x1
+	jobObjectCPURateControlHardCap uint32 = 0x4
+)
+
+// jobObjectCPURateControlInformation matches the Win32 API struct
+// JOBOBJECT_CPU_RATE_CONTROL_INFORMATION for SetInformationJobObject with
+// JobObjectCpuRateControlInformation (class 15).
+type jobObjectCPURateControlInformation struct {
+	ControlFlags uint32
+	CpuRate      uint32
+}
+
+// newSandboxedJob creates a job object that terminates all child processes when
+// its last handle closes, enforces a memory ceiling (default 1024 MB), and
+// caps CPU utilization (default 80%), placing pid in it.
+func newSandboxedJob(pid int, maxMemMB uint64, cpuPercent uint32) (windows.Handle, error) {
+	if maxMemMB == 0 {
+		maxMemMB = defaultMaxMemoryMB
+	}
+	if cpuPercent == 0 {
+		cpuPercent = defaultCPULimitPercent
+	}
+	if cpuPercent > 100 {
+		cpuPercent = 100
+	}
+
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		return 0, fmt.Errorf("CreateJobObject: %w", err)
+	}
+
+	// 1. Extended limit information: process and job memory limits plus kill-on-close.
+	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+		windows.JOB_OBJECT_LIMIT_PROCESS_MEMORY |
+		windows.JOB_OBJECT_LIMIT_JOB_MEMORY
+	memBytes := uintptr(maxMemMB * 1024 * 1024)
+	info.ProcessMemoryLimit = memBytes
+	info.JobMemoryLimit = memBytes
+
+	if _, err := windows.SetInformationJobObject(
+		job,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+	); err != nil {
+		windows.CloseHandle(job)
+		return 0, fmt.Errorf("SetInformationJobObject(ExtendedLimit): %w", err)
+	}
+
+	// 2. CPU rate control: hard cap on processor cycle proportion per 10,000.
+	cpuInfo := jobObjectCPURateControlInformation{
+		ControlFlags: jobObjectCPURateControlEnable | jobObjectCPURateControlHardCap,
+		CpuRate:      cpuPercent * 100,
+	}
+	if _, err := windows.SetInformationJobObject(
+		job,
+		windows.JobObjectCpuRateControlInformation,
+		uintptr(unsafe.Pointer(&cpuInfo)),
+		uint32(unsafe.Sizeof(cpuInfo)),
+	); err != nil {
+		slog.Debug("job object CPU rate control unavailable, proceeding with memory limits only", "err", err)
+	}
+
+	// 3. Open process and assign to job object.
+	proc, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(pid))
+	if err != nil {
+		windows.CloseHandle(job)
+		return 0, fmt.Errorf("OpenProcess(%d): %w", pid, err)
+	}
+	defer windows.CloseHandle(proc)
+
+	if err := windows.AssignProcessToJobObject(job, proc); err != nil {
+		windows.CloseHandle(job)
+		return 0, fmt.Errorf("AssignProcessToJobObject: %w", err)
+	}
+
+	return job, nil
+}
+
+// superviseSandboxedCommand puts a command that has just started into a sandboxed
+// kill-on-close job object with process and job memory limits and CPU rate control.
+// If maxMemMB is 0, it defaults to 1024 MB. If cpuPercent is 0, it defaults to 80%.
+func superviseSandboxedCommand(cmd *exec.Cmd, maxMemMB uint64, cpuPercent uint32) (release func()) {
 	if cmd == nil || cmd.Process == nil {
 		return func() {}
 	}
 	j := &killJob{}
-	if h, err := newKillJob(cmd.Process.Pid); err == nil {
+	if h, err := newSandboxedJob(cmd.Process.Pid, maxMemMB, cpuPercent); err == nil {
 		j.handle = h
 	} else {
-		slog.Debug("job object unavailable, cancellation falls back to taskkill", "pid", cmd.Process.Pid, "err", err)
+		slog.Debug("sandboxed job object unavailable, cancellation falls back to taskkill", "pid", cmd.Process.Pid, "err", err)
 	}
 	cmdJobsMu.Lock()
 	cmdJobs[cmd] = j
@@ -149,6 +221,12 @@ func superviseCommand(cmd *exec.Cmd) (release func()) {
 		cmdJobsMu.Unlock()
 		j.release()
 	}
+}
+
+// superviseCommand puts a command that has just started into a kill-on-close
+// job object with default sandboxing limits (1024 MB RAM, 80% CPU).
+func superviseCommand(cmd *exec.Cmd) (release func()) {
+	return superviseSandboxedCommand(cmd, 0, 0)
 }
 
 // killProcessTree ends p and every descendant. os.Process.Kill only

@@ -216,19 +216,25 @@ func waitGone(s service.Service, timeout time.Duration) {
 	}
 }
 
+// systemdUnit is rendered by kardianos/service's own template engine (v1.3+),
+// not text/template: keys are bare ({{Description}}, not {{.Description}}),
+// "." is only the current {{range}} element, and the only pipeline functions
+// are the ones the library's default systemdScript uses (cmd, cmdEscape). A
+// dotted key fails at install time with "unknown template key".
 const systemdUnit = `[Unit]
-Description={{.Description}}
+Description={{Description}}
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart={{.Path}}{{range .Arguments}} {{.|cmd}}{{end}}
-{{if .WorkingDirectory}}WorkingDirectory={{.WorkingDirectory|cmdEscape}}{{end}}
-Restart=always
+ExecStart={{Path | cmdEscape}}{{range Arguments}} {{. | cmd}}{{end}}
+{{if WorkingDirectory}}WorkingDirectory={{WorkingDirectory | cmdEscape}}
+{{end}}Restart=always
 RestartSec=5
 KillMode=process
 LimitNOFILE=65536
-
+{{range EnvVars}}{{.}}
+{{end}}
 [Install]
 WantedBy=multi-user.target
 `

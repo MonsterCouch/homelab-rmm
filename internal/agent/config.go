@@ -27,6 +27,16 @@ type Config struct {
 	EnrollToken string `json:"enroll_token,omitempty"`
 	Fingerprint string `json:"fingerprint,omitempty"` // sha256 hex of the server certificate; "" = system trust
 	LogFile     string `json:"log_file,omitempty"`
+	// Transport picks how the agent reaches the server: "websocket", "quic" or
+	// "auto" (the default, also what an empty value means). RMM_TRANSPORT in the
+	// environment overrides it.
+	Transport string `json:"transport,omitempty"`
+	// QUICPort is the UDP port the server advertised for QUIC, 0 when it has
+	// not (or has stopped). QUICFailedAt is the Unix time of the last QUIC
+	// attempt that fell back to WebSocket; auto mode waits 10 minutes after it
+	// before dialling UDP again.
+	QUICPort     int   `json:"quic_port,omitempty"`
+	QUICFailedAt int64 `json:"quic_failed_at,omitempty"`
 }
 
 // Version is stamped by the build.

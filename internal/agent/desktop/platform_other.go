@@ -13,3 +13,7 @@ type threadDesktop struct{}
 func newThreadDesktop() *threadDesktop { return &threadDesktop{} }
 func (*threadDesktop) follow() error   { return nil }
 func (*threadDesktop) close()          {}
+
+// newCapturer returns the screen-capture backend. Only the X11/GDI backend
+// exists off Windows and Linux.
+func newCapturer() capturer { return screenCapturer{} }

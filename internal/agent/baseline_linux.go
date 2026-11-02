@@ -146,7 +146,10 @@ func lnxServiceCheck(ctx context.Context, c *checkCtx) kindResult {
 		if isPresent {
 			return blFail(want, "not installed", fmt.Sprintf("%s does not exist on this device", unit))
 		}
-		return blFail(want, "not installed", fmt.Sprintf("%s does not exist on this device", unit))
+		// running/stopped against a unit that is not there is a wrong name,
+		// not drift: an error, never a fleet-wide alert or a fix loop that
+		// cannot succeed (docs/BASELINES.md, "the way an unknown service is").
+		return blError(want, "no such unit", fmt.Sprintf("%s does not exist on this device", unit))
 	}
 	state := unitState(props["ActiveState"], props["SubState"])
 	fileState := props["UnitFileState"]

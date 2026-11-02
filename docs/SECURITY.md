@@ -21,7 +21,8 @@ the console reachable on the LAN or over a VPN. Adversaries considered:
 
 Not designed for: exposing the console to the untrusted public internet without a reverse proxy/VPN,
 or adversaries with root/administrator access on the server host (they have everything: the SQLite file,
-the TLS private key, the SMTP credentials). Multi-tenancy (Organizations and Sites) is supported and
+the TLS private key, the SMTP credentials). With **signed actions** enabled, that adversary still cannot
+make devices act unless an operator signs; see Signed actions below for exactly what remains. Multi-tenancy (Organizations and Sites) is supported and
 enforces strict cross-tenant isolation and technician scoping.
 
 ## What is protected, and how
@@ -183,7 +184,9 @@ The console says so in the Add-check dialog. Have the check read a secret on the
 file operation (`file.download`, `file.upload`, `file.delete`, `file.mkdir`, `file.rename`),
 settings change and user change is written to the `audit` table with user and source address,
 along with `setup.refused` (a wrong setup code), `agent.enrolled`, `agent.rekeyed` and
-`agent.duplicate_hostname`. A **service action, process kill or file operation is audited
+`agent.duplicate_hostname`. A signed action that several operators approved is audited in the
+name of the operator who asked for it, at the address they asked from; each signature is its own
+`action.sign` entry by its signer. A **service action, process kill or file operation is audited
 whether or not it worked**: the attempt is what the log is read for, and a refusal carries
 `"outcome":"failed"` with the device's own error, so "nobody tried to stop the antivirus" and
 "somebody tried and was refused" are not the same empty log — and a sweep for unreadable paths
@@ -212,6 +215,14 @@ desktop session.
 empty hash used to skip verification altogether) and will not fetch one from just anywhere: the
 URL must be `https`, or plain `http` against the configured server's own host, which is the
 `--insecure`-behind-a-proxy deployment. What it installs runs as SYSTEM/root at the next restart.
+In an organization that signs actions, the agent treats the check it makes every five minutes
+(`GET /api/agent/update-check`, where the server supplies both the URL and the hash, so no operator
+is behind it) as an unsigned `agent.update`: in `audit` mode it still installs and raises a security
+alert once for each binary the server advertises, and in `enforce` mode it refuses and reports that
+once. The server stops advertising to devices of organizations in `enforce` mode, so that a fleet
+does not alert every five minutes, but the device refuses on its own whatever the server says.
+Updating such a fleet takes one signed manifest per organization and agent build (see Signed
+actions, **Updating agents**).
 
 **Downloads.** `/api/agent-download/` is unauthenticated on purpose (the install script runs
 before the device has credentials), restricted to files named `rmm-agent-*` in the agents
@@ -335,14 +346,183 @@ SYSTEM and reads the event log scores highly with behavioural engines. Exclusion
 deliberately, because an exclusion is a hole you are choosing to keep. The manual install needs
 neither the script nor the download.
 
+## Signed actions
+
+Once an organisation has a **trust bundle**, its devices stop taking the server's word for
+destructive requests. Running a script, killing a process, changing a service, writing or
+deleting files, rebooting, isolating, installing updates or a new agent build, repairing Windows servicing, opening a shell or
+the remote desktop, and browsing files all need an operator's **security key** (or passkey). The
+key must have signed that exact request for that device. The device checks the signature against
+the bundle it pinned, so a request the server altered, invented or replayed is refused there. The
+design is in `docs/plans/2026-10-06-phase3-signed-actions.md`.
+
+**What it stops:**
+- a stolen console session (a cookie, a phished password and TOTP);
+- anyone who can change the database: a SQL injection, a stolen backup, an edited script, schedule or
+  baseline;
+- a replayed request.
+
+None of them can make a device do anything, because they never touch an operator's key.
+
+**What it does not stop:**
+- **A fully compromised server can still trick you.** The console's JavaScript comes from the
+  server, and security keys do not display what they sign. A tampered console could show one
+  action and sign another. The signing dialog decodes the exact bytes your key signs, but that
+  dialog is also served by the server. Signing with `rmm-signer` (below) removes this for the
+  operator who uses it; the browser path stays exposed.
+- **Keystrokes into a session that is already open.** Signing covers opening a shell or remote
+  desktop, not each keystroke. Grants last 15 minutes and cover one device.
+- **Denial of service and telemetry.** A compromised server can still refuse to relay anything,
+  and it still sees what devices report.
+
+**Signing outside the browser (`rmm-signer`).** `rmm-signer.exe` (Windows, built by `make signer`)
+fetches a pending manifest, decodes and prints it itself (kind, organization, issuer, expiry, targets,
+and the payload in full: a script's whole body and environment, an update's url and sha256), asks
+`Sign? [y/N]`, and signs the exact bytes with Windows Hello or a security key through the native
+WebAuthn API. A compromised server or console can no longer show one action and have you sign
+another, because the server serves nothing you read. It only supplies the list and the device names,
+which are printed marked as the server's. The credentials are the ones registered under **Account →
+Security keys**; the signature is checked by the devices as for a browser signature.
+
+```
+rmm-signer login --server https://rmm.example.net     password, and the TOTP code when asked
+rmm-signer list  --server https://rmm.example.net     what waits for your signature
+rmm-signer show  ID                                   print one manifest, sign nothing
+rmm-signer sign  ID                                   print, confirm, sign, post (or: sign --all)
+rmm-signer logout
+```
+
+In the console, **Sign with rmm-signer** in the signing dialog (or **Copy rmm-signer command** on
+Approvals) gives the id; the request waits until it expires. The tool signs only when `--server`'s
+origin is one of the bundle's origins, and refuses an entry whose manifest carries another id than
+the one listed. `login` keeps the session cookie in `%APPDATA%\homelab-rmm\signer.json` (mode 0600,
+written through a temporary file); it has the power of a logged-in browser until it expires, and
+`rmm-signer logout` deletes it and ends the session on the server. A session saved for another
+server is never sent, and redirects are never followed.
+
+What it does **not** protect against: a compromised operator machine (malware there can read the
+session file, replace the tool or press the confirmation for you; Windows Hello or the key touch is
+the only barrier), a manifest you approve without reading it, and a server that invents manifests
+for you to sign (it can only ask; you decide). It has not yet been run against a real authenticator.
+
+**Before you start:**
+- The console must be reached by a **DNS name**. Browsers do not offer security keys to a site
+  addressed by IP. Set `RMM_PUBLIC_URL` to the name, or `RMM_WEBAUTHN_RP_ID` and
+  `RMM_WEBAUTHN_ORIGINS` to override.
+- The browser must **trust the server certificate**. Import `server.crt` (Recommendations §4) or
+  use `tailscale cert`. A page with a certificate warning may not be allowed to use security keys.
+- Every operator who will approve actions registers keys under **Account → Security keys**.
+  Register two each (a key and a backup, or a key and a passkey).
+
+**Rolling out:**
+1. **Trust & signing → New proposal**, mode `audit`. Select the operators' keys, and generate a
+   **recovery key**. It is shown once: print it or store it in a password manager, offline from
+   the server. Sign the proposal. Devices pin this first bundle the next time they connect.
+2. In `audit` mode devices check every request but still run unsigned ones. Each unsigned request
+   raises a **security alert** naming the request type. Interactive actions now ask for your key;
+   **Continue without signing** is still offered.
+3. Things that run with nobody present (scheduled tasks, automations, patch policies, software
+   catalog items and baselines) need a **standing approval**. Sign each one under
+   **Approvals → Review & sign**. Editing one later makes it unsigned again until re-signed.
+4. When the alerts have stopped, propose the same bundle in `enforce` mode. Devices now refuse
+   anything unsigned. Enforce cannot be selected without a recovery key.
+
+**Updating agents.** *Update Agents* (on Devices, and under *Server & Fleet Updates*) works through
+the devices one organization and agent build at a time (2000 devices at most per signature) and asks
+for one signature for each, because a manifest names one organization and carries one binary.
+`agent.update` is high-risk, so each of those manifests needs `high_threshold` signers (1 by default;
+with more, the others sign under **Approvals**). The manifest binds the binary's SHA-256, which the
+device checks after the download, so the server cannot substitute another file under your signature.
+A device that already runs that build answers as done and downloads and restarts nothing, but the
+signature is asked for before any device is: there is no way to know first, so a repeat costs the
+same touch. Only devices that are online when you start are included, because a manifest lasts 5
+minutes (10 when several signers are needed). A device that was offline waits for the next signed
+push in `enforce` mode, so run *Update Agents* again once it is back (the console says how many were
+offline); in `audit` mode its own five-minute check still updates it and reports the unsigned update.
+The console counts a device as updated *by signed update* only when the server says the update was
+signed, so devices you let through with *Continue without signing* in `audit` mode are counted as
+sent without a signature, and it names the devices that failed with the reason each gave. Online
+devices for which the server has no agent build are reported as skipped. The audit log keeps who
+asked and from where (not the address of whoever added the last signature) and, for a failure,
+which devices and why.
+
+A signed run is never queued for an offline device: its signature lasts 5 minutes, so a queued run
+would start long after it expired and reach the device unsigned (an alarm in `audit` mode, a refusal
+in `enforce`). The console refuses it up front and asks you to run it again when the device is
+online. Unattended runs (tasks and automations) still queue, and the queued row keeps its standing
+approval, which the server presents when the device reconnects.
+
+**Changing the bundle** (adding an operator, a key or a recovery key, or changing the mode)
+takes signatures from operators of the **current** bundle, so the server cannot add its own key.
+
+**If every key is lost**, sign the next proposal with the recovery key on any machine with the
+`rmm-server` binary. Take the bundle text from the proposal's **Recovery** dialog:
+
+```
+rmm-server trust sign-bundle --key recovery.txt --bundle proposal.txt
+```
+
+Paste the output into the same dialog.
+
+**A device that refuses everything** after its `trust.json` (next to `agent.json`) was damaged
+has failed closed on purpose. An administrator on that device can delete `trust.json`; the agent
+then pins the server's current bundle on its next connection, as on first use.
+
+### Transparency log
+
+The server keeps an append-only Merkle log (`internal/translog`, built on `golang.org/x/mod/sumdb/tlog`,
+the code behind Go's checksum database) of every manifest and signature set it releases, every trust
+bundle it activates and every audit row, with tree heads signed by a log key in `<data dir>/log.key`
+(mode 0600). A bundle pins that key as `log_key`; the server always adds its own when it composes a
+bundle and refuses a proposal naming another. A device holding such a bundle checks, before it runs a
+protected, signed request, that the manifest is in the log (it rebuilds the leaf itself and checks an
+inclusion proof against a signed head) and that the log only grew since the head it last accepted (a
+consistency proof; the head is kept in `log_head.json` next to `agent.json`). A bad proof is refused in
+`enforce` and reported once in `audit`; a request with no proof is refused only when the bundle's policy
+sets **Require log proofs** (`require_log_proof`, which needs a `log_key`). A manifest refused for its
+proof has spent its nonce, so the operator signs again. A damaged `log_head.json` fails closed like a
+damaged `trust.json`: the device refuses protected requests until an administrator deletes the file
+after confirming that the server's log is the one to trust, and changing `log_key` needs the same step.
+
+Each device also keeps `executed.log`, one hash-chained line per manifest it ran, and reports the head
+in hello and inventory, so the server cannot drop a manifest from a device's history without the head
+disagreeing with the file. Anyone can check from outside that the log only grew:
+
+```
+rmm-server log verify --server https://rmm.lan:8443 --key homelab-rmm-log+...
+```
+
+The first run pins the head in `log-verify.json` (or `--state`); later runs demand a consistency proof
+from it and report a rewritten or shrunk log. `rmm-server log head` prints the head and key. The log
+means the server cannot release or rewrite anything quietly. It does not protect against:
+- a server that never dispatches an action: nothing is logged because nothing was sent, so a device
+  that never hears from the server looks like an idle one;
+- an operator who holds both the log key and the database: they can rebuild a consistent log. Run
+  `log verify` from another host so that a rebuilt log fails its consistency check, and guard `log.key`;
+- a log that nobody checks: devices verify proofs only when the bundle pins `log_key`, and the command
+  only when someone runs it.
+
+### Servicing repair and the update cache
+
+`servicing.repair` is a `ClassAction` in `internal/actionauth/policy.go`, so a manual repair is signed like `script.run`: the manifest names the device and the exact steps, package and reboot mode, and the agent refuses it in enforce mode without a valid signature. An automatic repair by a patch policy runs under a **standing approval unit** (purpose `repair`, constraints `{op: servicing.repair, steps, reboot}`). The unit binds the steps (`dism_restore`, `reset_components`, `rescan`) and the reboot mode (`if_required` or `never`), and `Constraints.check` refuses any payload that carries a package, so an unattended repair cannot be pointed at a download. Editing the policy's repair or reboot setting makes the unit unsigned until it is re-signed. The agent runs only fixed executables by absolute path under `%SystemRoot%\System32`, hidden, and renames the two catalog directories instead of deleting them. A package, when one is signed for, must be https on the server's own host and match its SHA-256.
+
+The subnet update cache (see OPERATIONS) does not widen what a device trusts:
+- **Integrity does not depend on the leader.** A member verifies each 2 MiB chunk against the leader's index, then the whole file against the SHA-256 the server named, which in a signing organization is inside the signed manifest. A leader that serves consistent but wrong bytes is rejected, and the member falls back to the origin.
+- **Who may use a leader.** Requests carry a bearer token, an HMAC of the organization and the UTC date under a server-held secret (`mesh_cache_secret`); the leader accepts today's and yesterday's. The member pins the leader's self-signed certificate by the SHA-256 fingerprint the server delivered in its config, so another host on the subnet cannot impersonate a leader. The token is not a secret from the organization's own devices.
+- **The leader is not a proxy.** It fills a miss only from a URL with the same scheme and host as its configured `server_url`, refuses redirects off that host, and keeps a download only if its hash equals the one asked for (otherwise 502).
+- **What leaks.** The cached artifacts are things the server serves without authentication anyway (agent binaries). The leader listens on every interface; restrict the port to the subnet with the firewall. The Windows agent's own rule uses `remoteip=LocalSubnet`.
+- **Grouping is by organization,** and a group only forms inside one organization and subnet, so devices of one tenant never fetch through another tenant's device.
+
 ## What is not protected
 
-- **Anyone with a console account is root everywhere.** There is no per-device permission model
-  beyond the three roles. Do not share accounts; create a `viewer` for people who only need to
-  look.
+- **Without signed actions, anyone with a console account is root everywhere.** There is no
+  per-device permission model beyond the roles. Do not share accounts, and create a `viewer` for
+  people who only need to look. With a trust bundle in `enforce` mode, an account alone is no
+  longer enough to change a device (see Signed actions).
 - **The console is not hardened for the open internet.** No account lockout beyond the
-  per-minute limiter, no WebAuthn, no IP allow-lists, no brute-force alerting. Keep it on the
-  LAN or behind a VPN (WireGuard, Tailscale).
+  per-minute limiter, no IP allow-lists, no brute-force alerting. Security keys gate actions on
+  devices, not signing in to the console. Keep it on the LAN or behind a VPN (WireGuard,
+  Tailscale).
 - **Behind a reverse proxy the client address is only as good as the proxy.** With
   `--trusted-proxies` set, anything that reaches the server from that network can claim any
   client address in `X-Forwarded-For`. Bind the HTTP listener to localhost when a proxy is used,
@@ -446,7 +626,7 @@ backed by strict tenant-scoping defenses and role-based access control:
      (`/api/software-catalog`) requires the `admin` role. Technicians can trigger installs on scoped
      devices, but cannot alter package repositories or binaries.
    - **Automations & Fleet Updates (`VULN-008`, `VULN-011`)**: Accessing or modifying event automations
-     (`/api/automations`, `VULN-008`), triggering fleet-wide agent updates (`POST /api/agents/update-all`, `VULN-011`),
+     (`/api/automations`, `VULN-008`), triggering fleet-wide agent updates (`POST /api/agents/update-all`, `VULN-011`, and `POST /api/agents/update-batch`),
      in-place server updates (`POST /api/server/update`), and full system audit logs (`/api/audit`) require full `admin` rights.
    - **Network Subnet Scanning (`VULN-013`)**: Initiating server-side network scans without an agent probe
      (`POST /api/network-scans`) requires the `admin` role (`VULN-013`). Technicians can only dispatch scans via online agents in their `org_scope`.

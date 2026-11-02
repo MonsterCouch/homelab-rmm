@@ -7,11 +7,13 @@
       web       npm ci + npm run build in web\ (the server embeds web\dist)
       server    rmm-server for windows/amd64, windows/arm64, linux/amd64, linux/arm64
       agents    rmm-agent for those plus linux/arm (GOARM=7)
-      all       web, server, agents (default)
+      signer    rmm-signer (out-of-band approval signer) for windows/amd64 and windows/arm64
+      all       web, server, agents, signer (default)
       test      go vet, go test, UI type-check + build
       package   dist\homelab-rmm-<os>-<arch>.zip per server platform (+ .tar.gz for linux
-                when tar.exe is available) and dist\SHA256SUMS. It archives what
-                server/agents built and does NOT build the UI, and it refuses a
+                when tar.exe is available) and dist\SHA256SUMS. The windows archives
+                also carry rmm-signer-windows-<arch>.exe. It archives what
+                server/agents/signer built and does NOT build the UI, and it refuses a
                 binary older than the sources or web\dist it was built from.
       clean     remove dist\ and the built UI
 
@@ -28,12 +30,13 @@
 .EXAMPLE
     tools\build.ps1                       # everything
     tools\build.ps1 -Target server,agents # binaries only, reusing the existing web\dist
+    tools\build.ps1 -Target signer        # rmm-signer only; needs no web\dist
     tools\build.ps1 -Target package -Version v1.2.3
     tools\build.ps1 -Target web,server,agents,msi -Platforms windows/amd64 # installers only
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('web', 'server', 'agents', 'desktop', 'all', 'test', 'package', 'msi', 'checksums', 'clean')]
+    [ValidateSet('web', 'server', 'agents', 'signer', 'desktop', 'all', 'test', 'package', 'msi', 'checksums', 'clean')]
     [string[]]$Target = @('all'),
     [string]$Version = '',
     [string]$Dist = 'dist',
@@ -54,11 +57,14 @@ Set-Location $root
 $module = 'github.com/MonsterCouch/homelab-rmm'
 $serverPlatforms = @('windows/amd64', 'windows/arm64', 'linux/amd64', 'linux/arm64')
 $agentPlatforms = @('windows/amd64', 'windows/arm64', 'linux/amd64', 'linux/arm64', 'linux/arm')
+# rmm-signer signs with the Windows WebAuthn API, so only Windows gets a binary.
+$signerPlatforms = @('windows/amd64', 'windows/arm64')
 if ($Platforms.Count -gt 0) {
     # Intersect rather than replace, so a typo or an unsupported pair cannot
     # quietly invent a build target that the rest of the script cannot name.
     $serverPlatforms = @($serverPlatforms | Where-Object { $Platforms -contains $_ })
     $agentPlatforms = @($agentPlatforms | Where-Object { $Platforms -contains $_ })
+    $signerPlatforms = @($signerPlatforms | Where-Object { $Platforms -contains $_ })
     if ($serverPlatforms.Count -eq 0 -and $agentPlatforms.Count -eq 0) {
         throw "-Platforms matched nothing. Supported: windows/amd64, windows/arm64, linux/amd64, linux/arm64, linux/arm"
     }
@@ -89,7 +95,7 @@ function Get-BuildVersion {
 }
 
 $Version = Get-BuildVersion
-$ldflags = "-s -w -X $module/internal/server.Version=$Version -X $module/internal/agent.Version=$Version"
+$ldflags = "-s -w -X $module/internal/server.Version=$Version -X $module/internal/agent.Version=$Version -X main.Version=$Version"
 
 function Invoke-Native {
     # Runs a native command and turns a non-zero exit into a terminating error.
@@ -146,6 +152,7 @@ function Assert-WebBuilt {
 
 function Build-Server { Assert-WebBuilt; foreach ($p in $serverPlatforms) { Invoke-GoBuild 'rmm-server' $p } }
 function Build-Agents { foreach ($p in $agentPlatforms) { Invoke-GoBuild 'rmm-agent' $p } }
+function Build-Signer { foreach ($p in $signerPlatforms) { Invoke-GoBuild 'rmm-signer' $p } }
 function Build-Desktop {
     Assert-WebBuilt
     New-Item -ItemType Directory -Force -Path $Dist | Out-Null
@@ -203,7 +210,7 @@ function Write-Checksums {
     # in $Dist, not what this run produced: build a release from a clean dist
     # (-Target clean) or a stale artefact from an earlier version rides along.
     $files = Get-ChildItem -Path $Dist -File |
-        Where-Object { $_.Name -match '^(homelab-rmm-.*\.(zip|tar\.gz)|rmm-(server|agent)-.*)$' -and $_.Extension -ne '.wixpdb' } |
+        Where-Object { $_.Name -match '^(homelab-rmm-.*\.(zip|tar\.gz)|rmm-(server|agent|signer)-.*)$' -and $_.Extension -ne '.wixpdb' } |
         Sort-Object Name
     $lines = foreach ($f in $files) {
         $hash = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLower()
@@ -288,6 +295,16 @@ function New-Packages {
             if (Test-Path -LiteralPath $dt) {
                 Assert-Fresh $dt 'desktop'
                 Copy-Item -LiteralPath $dt -Destination (Join-Path $stage 'Homelab-RMM.exe')
+            }
+        }
+        # the signer ships in the Windows archives only, where it can run
+        if ($os -eq 'windows') {
+            foreach ($sp in $signerPlatforms) {
+                $sparts = $sp.Split('/')
+                $s = Get-BinName 'rmm-signer' $sparts[0] $sparts[1]
+                if (-not (Test-Path -LiteralPath $s)) { throw "missing $s (run: tools\build.ps1 -Target signer)" }
+                Assert-Fresh $s 'signer'
+                Copy-Item -LiteralPath $s -Destination $stage
             }
         }
         foreach ($ap in $agentPlatforms) {
@@ -450,11 +467,13 @@ foreach ($t in $Target) {
         'web'       { Build-Web }
         'server'    { Build-Server }
         'agents'    { Build-Agents }
+        'signer'    { Build-Signer }
         'desktop'   { Build-Desktop }
         'all'       {
             Build-Web
             Build-Server
             Build-Agents
+            Build-Signer
             Build-Desktop
             if (Get-WixCommand) {
                 New-Msi

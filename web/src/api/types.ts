@@ -90,6 +90,7 @@ export interface Inventory {
   agent_path: string;
   collected_at: number;
   extra?: Record<string, string>;
+  cache?: CacheStats;
 }
 
 export interface DiskUsage {
@@ -213,6 +214,8 @@ export interface Agent {
   last_ip: string;
   last_seen: number;
   online: boolean;
+  /** Which agent transport the live connection uses; absent while offline. */
+  transport?: 'websocket' | 'quic';
   monitored_services: string[];
   maintenance_until: number;
   enrolled_at: number;
@@ -224,6 +227,8 @@ export interface Agent {
   isolated?: boolean;
   isolated_at?: number;
   isolated_by?: string;
+  /** head of the device's executed-action log, as the device last reported it */
+  executed_head?: string;
 }
 
 export interface AgentUpdate {
@@ -518,6 +523,8 @@ export interface PatchPolicy {
   mode: 'approved' | 'all' | 'security' | string;
   reboot: 'never' | 'if_required' | 'always' | string;
   enabled: boolean;
+  /** off, or auto: a scan or install that reports a servicing error code starts one repair. */
+  repair?: 'off' | 'auto' | string;
   created_at: number;
 }
 
@@ -551,6 +558,57 @@ export interface Settings {
   smtp: MailSettings;
   agent_defaults: AgentConfig;
   retention: Retention;
+  /** Absent from an older server; a save that omits it keeps the current value. */
+  mesh_cache?: MeshCacheSettings;
+}
+
+export interface MeshCacheSettings {
+  enabled: boolean;
+  port: number;
+  max_bytes: number;
+}
+
+export interface CacheStats {
+  /** leader, member, or empty when the device is not in a cache group */
+  role: string;
+  hits: number;
+  misses: number;
+  bytes_served: number;
+  bytes_stored: number;
+}
+
+export interface ServicingStep {
+  name: string;
+  status: 'ok' | 'failed' | 'skipped' | string;
+  exit_code: number;
+  duration_ms: number;
+  tail?: string;
+}
+
+/** What the agent replied. A record whose repair never started carries only error. */
+export interface ServicingResult {
+  steps?: ServicingStep[] | null;
+  reboot_required?: boolean;
+  error?: string;
+}
+
+export interface ServicingRecord {
+  id: number;
+  agent_id: string;
+  policy_id: number | null;
+  trigger: 'manual' | 'auto' | string;
+  code: string;
+  why?: string;
+  started_at: number;
+  finished_at: number;
+  status: 'running' | 'ok' | 'failed' | string;
+  result: ServicingResult | null;
+  by: string;
+}
+
+export interface ServicingRepairRequest {
+  steps: string[];
+  reboot: 'never' | 'if_required';
 }
 
 export interface SystemInfo {
@@ -559,6 +617,10 @@ export interface SystemInfo {
   fingerprint: string;
   data_dir: string;
   db_bytes: number;
+  /** sqlite, pebble or clickhouse; absent from an older server */
+  telemetry_engine?: string;
+  /** -1 when the engine cannot report a size */
+  telemetry_bytes?: number;
   uptime: number;
   agents_connected: number;
 }
@@ -571,6 +633,8 @@ export interface AuditRow {
   action: string;
   target: string;
   details: string;
+  /** the entry's leaf in the transparency log; -1 when it was never logged */
+  log_index?: number;
 }
 
 export interface Dashboard {
@@ -1091,4 +1155,262 @@ export interface ServerVersionInfo {
   pid: number;
   exe_path: string;
   staged_update?: StagedUpdate;
+}
+
+/**
+ * Online devices of one organization that need one build of the agent, at most
+ * as many as one update may cover (a build more devices run comes back as
+ * several groups). A signed update names one organization and one binary, so
+ * each group costs one signature (lib/fleetUpdate.ts walks them).
+ */
+export interface SignedUpdateGroup {
+  /** organization id */
+  org: string;
+  org_name?: string;
+  os: string;
+  arch: string;
+  /** version the build reports */
+  version: string;
+  /** SHA-256 of the binary: the signature covers it and each device checks it */
+  sha256: string;
+  agent_ids: string[];
+}
+
+/**
+ * Reply to a fleet-wide update. Devices of organizations that do not sign
+ * actions are updated at once; the others come back as groups that still need
+ * a signature.
+ */
+export interface UpdateAllResult {
+  ok: boolean;
+  /** devices of organizations without signing that were sent the update */
+  dispatched_to: number;
+  signed_groups: SignedUpdateGroup[];
+  /** online devices the server has no agent build for (their OS or architecture), which it sent nothing */
+  skipped_no_build: number;
+  /** online devices left out because they reported the build being pushed within the last day */
+  up_to_date: number;
+  message: string;
+}
+
+/** Reply to a signed update of one group's devices. */
+export interface UpdateBatchResult {
+  ok: boolean;
+  /** devices that took the update: those that confirmed it and those still installing it */
+  dispatched_to: number;
+  /**
+   * whether the update went out under a signature. False for an update nobody
+   * signed: an operator who continued without signing in an organization that
+   * only audits, or an organization that stopped signing since the listing.
+   */
+  signed: boolean;
+  /** devices that confirmed it */
+  accepted: number;
+  /** devices that did not reply within 20 s: still downloading and staging the binary */
+  installing: number;
+  /** devices that were not connected */
+  offline: number;
+  /** devices that did not take the update because they answered with an error or could not be sent it, with the reason */
+  failed: { id: string; name?: string; error: string }[];
+  /** devices left out of the update because they already run this build */
+  up_to_date: number;
+  /** what each device that confirmed the update said about its download; absent from a server that predates it */
+  results?: AgentUpdateResult[];
+  /** devices that confirmed the update, by where they downloaded it; absent from a server that predates it */
+  by_source?: UpdateSourceCounts;
+  message: string;
+}
+
+/** A device's answer to an update: where its bytes came from. An agent that predates it leaves source empty. */
+export interface AgentUpdateResult {
+  /** only in a batch reply */
+  id?: string;
+  name?: string;
+  /** "origin", "cache <leader> over h3|https", "origin (the cache failed: ...)", or empty */
+  source: string;
+  bytes?: number;
+  resumed_chunks?: number;
+  version?: string;
+}
+
+/** 200 from POST /api/agents/{id}/update. */
+export interface DispatchUpdateResult {
+  ok: boolean;
+  message: string;
+  /** the device is still downloading; it restarts on its own when done */
+  installing?: boolean;
+  /** the device already runs the pushed build, nothing was sent */
+  up_to_date?: boolean;
+  result?: AgentUpdateResult;
+}
+
+/** Devices per download source in one update batch. */
+export interface UpdateSourceCounts {
+  cache: number;
+  origin: number;
+  /** from the server because the subnet cache failed */
+  origin_cache_failed: number;
+  /** no source reported: the device already ran the build, or its agent predates the reply */
+  unreported: number;
+}
+
+// ---- Phase 3: operator-signed actions ----
+// docs/plans/2026-10-06-phase3-signed-actions.md §4.1. Binary values are
+// unpadded base64url strings.
+
+/** 202 from a protected request that still needs more signers. */
+export interface ApprovalPending {
+  pending: true;
+  manifest_id: string;
+  have: number;
+  need: number;
+}
+
+export interface WebAuthnCredential {
+  id: string;
+  name: string;
+  /** COSE algorithm: -7 ES256, -8 EdDSA, -257 RS256 */
+  alg: number;
+  owner: string;
+  created_at: number;
+  last_used_at: number;
+  in_bundle: boolean;
+}
+
+export type TrustMode = 'off' | 'audit' | 'enforce';
+
+export interface TrustPolicy {
+  mode?: TrustMode;
+  require_uv?: boolean;
+  high_threshold?: number;
+  bundle_threshold?: number;
+  bulk_limit?: number;
+  require_log_proof?: boolean;
+}
+
+export interface TrustSigner {
+  owner: string;
+  /** bundle shape */
+  creds?: { id: string; alg?: number; pub?: string }[];
+  /** proposal-request shape */
+  credential_ids?: string[];
+}
+
+export interface TrustCurrent {
+  epoch: number;
+  hash: string;
+  mode?: TrustMode;
+  policy?: TrustPolicy;
+  signers?: TrustSigner[] | null;
+  recovery_ids?: string[] | null;
+  rp_id?: string;
+  origins?: string[] | null;
+  log_key?: string;
+}
+
+export interface TrustProposal {
+  id: string;
+  epoch: number;
+  /** exact bundle bytes; absent from list rows on some servers (GET /api/trust/proposals/{pid} has it) */
+  bundle?: string;
+  need: number;
+  have: number;
+  created_by?: string;
+  created_at?: number;
+}
+
+/** GET /api/log/head: the transparency log's current signed head. */
+export interface LogHead {
+  size: number;
+  hash: string;
+  /** the verifier key an auditor pins */
+  key: string;
+  note: string;
+}
+
+export interface TrustAgentCounts {
+  at_current: number;
+  behind: number;
+  mismatched: number;
+  none: number;
+}
+
+export interface TrustInfo {
+  current: TrustCurrent | null;
+  proposals: TrustProposal[] | null;
+  agents: TrustAgentCounts;
+}
+
+export interface TrustProposalInput {
+  mode: TrustMode;
+  require_uv: boolean;
+  high_threshold: number;
+  bundle_threshold: number;
+  bulk_limit: number;
+  require_log_proof: boolean;
+  signers: { owner: string; credential_ids: string[] }[];
+  /** only the public half ever leaves the browser */
+  recovery: { id: string; pub: string }[];
+}
+
+export interface ProposalSignResult {
+  have: number;
+  need: number;
+  active: boolean;
+}
+
+export interface PendingApproval {
+  manifest_id: string;
+  /** exact manifest bytes; the console will not sign what it cannot show */
+  manifest?: string;
+  summary?: string;
+  issuer?: string;
+  org?: string;
+  have: number;
+  need: number;
+  created_at?: number;
+  expires_at?: number;
+  kind?: string;
+  op?: string;
+  ops?: string[];
+  targets?: string[];
+  /** device id to display name, for the ids the caller may see */
+  target_names?: Record<string, string>;
+  rp_id?: string;
+  origins?: string[];
+  allow_credentials?: string[];
+  user_verification?: 'required' | 'preferred' | 'discouraged';
+  /** owner names that have signed so far */
+  signers?: string[];
+}
+
+export type UnsignedType = 'task' | 'automation' | 'patch_policy' | 'catalog_item' | 'baseline';
+
+export interface UnsignedObject {
+  type: UnsignedType;
+  id: string | number;
+  name: string;
+  reason: 'missing' | 'expired' | 'content changed';
+  /** the organization the approval is for */
+  org: string;
+  /** what the signature covers when the object has several (a patch policy's "install" and "reboot", a catalog item's "install/windows"); empty when there is one */
+  purpose: string;
+}
+
+/** POST /api/approvals/objects/{type}/{id}/sign */
+export type SignObjectResult =
+  | {
+      expires_at?: number;
+      org?: string;
+      purpose?: string;
+      /** other units of the same object that still need a signature */
+      remaining?: number;
+      already_approved?: boolean;
+    }
+  | ApprovalPending;
+
+/** POST /api/agents/{id}/grant */
+export interface GrantResult {
+  required?: boolean;
+  expires_at?: number;
 }

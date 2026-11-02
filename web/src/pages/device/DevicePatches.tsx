@@ -1,13 +1,13 @@
 import { useMemo, useState } from 'react';
 import { api } from '../../api/client';
-import type { Patch } from '../../api/types';
+import type { Patch, ServicingRecord } from '../../api/types';
 import { DataTable, textMatch, type Column } from '../../components/DataTable';
 import { IconRefresh } from '../../components/Icons';
-import { useConfirm } from '../../components/Modal';
-import { Button, Chip, ErrorBox, PatchStatusChip, Switch } from '../../components/ui';
+import { Modal, useConfirm } from '../../components/Modal';
+import { Button, Chip, ErrorBox, Field, PatchStatusChip, Switch } from '../../components/ui';
 import { useAsync, useDebounced } from '../../hooks/useAsync';
 import { useLiveReload } from '../../hooks/useEvents';
-import { bytes, relTime } from '../../lib/format';
+import { bytes, dateTime, relTime } from '../../lib/format';
 import { errMsg, useToast } from '../../state/toast';
 import type { TabProps } from './DeviceDetail';
 import '../../styles/mobile-pages.css';
@@ -22,6 +22,120 @@ export function sevTone(s: string): 'danger' | 'warn' | 'info' | '' {
 
 export const patchKey = (p: Patch) => `${p.agent_id}|${p.patch_id}`;
 
+const REPAIR_STEPS: { id: string; label: string; hint: string }[] = [
+  { id: 'dism_restore', label: 'DISM RestoreHealth', hint: 'Repairs the component store from Windows Update.' },
+  { id: 'sfc', label: 'System File Checker', hint: 'Advisory: a failure here does not stop the repair.' },
+  { id: 'reset_components', label: 'Reset Windows Update components', hint: 'Renames the update catalog and download caches so Windows rebuilds them.' },
+  { id: 'rescan', label: 'Scan for updates afterwards', hint: 'Takes a fresh update scan when the repair is done.' },
+];
+
+const stepTone = (s: string): 'ok' | 'danger' | '' => (s === 'ok' ? 'ok' : s === 'failed' ? 'danger' : '');
+
+function RepairDialog({ agentId, onClose, onStarted }: { agentId: string; onClose: () => void; onStarted: () => void }) {
+  const toast = useToast();
+  const [steps, setSteps] = useState<Set<string>>(new Set(['dism_restore', 'reset_components', 'rescan']));
+  const [reboot, setReboot] = useState<'never' | 'if_required'>('never');
+  const [busy, setBusy] = useState(false);
+  const start = async () => {
+    setBusy(true);
+    try {
+      // Sent in canonical order whatever order they were ticked in, so what
+      // is signed reads the same as what the device runs.
+      await api.servicingRepair(agentId, { steps: REPAIR_STEPS.filter((s) => steps.has(s.id)).map((s) => s.id), reboot });
+      toast.info('Repair started', 'It can take several minutes. The result appears under the patch list.');
+      onStarted();
+      onClose();
+    } catch (err) {
+      toast.error('Repair failed to start', errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal
+      title="Repair Windows servicing"
+      onClose={onClose}
+      footer={
+        <>
+          <Button onClick={onClose}>Cancel</Button>
+          <Button variant="primary" busy={busy} disabled={!steps.size} onClick={start}>
+            Start repair
+          </Button>
+        </>
+      }
+    >
+      <p className="muted small" style={{ marginTop: 0 }}>
+        Use this when updates fail with a servicing error such as 0x80073712 or 0x800F081F. The repair holds the device's patch jobs while it runs.
+      </p>
+      {REPAIR_STEPS.map((s) => (
+        <label key={s.id} style={{ display: 'flex', gap: 8, alignItems: 'flex-start', marginBottom: 8 }}>
+          <input
+            type="checkbox"
+            checked={steps.has(s.id)}
+            onChange={(e) =>
+              setSteps((cur) => {
+                const n = new Set(cur);
+                if (e.target.checked) n.add(s.id);
+                else n.delete(s.id);
+                return n;
+              })
+            }
+          />
+          <span>
+            {s.label}
+            <br />
+            <span className="muted small">{s.hint}</span>
+          </span>
+        </label>
+      ))}
+      <Field label="Reboot">
+        <select value={reboot} onChange={(e) => setReboot(e.target.value as 'never' | 'if_required')}>
+          <option value="never">Never, only report that one is needed</option>
+          <option value="if_required">If required</option>
+        </select>
+      </Field>
+    </Modal>
+  );
+}
+
+function LastRepair({ rec }: { rec: ServicingRecord }) {
+  const steps = rec.result?.steps ?? [];
+  return (
+    <div className="card" style={{ marginTop: 12 }}>
+      <div className="card-head">
+        Last servicing repair <Chip tone={rec.status === 'ok' ? 'ok' : rec.status === 'failed' ? 'danger' : 'info'}>{rec.status}</Chip>
+      </div>
+      <div className="card-body">
+        <div className="muted small">
+          {rec.trigger === 'auto' ? 'Started automatically' : 'Started by ' + (rec.by || 'an operator')} {dateTime(rec.started_at)}
+          {rec.code && ` after ${rec.code}`}
+          {rec.why && `: ${rec.why}`}
+        </div>
+        {rec.result?.error && <div style={{ color: 'var(--danger)', marginTop: 6 }}>{rec.result.error}</div>}
+        {steps.length > 0 && (
+          <table className="table compact" style={{ marginTop: 8 }}>
+            <tbody>
+              {steps.map((s) => (
+                <tr key={s.name}>
+                  <td className="mono">{s.name}</td>
+                  <td>
+                    <Chip tone={stepTone(s.status)}>{s.status}</Chip>
+                  </td>
+                  <td className="muted small">{s.status === 'skipped' ? '' : `exit ${s.exit_code}, ${Math.round(s.duration_ms / 1000)} s`}</td>
+                  <td className="muted small mono truncate" style={{ maxWidth: 420 }} title={s.tail}>
+                    {s.tail?.split('\n').filter(Boolean).slice(-1)[0] ?? ''}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {rec.result?.reboot_required && <div className="banner warn" style={{ marginTop: 8 }}>The repair finished and the device needs a reboot.</div>}
+      </div>
+    </div>
+  );
+}
+
 export function DevicePatches({ agent, canWrite }: TabProps) {
   const toast = useToast();
   const confirm = useConfirm();
@@ -33,6 +147,11 @@ export function DevicePatches({ agent, canWrite }: TabProps) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [scanning, setScanning] = useState(false);
   const [reboot, setReboot] = useState(false);
+  const [repairing, setRepairing] = useState(false);
+  const isWindows = agent.os === 'windows';
+  const servicing = useAsync(() => (isWindows ? api.servicingRecords(agent.id, 1) : Promise.resolve([] as ServicingRecord[])), [agent.id, isWindows]);
+  useLiveReload(['patches'], servicing.reload, { agentId: agent.id });
+  const lastRepair = servicing.data?.[0];
 
   const patches = data.data?.patches ?? [];
   const rows = useMemo(
@@ -190,6 +309,11 @@ export function DevicePatches({ agent, canWrite }: TabProps) {
             <IconRefresh /> Scan now
           </Button>
         )}
+        {canWrite && isWindows && (
+          <Button onClick={() => setRepairing(true)} disabled={!agent.online || lastRepair?.status === 'running'} title="Repair the Windows Update servicing stack on this device">
+            Repair Windows servicing
+          </Button>
+        )}
       </div>
       {canWrite && (
         <div className="toolbar">
@@ -227,6 +351,8 @@ export function DevicePatches({ agent, canWrite }: TabProps) {
         emptyTitle={patches.length ? 'No patches in this view' : 'No patch data yet'}
         emptyBody={!patches.length ? 'Run a scan to see available updates.' : undefined}
       />
+      {lastRepair && <LastRepair rec={lastRepair} />}
+      {repairing && <RepairDialog agentId={agent.id} onClose={() => setRepairing(false)} onStarted={() => void servicing.reload()} />}
     </>
   );
 }

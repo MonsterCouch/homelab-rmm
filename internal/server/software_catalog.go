@@ -244,22 +244,26 @@ func (s *Server) handleAgentSoftwareInstall(w http.ResponseWriter, r *http.Reque
 		Name:     fmt.Sprintf("Install: %s", appName),
 	}
 
-	runID, err := s.runs.Start(agentID, runReq)
-	if err != nil {
-		fail(w, err)
-		return
-	}
+	// An operator is present, so this is signed like any script run (the
+	// catalog item's standing approval is for the client portal, whose
+	// contacts never sign).
+	s.startOneRun(w, r, runReq, agentID, a.OrgID, func(w http.ResponseWriter, r *http.Request, runID string, err error) {
+		if err != nil {
+			fail(w, err)
+			return
+		}
 
-	s.audit(r, "software.install", fmt.Sprintf("%s on %s", appName, a.DisplayName), map[string]any{
-		"agent_id": agentID,
-		"app":      appName,
-		"run_id":   runID,
-	})
+		s.audit(r, "software.install", fmt.Sprintf("%s on %s", appName, a.DisplayName), map[string]any{
+			"agent_id": agentID,
+			"app":      appName,
+			"run_id":   runID,
+		})
 
-	writeJSON(w, 202, map[string]any{
-		"run_id":   runID,
-		"status":   "started",
-		"app_name": appName,
+		writeJSON(w, 202, map[string]any{
+			"run_id":   runID,
+			"status":   "started",
+			"app_name": appName,
+		})
 	})
 }
 
@@ -317,21 +321,22 @@ func (s *Server) handleAgentSoftwareUninstall(w http.ResponseWriter, r *http.Req
 		Name:     fmt.Sprintf("Uninstall: %s", appName),
 	}
 
-	runID, err := s.runs.Start(agentID, runReq)
-	if err != nil {
-		fail(w, err)
-		return
-	}
+	s.startOneRun(w, r, runReq, agentID, a.OrgID, func(w http.ResponseWriter, r *http.Request, runID string, err error) {
+		if err != nil {
+			fail(w, err)
+			return
+		}
 
-	s.audit(r, "software.uninstall", fmt.Sprintf("%s on %s", appName, a.DisplayName), map[string]any{
-		"agent_id": agentID,
-		"app":      appName,
-		"run_id":   runID,
-	})
+		s.audit(r, "software.uninstall", fmt.Sprintf("%s on %s", appName, a.DisplayName), map[string]any{
+			"agent_id": agentID,
+			"app":      appName,
+			"run_id":   runID,
+		})
 
-	writeJSON(w, 202, map[string]any{
-		"run_id":   runID,
-		"status":   "started",
-		"app_name": appName,
+		writeJSON(w, 202, map[string]any{
+			"run_id":   runID,
+			"status":   "started",
+			"app_name": appName,
+		})
 	})
 }

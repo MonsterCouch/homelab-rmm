@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import QRCode from 'qrcode';
 import { api } from '../api/client';
+import { SecurityKeys } from '../components/SecurityKeys';
 import { Button, Chip, CopyButton, Field } from '../components/ui';
 import { dateTime } from '../lib/format';
 import { useAuth } from '../state/auth';
@@ -37,7 +38,10 @@ export function Account() {
           </div>
           <ChangePassword />
         </div>
-        <TwoFactor enabled={user.totp_enabled} onChanged={refresh} />
+        <div className="stack" style={{ gap: 14 }}>
+          <TwoFactor enabled={user.totp_enabled} onChanged={refresh} />
+          {user.role !== 'poc' && <SecurityKeys />}
+        </div>
       </div>
     </>
   );

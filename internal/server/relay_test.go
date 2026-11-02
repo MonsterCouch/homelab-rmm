@@ -13,6 +13,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/MonsterCouch/homelab-rmm/internal/actionauth"
 	"github.com/MonsterCouch/homelab-rmm/internal/protocol"
 )
 
@@ -227,6 +228,17 @@ type shellAgent struct {
 	id     string
 	ws     *websocket.Conn
 	closes chan string
+	// opens and rtcs record every shell.open payload and shell.rtc frame the
+	// server sent; sig streams WebRTC signaling back the way a device does.
+	opens chan protocol.ShellOpen
+	rtcs  chan protocol.ShellRTC
+	send  func(env protocol.Envelope)
+}
+
+// sig streams one WebRTC signal for a session, as the agent does on the
+// shell.open stream.
+func (a *shellAgent) sig(session string, s protocol.ShellSignal) {
+	a.send(protocol.Envelope{T: protocol.TypeStream, ID: session, D: protocol.Must(protocol.ShellChunk{Session: session, Sig: &s})})
 }
 
 func newShellAgent(t *testing.T, ts *httptest.Server, token, hostname, openErr string) *shellAgent {
@@ -236,13 +248,14 @@ func newShellAgent(t *testing.T, ts *httptest.Server, token, hostname, openErr s
 		t.Fatalf("agent dial: %v", err)
 	}
 	t.Cleanup(func() { ws.Close() })
-	a := &shellAgent{ws: ws, closes: make(chan string, 8)}
+	a := &shellAgent{ws: ws, closes: make(chan string, 8), opens: make(chan protocol.ShellOpen, 8), rtcs: make(chan protocol.ShellRTC, 16)}
 	var mu sync.Mutex
 	send := func(env protocol.Envelope) {
 		mu.Lock()
 		defer mu.Unlock()
 		ws.WriteJSON(env)
 	}
+	a.send = send
 	send(protocol.Envelope{T: protocol.TypeHello, D: protocol.Must(protocol.Hello{
 		Hostname: hostname, OS: "windows", Arch: "amd64", Version: "test", ProtocolVersion: protocol.Version,
 	})})
@@ -267,6 +280,12 @@ func newShellAgent(t *testing.T, ts *httptest.Server, token, hostname, openErr s
 			case protocol.ReqPing:
 				send(protocol.Envelope{T: protocol.TypePong, ID: env.ID})
 			case protocol.ReqShellOpen:
+				var open protocol.ShellOpen
+				json.Unmarshal(env.D, &open)
+				select {
+				case a.opens <- open:
+				default:
+				}
 				if openErr != "" {
 					send(protocol.Envelope{T: protocol.TypeReply, ID: env.ID, Err: openErr})
 					continue
@@ -276,6 +295,13 @@ func newShellAgent(t *testing.T, ts *httptest.Server, token, hostname, openErr s
 				var in protocol.ShellInput
 				json.Unmarshal(env.D, &in)
 				send(protocol.Envelope{T: protocol.TypeStream, ID: in.Session, D: protocol.Must(protocol.ShellChunk{Session: in.Session, Data: "echo:" + in.Data})})
+			case protocol.ReqShellRTC:
+				var in protocol.ShellRTC
+				json.Unmarshal(env.D, &in)
+				select {
+				case a.rtcs <- in:
+				default:
+				}
 			case protocol.ReqShellClose:
 				var in protocol.ShellClose
 				json.Unmarshal(env.D, &in)
@@ -609,4 +635,185 @@ func TestDesktopViewerSocketDropsAViewerThatStoppedAnswering(t *testing.T) {
 		defer s.desktops.mu.Unlock()
 		return len(s.desktops.pending) == 0
 	})
+}
+
+// ---- terminal over WebRTC ----
+
+func dialShellRTC(t *testing.T, ts *httptest.Server, b *browser, agentID, query string) *websocket.Conn {
+	t.Helper()
+	term, _, err := websocket.DefaultDialer.Dial(wsURL(ts)+"/ws/shell/"+agentID+query, wsCookies(t, ts, b))
+	if err != nil {
+		t.Fatalf("terminal dial: %v", err)
+	}
+	t.Cleanup(func() { term.Close() })
+	return term
+}
+
+func recvRTC(t *testing.T, a *shellAgent) protocol.ShellRTC {
+	t.Helper()
+	select {
+	case r := <-a.rtcs:
+		return r
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent never received a shell.rtc frame")
+		return protocol.ShellRTC{}
+	}
+}
+
+func TestShellRTCSignalingRelay(t *testing.T) {
+	s, ts, b := newTestServerWith(t, Config{ICEServers: []string{"stun:stun.example.test:3478", "turn:turn.example.test:3478|alice|secret"}})
+	var tok struct{ Token string }
+	b.mustJSON("POST", "/api/enroll", map[string]any{"name": "lab", "uses": 5}, &tok)
+	agent := newShellAgent(t, ts, tok.Token, "rtcbox", "")
+	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(agent.id) })
+
+	term := dialShellRTC(t, ts, b, agent.id, "?webrtc=1")
+	// Signaling before the open is ignored: nothing reaches the device.
+	term.WriteJSON(map[string]any{"t": "rtc_offer", "sdp": "early"})
+	term.WriteJSON(map[string]any{"t": "open", "shell": "powershell", "cols": 80, "rows": 24})
+
+	cfg := readShell(t, term)
+	if cfg["t"] != "webrtc_config" {
+		t.Fatalf("first frame = %v, want webrtc_config before the shell opens", cfg)
+	}
+	servers, _ := cfg["ice_servers"].([]any)
+	if len(servers) != 2 {
+		t.Fatalf("ice_servers = %v", cfg["ice_servers"])
+	}
+	opened := readShell(t, term)
+	if opened["t"] != "opened" {
+		t.Fatalf("expected opened, got %v", opened)
+	}
+	session, _ := opened["session"].(string)
+	if p := readShell(t, term); p["t"] != "out" {
+		t.Fatalf("expected the prompt, got %v", p)
+	}
+
+	open := <-agent.opens
+	if !open.RTC || len(open.ICEServers) != 2 {
+		t.Fatalf("ShellOpen = %+v, want RTC with both ICE servers", open)
+	}
+	if turn := open.ICEServers[1]; turn.Username != "alice" || turn.Credential != "secret" || turn.URLs[0] != "turn:turn.example.test:3478" {
+		t.Fatalf("TURN server lost its credentials on the way to the device: %+v", turn)
+	}
+	select {
+	case r := <-agent.rtcs:
+		t.Fatalf("an offer sent before opened reached the device: %+v", r)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Browser to device.
+	term.WriteJSON(map[string]any{"t": "rtc_offer", "sdp": "v=0 offer"})
+	if r := recvRTC(t, agent); r.Kind != "offer" || r.SDP != "v=0 offer" || r.Session != session {
+		t.Fatalf("offer forwarded as %+v", r)
+	}
+	term.WriteJSON(map[string]any{"t": "rtc_candidate", "candidate": map[string]any{"candidate": "candidate:1 1 udp 1 10.0.0.1 9 typ host", "sdpMid": "0"}})
+	if r := recvRTC(t, agent); r.Kind != "candidate" || !strings.Contains(string(r.Candidate), "10.0.0.1") || r.Session != session {
+		t.Fatalf("candidate forwarded as %+v", r)
+	}
+	term.WriteJSON(map[string]any{"t": "rtc_fallback"})
+	if r := recvRTC(t, agent); r.Kind != "fallback" || r.Session != session {
+		t.Fatalf("fallback forwarded as %+v", r)
+	}
+	// An oversize SDP is refused here and never forwarded.
+	term.WriteJSON(map[string]any{"t": "rtc_offer", "sdp": strings.Repeat("a", shellRTCSDPLimit+1)})
+	if m := readShell(t, term); m["t"] != "rtc_unavailable" {
+		t.Fatalf("oversize offer: %v", m)
+	}
+	select {
+	case r := <-agent.rtcs:
+		t.Fatalf("oversize SDP reached the device: %d bytes", len(r.SDP))
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Device to browser.
+	agent.sig(session, protocol.ShellSignal{Kind: "answer", SDP: "v=0 answer"})
+	if m := readShell(t, term); m["t"] != "rtc_answer" || m["sdp"] != "v=0 answer" {
+		t.Fatalf("answer: %v", m)
+	}
+	agent.sig(session, protocol.ShellSignal{Kind: "candidate", Candidate: json.RawMessage(`{"candidate":"candidate:2 1 udp 1 10.0.0.2 9 typ host","sdpMid":"0"}`)})
+	if m := readShell(t, term); m["t"] != "rtc_candidate" || !strings.Contains(fmt.Sprint(m["candidate"]), "10.0.0.2") {
+		t.Fatalf("candidate: %v", m)
+	}
+	agent.sig(session, protocol.ShellSignal{Kind: "unavailable", Reason: "no udp"})
+	if m := readShell(t, term); m["t"] != "rtc_unavailable" || m["reason"] != "no udp" {
+		t.Fatalf("unavailable: %v", m)
+	}
+	agent.sig(session, protocol.ShellSignal{Kind: "switch"})
+	if m := readShell(t, term); m["t"] != "rtc_switch" {
+		t.Fatalf("switch: %v", m)
+	}
+	// A signal frame carries no output: the terminal must not see an "out".
+	agent.sig(session, protocol.ShellSignal{Kind: "bogus"})
+
+	// The switch is audited and shows up in the device's event log.
+	var audited int
+	waitFor(t, "shell.rtc audit row", func() bool {
+		s.db.QueryRow(`SELECT COUNT(*) FROM audit WHERE action = 'shell.rtc' AND target = ?`, agent.id).Scan(&audited)
+		return audited == 1
+	})
+	var events int
+	waitFor(t, "upgrade event", func() bool {
+		s.db.QueryRow(`SELECT COUNT(*) FROM agent_events WHERE agent_id = ? AND message LIKE 'Terminal session upgraded to WebRTC by %'`, agent.id).Scan(&events)
+		return events == 1
+	})
+	if events != 1 {
+		t.Fatalf("upgrade events = %d, want 1", events)
+	}
+
+	// Input still works over the relay afterwards, and the bogus signal
+	// produced no frame of its own.
+	term.WriteJSON(map[string]any{"t": "in", "data": "x"})
+	if m := readShell(t, term); m["t"] != "out" || !strings.Contains(fmt.Sprint(m["data"]), "echo:x") {
+		t.Fatalf("after the signals: %v", m)
+	}
+}
+
+func TestShellWithoutWebRTCQueryGetsNoConfig(t *testing.T) {
+	s, ts, b := newTestServerWith(t, Config{})
+	var tok struct{ Token string }
+	b.mustJSON("POST", "/api/enroll", map[string]any{"name": "lab", "uses": 5}, &tok)
+	agent := newShellAgent(t, ts, tok.Token, "plainbox", "")
+	waitFor(t, "agent online", func() bool { return s.hub.IsOnline(agent.id) })
+
+	term := dialShellRTC(t, ts, b, agent.id, "")
+	term.WriteJSON(map[string]any{"t": "open", "shell": "powershell", "cols": 80, "rows": 24})
+	if m := readShell(t, term); m["t"] != "opened" {
+		t.Fatalf("first frame = %v, want opened and no webrtc_config", m)
+	}
+	open := <-agent.opens
+	if open.RTC || len(open.ICEServers) != 0 {
+		t.Fatalf("ShellOpen = %+v, want no RTC without ?webrtc=1", open)
+	}
+	// Signaling is not honoured on a session that did not ask for WebRTC.
+	readShell(t, term) // prompt
+	term.WriteJSON(map[string]any{"t": "rtc_offer", "sdp": "v=0"})
+	select {
+	case r := <-agent.rtcs:
+		t.Fatalf("offer forwarded for a non-WebRTC session: %+v", r)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// Under enforcement a shell opens only with a grant; without one nothing about
+// WebRTC reaches the device, whatever the viewer sends.
+func TestShellRTCEnforceWithoutGrantBlocksEverything(t *testing.T) {
+	f := newSignFixture(t, actionauth.ModeEnforce, 1, 10)
+	ag := f.addAgent("box1")
+
+	ws := f.dialWS(t, f.admin, "/ws/shell/"+ag.ID()+"?webrtc=1")
+	ws.WriteJSON(map[string]any{"t": "rtc_offer", "sdp": "v=0"})
+	ws.WriteJSON(map[string]any{"t": "open", "cols": 80, "rows": 24})
+	var msg map[string]any
+	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := ws.ReadJSON(&msg); err != nil || msg["t"] != "error" || !strings.Contains(fmt.Sprint(msg["message"]), "signature required") {
+		t.Fatalf("shell without a grant: %v %v", msg, err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := len(ag.requests(protocol.ReqShellOpen)); n != 0 {
+		t.Fatal("a shell was opened without a grant")
+	}
+	if n := len(ag.requests(protocol.ReqShellRTC)); n != 0 {
+		t.Fatalf("%d shell.rtc frames reached the device without a gated shell.open", n)
+	}
 }

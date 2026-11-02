@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { api } from '../api/client';
 import type { Agent, Group, Metrics, PowerAction } from '../api/types';
@@ -12,6 +12,7 @@ import { RunDialog } from '../components/RunDialog';
 import { Button, Chip, Dropdown, ErrorBox, Field, MiniBar, OnlineDot, TagInput } from '../components/ui';
 import { useAsync, useDebounced, useLocalState } from '../hooks/useAsync';
 import { useEvents, useLiveReload } from '../hooks/useEvents';
+import { fleetUpdateRunning, fleetUpdateTone, subscribeFleetUpdate, summarizeFleetUpdate, updateFleet } from '../lib/fleetUpdate';
 import { memPct, osLabel, relTime } from '../lib/format';
 import { useAuth } from '../state/auth';
 import { errMsg, useToast } from '../state/toast';
@@ -38,6 +39,10 @@ export function Devices() {
   const toast = useToast();
   const confirm = useConfirm();
   const navigate = useNavigate();
+  // A fleet update can sit on signing dialogs and slow devices for a while, and
+  // can be started from here or from Server & Fleet Updates: the button follows
+  // the run itself, so it cannot be clicked into a second run of the same thing.
+  const fleetBusy = useSyncExternalStore(subscribeFleetUpdate, fleetUpdateRunning);
   const [params, setParams] = useSearchParams();
   const agents = useAsync(() => api.agents(), []);
   const groups = useAsync(() => api.groups(), []);
@@ -399,18 +404,19 @@ export function Devices() {
                   !(await confirm({
                     title: 'Update All Online Agents',
                     message:
-                      'Broadcast an update command to all currently online agents? Agents will download the latest matching binary from the server, install it in-place, and restart.',
+                      'Broadcast an update command to all currently online agents? Agents will download the latest matching binary from the server, install it in-place, and restart. Devices in organizations that sign actions are updated with one signature per organization and build; you will be asked to sign each one.',
                     confirmLabel: 'Broadcast Update',
                   }))
                 )
                   return;
                 try {
-                  const res = await api.updateAllAgents();
-                  toast.info(res.message);
+                  const s = await updateFleet();
+                  toast.push(fleetUpdateTone(s), summarizeFleetUpdate(s));
                 } catch (err) {
                   toast.error(errMsg(err));
                 }
               }}
+              busy={fleetBusy}
               title="Broadcast update command to all online agents"
             >
               <IconUpload /> Update Agents

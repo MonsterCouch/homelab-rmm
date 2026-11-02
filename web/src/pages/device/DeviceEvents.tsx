@@ -7,6 +7,7 @@ import { Button, Chip, ErrorBox } from '../../components/ui';
 import { useAsync, useDebounced } from '../../hooks/useAsync';
 import { useLiveReload } from '../../hooks/useEvents';
 import { dateTime, relTime } from '../../lib/format';
+import { describeUpdateSource } from '../../lib/fleetUpdate';
 import type { TabProps } from './DeviceDetail';
 
 type CategoryFilter = 'all' | 'run' | 'patch' | 'drift' | 'remote' | 'software' | 'system';
@@ -48,6 +49,8 @@ function kindMeta(k: string): { label: string; tone: 'danger' | 'warn' | 'info' 
       return { label: 'Isolation', tone: 'danger' };
     case 'service':
       return { label: 'Service', tone: 'info' };
+    case 'update':
+      return { label: 'Agent Update', tone: 'info' };
     default:
       return { label: k, tone: '' };
   }
@@ -109,6 +112,9 @@ export function DeviceEvents({ agent }: TabProps) {
             <span className="wrap" style={{ fontWeight: 500 }}>
               {e.message}
             </span>
+            {e.kind === 'update' && (
+              <span className="muted small wrap">{describeUpdateSource(e.fields?.source)}</span>
+            )}
             {runId && (
               <div>
                 <Button size="xs" variant="ghost" onClick={() => setActiveRunId(runId)}>

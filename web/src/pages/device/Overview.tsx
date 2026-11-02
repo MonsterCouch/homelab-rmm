@@ -108,6 +108,18 @@ export function Overview({ agent, reload, canWrite }: TabProps) {
                     <dd>{inv.last_user}</dd>
                   </>
                 )}
+                {inv.cache && inv.cache.role && (
+                  <>
+                    <dt>Update cache</dt>
+                    <dd title="Hits and misses count requests this device answered (leader) or fetches it made (member)">
+                      <Chip tone={inv.cache.role === 'leader' ? 'info' : ''}>{inv.cache.role}</Chip>{' '}
+                      <span className="muted">
+                        {num(inv.cache.hits)} hits, {num(inv.cache.misses)} misses
+                        {inv.cache.role === 'leader' ? `, ${bytes(inv.cache.bytes_served)} served, ${bytes(inv.cache.bytes_stored)} stored` : ''}
+                      </span>
+                    </dd>
+                  </>
+                )}
                 <dt>Reboot</dt>
                 <dd>{agent.pending_reboot ? <Chip tone="warn">pending</Chip> : <span className="muted">not required</span>}</dd>
                 <dt>Collected</dt>

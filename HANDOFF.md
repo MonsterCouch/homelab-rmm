@@ -20,7 +20,7 @@ automation combined with ScreenConnect's remote desktop.
   a service, outbound-only connection, inventory, metrics, scripts (PowerShell, cmd, bash, sh,
   python), services, processes, event log / journal, files, power, Wake-on-LAN, patching
   (Windows Update Agent, apt/dnf/pacman/zypper), device network quarantine (`isolate`),
-  remote shell (ConPTY / pty), remote desktop helper (`internal/agent/desktop`, spawned into the
+  remote shell (ConPTY / pty, WebRTC data channel with relay fallback: `docs/TERMINAL-PROTOCOL.md`), device-page Update agent button, remote desktop helper (`internal/agent/desktop`, spawned into the
   interactive session with privacy banner and multi-monitor switching), portal pipe server
   (`internal/portalpipe`), and the baselines engine (`internal/agent/baseline*.go`).
 - **Desktop Companion** (`cmd/rmm-desktop`): lightweight tray client for Windows end users and
@@ -161,7 +161,7 @@ the new version and fix the compare links at the bottom).
   and the fallback is `tailscale cert` on the server, not a relay in the app.
 - Linux paths that need systemd, ufw/firewalld or a package install were unit-tested against
   canned output; the container used for development had no systemd and no network for apt.
-- Wayland desktops are refused by design (X11 works).
+- Wayland desktops are captured through the ScreenCast portal and a pure-Go PipeWire client, which is verified on GNOME 50 and KDE Plasma 6.6 on Wayland (Ubuntu 26.04.1, PipeWire 1.6.2, Hyper-V VM, 100% and 200% scaling) but not on DMA-BUF-only compositors or multi-monitor; the first session needs the person at the machine to accept the share prompt once. It falls back to the Screenshot portal when it fails (X11 is unchanged). See docs/OPERATIONS.md, "Wayland screen capture".
 - Docker image builds were not executed (no daemon available); the Dockerfile was reviewed.
 
 ## Known open items

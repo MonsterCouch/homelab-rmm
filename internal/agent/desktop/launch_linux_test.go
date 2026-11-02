@@ -4,6 +4,7 @@ package desktop
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,7 +72,7 @@ func TestHelperEnvIsMinimalAndCarriesTheToken(t *testing.T) {
 // The token must never be an argument: /proc/<pid>/cmdline is world
 // readable, so an argument would hand the bridge token to every local user.
 func TestHelperArgsCarryNoToken(t *testing.T) {
-	args := strings.Join(helperArgs("https://rmm.example:8443", "abcd", 60), " ")
+	args := strings.Join(helperArgs(Config{ServerURL: "https://rmm.example:8443", Fingerprint: "abcd", Quality: 60}), " ")
 	if strings.Contains(args, "--token") || strings.Contains(args, "s3cret") {
 		t.Fatalf("token on the command line: %s", args)
 	}
@@ -178,10 +179,15 @@ func TestFindSessionPrefersTheConfig(t *testing.T) {
 func TestLaunchWithoutASessionNamesTheConfigKeys(t *testing.T) {
 	t.Setenv("RMM_AGENT_DIR", t.TempDir())
 	t.Setenv("DISPLAY", "")
+	t.Setenv("XDG_SESSION_TYPE", "") // a test run from a desktop terminal must not take the in-process path
 	if s, err := findSession(); err == nil {
 		t.Skipf("this machine has a usable graphical session (%s); nothing to assert", s.display)
+	} else if errors.Is(err, errWayland) && !errors.Is(err, errWaylandGreeter) {
+		// launch serves a user's Wayland session through launchWayland, so
+		// there is no "no session" error to assert on this machine.
+		t.Skipf("this machine has a user Wayland session (%v); nothing to assert", err)
 	}
-	_, err := launch("/nonexistent/rmm-agent", "https://rmm.example:8443", "tok", "fp", 60)
+	_, err := launch("/nonexistent/rmm-agent", Config{ServerURL: "https://rmm.example:8443", Token: "tok", Fingerprint: "fp", Quality: 60})
 	if err == nil {
 		t.Fatal("launch succeeded without a session")
 	}
@@ -210,8 +216,8 @@ func TestSelectSession(t *testing.T) {
 	if err != nil || s.id != "c1" || s.class != greeterClass {
 		t.Fatalf("greeter not used as the fallback: %+v %v", s, err)
 	}
-	// Wayland: a greeter means "no user is logged in", a user session means
-	// "not supported yet"; both stay recognisable as errWayland.
+	// Wayland: a greeter means "no user is logged in", a user session is
+	// handed to launchWayland; both stay recognisable as errWayland.
 	wl := map[string]map[string]string{
 		"w1": {"Type": "wayland", "Active": "yes", "Class": greeterClass, "User": "0"},
 		"w2": {"Type": "wayland", "Active": "yes", "Class": "user", "User": "0"},

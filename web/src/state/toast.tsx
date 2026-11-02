@@ -7,6 +7,10 @@ export interface Toast {
   kind: ToastKind;
   title: string;
   detail?: string;
+  /** stays until dismissed instead of expiring */
+  sticky?: boolean;
+  /** shown in a box with a copy button */
+  copy?: string;
 }
 
 /** A toast that has been raised, kept in the activity log after it expires. */
@@ -16,7 +20,7 @@ export interface Activity extends Toast {
 }
 
 interface ToastApi {
-  push: (kind: ToastKind, title: string, detail?: string) => void;
+  push: (kind: ToastKind, title: string, detail?: string, extra?: { sticky?: boolean; copy?: string }) => void;
   info: (title: string, detail?: string) => void;
   success: (title: string, detail?: string) => void;
   error: (title: string, detail?: string) => void;
@@ -94,11 +98,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   );
 
   const push = useCallback(
-    (kind: ToastKind, title: string, detail?: string) => {
+    (kind: ToastKind, title: string, detail?: string, extra?: { sticky?: boolean; copy?: string }) => {
+      if (kind === 'error' && (title === PARKED_MESSAGE || detail === PARKED_MESSAGE)) return;
       const id = ++seq.current;
-      setItems((list) => [...list, { id, kind, title, detail }].slice(-MAX_VISIBLE));
+      setItems((list) => [...list, { id, kind, title, detail, ...extra }].slice(-MAX_VISIBLE));
       setLog((list) => [{ id, kind, title, detail, at: Date.now() }, ...list].slice(0, MAX_HISTORY));
       setUnread((n) => Math.min(n + 1, 99));
+      if (extra?.sticky) return;
       arm(id, TTL_MS[kind]);
       // A toast raised while the pointer rests on the stack must not start
       // counting down either, or it disappears from under the reader.
@@ -209,6 +215,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               <div className="toast-body">
                 <div className="toast-title">{t.title}</div>
                 {t.detail && <div className="toast-detail">{t.detail}</div>}
+                {t.copy && <ToastCopy text={t.copy} />}
               </div>
               <button className="toast-close" aria-label="Dismiss" onClick={() => dismiss(t.id)}>
                 ×
@@ -218,6 +225,26 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         </div>
       </ActivityCtx.Provider>
     </Ctx.Provider>
+  );
+}
+
+function ToastCopy({ text }: { text: string }) {
+  const [done, setDone] = useState(false);
+  const copy = () => {
+    void navigator.clipboard?.writeText(text).then(
+      () => setDone(true),
+      () => setDone(false),
+    );
+  };
+  return (
+    <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 6 }}>
+      <code className="mono small" style={{ flex: 1, minWidth: 0, wordBreak: 'break-all', userSelect: 'all' }}>
+        {text}
+      </code>
+      <button type="button" className="btn sm" onClick={copy}>
+        {done ? 'Copied' : 'Copy'}
+      </button>
+    </div>
   );
 }
 
@@ -235,6 +262,13 @@ export function useActivity(): ActivityApi {
 }
 
 /** Message for an unknown thrown value. */
+/**
+ * The message of the error request() throws when an action was parked for
+ * rmm-signer. The "Waiting for rmm-signer" info toast already says so, so an
+ * error toast carrying this text is dropped instead of showing a red failure.
+ */
+export const PARKED_MESSAGE = 'The request is waiting for rmm-signer.';
+
 export function errMsg(err: unknown): string {
   if (err instanceof Error) return err.message;
   if (typeof err === 'string') return err;

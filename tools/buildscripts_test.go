@@ -24,16 +24,18 @@ func readScript(t *testing.T, path string) string {
 	return strings.ReplaceAll(string(b), "\r\n", "\n")
 }
 
-// Every build entry point stamps both version symbols, and defaults to the same
+// Every build entry point stamps the version symbols (main.Version is the one
+// rmm-signer prints), and defaults to the same
 // git describe. A binary is otherwise indistinguishable from any other build:
 // the version is what `rmm-agent --version`, GET /api/system.version and the
 // console all report.
-func TestEveryBuildEntryPointStampsBothVersionSymbols(t *testing.T) {
+func TestEveryBuildEntryPointStampsEveryVersionSymbol(t *testing.T) {
 	for _, f := range []string{"build.sh", "build.ps1", "../Makefile"} {
 		src := readScript(t, f)
 		for _, want := range []string{
 			"internal/server.Version=",
 			"internal/agent.Version=",
+			"-X main.Version=",
 			"git describe --tags --always",
 		} {
 			if !strings.Contains(src, want) {
@@ -88,6 +90,34 @@ func TestBothPackagersRefuseStaleBinaries(t *testing.T) {
 	for _, want := range []string{"ALLOW_STALE_BUILD", "function Assert-Fresh", "Assert-Fresh $srv 'server'", "Assert-Fresh $a 'agents'"} {
 		if !strings.Contains(ps, want) {
 			t.Errorf("build.ps1 does not contain %q (the twin of fresh() in build.sh)", want)
+		}
+	}
+}
+
+// rmm-signer has to be built, packaged and checksummed the same way by both
+// scripts, for windows/amd64 and windows/arm64 only: the WebAuthn API it signs
+// with is part of Windows, so a linux binary would be shipped dead weight.
+func TestBothScriptsBuildAndPackageTheSigner(t *testing.T) {
+	sh := readScript(t, "build.sh")
+	for _, want := range []string{
+		`SIGNER_PLATFORMS="windows/amd64 windows/arm64"`,
+		`signer)    build_platforms rmm-signer`,
+		`fresh "$s" signer`,
+		`"$DIST"/rmm-signer-*`,
+	} {
+		if !strings.Contains(sh, want) {
+			t.Errorf("build.sh does not contain %q", want)
+		}
+	}
+	ps := readScript(t, "build.ps1")
+	for _, want := range []string{
+		`$signerPlatforms = @('windows/amd64', 'windows/arm64')`,
+		`'signer'    { Build-Signer }`,
+		`Assert-Fresh $s 'signer'`,
+		`rmm-(server|agent|signer)-`,
+	} {
+		if !strings.Contains(ps, want) {
+			t.Errorf("build.ps1 does not contain %q", want)
 		}
 	}
 }

@@ -26,6 +26,8 @@ import { Tickets } from './pages/Tickets';
 import { TicketDetail } from './pages/TicketDetail';
 import { Audit } from './pages/Audit';
 import { Account } from './pages/Account';
+import { Approvals } from './pages/Approvals';
+import { TrustSigning } from './pages/TrustSigning';
 import { ClientPortal } from './pages/portal/ClientPortal';
 
 // The device detail pulls in xterm and the desktop viewer; keep it off the
@@ -108,6 +110,7 @@ export function App() {
         <Route path="baselines/:id/edit" element={<BaselineEditor />} />
         <Route path="alerts" element={<Alerts />} />
         <Route path="patches" element={<Patches />} />
+        <Route path="approvals" element={<Approvals />} />
         <Route path="software-catalog" element={<SoftwareCatalog />} />
         <Route path="discovery" element={<Discovery />} />
         <Route path="tickets" element={<Tickets />} />
@@ -125,6 +128,14 @@ export function App() {
           element={
             <AdminOnly>
               <Settings />
+            </AdminOnly>
+          }
+        />
+        <Route
+          path="trust"
+          element={
+            <AdminOnly>
+              <TrustSigning />
             </AdminOnly>
           }
         />

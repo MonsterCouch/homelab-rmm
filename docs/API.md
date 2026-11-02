@@ -60,13 +60,16 @@ technicians never receive telemetry or state changes for devices outside their s
 
 See `routes()` in `internal/server/api.go`. Highlights:
 
-- Devices: `GET /api/agents`, `GET /api/agents/{id}` (includes `inventory` and `last_metrics`),
-  `PATCH /api/agents/{id}` (`AgentUpdate`), `DELETE`, `GET /api/agents/{id}/metrics?from=&to=&points=`,
+- Devices: `GET /api/agents`, `GET /api/agents/{id}` (includes `inventory` and `last_metrics`; an online device also carries `transport`, `"websocket"` or `"quic"`, the transport of its live connection),
+  `PATCH /api/agents/{id}` (`AgentUpdate`), `DELETE`, `GET /api/agents/{id}/metrics?from=&to=&points=` (the same on every telemetry engine),
   `POST /api/agents/{id}/refresh`, `GET .../processes`, `POST .../processes/kill {pid}`,
   `GET .../services`, `POST .../services/action {name, action}`,
   `GET .../eventlog?log=System&level=error&limit=200&search=&since=` (contract in
   [Event log](#event-log)), `GET .../fs?path=`,
-  `GET .../fs/download?path=` (binary), `POST .../fs/upload?path=` (raw body),
+  `GET .../fs/download?path=` (binary), `POST .../fs/upload?path=` (raw body; on a device whose organisation has a
+  trust bundle it answers `{staged, commit_required, upload_id, bytes, sha256}` and the file is only
+  staged until `POST .../fs/commit {upload_id}`, which goes through the signing flow, signing the
+  destination, size and SHA-256 rather than the bytes; see `docs/SECURITY.md`, Signed actions),
   `POST .../fs/delete|mkdir {path}`, `POST .../fs/rename {from,to}`,
   `POST .../isolate {isolate: true|false}` (device network quarantine: host firewall lockdown blocking non-RMM traffic while preserving control channel),
   `POST .../power {action: reboot|shutdown|lock|logoff, delay_sec, message}` — `poweroff` and
@@ -80,6 +83,16 @@ See `routes()` in `internal/server/api.go`. Highlights:
   wrong during the last scan, `""` when it was clean: a scan whose update source failed still
   answers 200 and still refreshes `last_scan`, so this is the only signal that the list is stale),
   `POST .../patches/scan`,
+  `GET .../servicing?limit=` (default 20) → bare array of repair records, newest first
+  `{id, agent_id, policy_id, trigger: manual|auto, code, why, started_at, finished_at, status, result, by}`
+  (`why` is the sentence for the error `code`; `result` is `{steps: [{name, status: ok|failed|skipped,
+  exit_code, duration_ms, tail}], reboot_required, scan}`),
+  `POST .../servicing/repair {steps?, package?: {url, sha256}, reboot?: never|if_required}` (Windows
+  only, signed like `script.run`; 202 `{ok, id}`; empty `steps` become `dism_restore`,
+  `reset_components`, `rescan` and empty `reboot` `never` before signing; steps are `dism_restore`,
+  `sfc`, `reset_components`, `add_package`, `rescan`; a package must be https, `.cab` or `.msu`, carry a
+  64-hex `sha256` and goes with `add_package`; 400 on a non-Windows device or a bad value, 409 while a
+  patch job holds the device),
   `POST .../patches/install {ids | all:true, reboot_if_required}` (202, follow `patches` events),
   `GET .../events` (agent event log).
 - Terminal: WebSocket `/ws/shell/{id}`. Send `{"t":"open","shell":"powershell|cmd|bash|sh|","cols","rows"}`,
@@ -116,6 +129,34 @@ See `routes()` in `internal/server/api.go`. Highlights:
 - Scripts `/api/scripts`, `POST /api/scripts/run {script_id|language+body, args, targets|agent_ids}`
   → `{runs: {agentId: runId|"error: ..."|"skipped: ..."}}`, runs `/api/runs?agent=&limit=`,
   `/api/runs/{id}` (includes stdout/stderr, live while running), `POST /api/runs/{id}/cancel`.
+  In an organization that signs actions a run is never queued for an offline device, because its
+  signature would expire before the device is back: a library script answers `error: device is
+  offline: a signed run cannot wait for it, ...` for that device (no signature is asked for it) and
+  an ad hoc body `error: agent is offline`. `POST /api/agents/{id}/run` answers 409 with the same
+  text. Organizations that do not sign actions still queue library scripts. Unattended runs
+  (tasks, automations) queue in every case and keep their standing approval.
+- Standing approvals: `GET /api/approvals/unsigned?org=` → one row per unit that needs a signature,
+  `{type, id, name, reason, org, purpose}`. `POST /api/approvals/objects/{type}/{id}/sign?org=&purpose=`
+  goes through the signing flow (428, then a retry with `X-Action-Auth`). With both `org` and
+  `purpose` it signs exactly that unit; otherwise it signs the first unit that needs it. Answers
+  `{expires_at, org, purpose, remaining}`, where `remaining` counts the other units of the object
+  that still need a signature, or `{already_approved: true, expires_at, remaining}` when the unit
+  needs none (no signature is asked for).
+- Pending approvals (the signing queue): `GET /api/approvals` lists what the caller may still sign;
+  `GET /api/approvals/{manifest_id}` returns one entry in the same shape, or 404 when the caller may
+  not sign it (unknown, expired, done, another organization, or already signed by the caller).
+  An entry is listed when it is neither done nor expired, the caller may access its organization,
+  it has a signature already or the caller issued it, and the caller has not signed it. So the
+  caller's own challenge shows up with `have: 0`, which is what `rmm-signer` signs out of band.
+  `POST /api/approvals/{manifest_id}/sign {assertion}` is unchanged. Entry:
+  `{manifest_id, manifest (base64url of the exact bytes), summary, have, need, created_by, issuer,
+  org, created_at, expires_at, kind (action|grant|standing), op, ops[], targets[], target_names{},
+  rp_id, origins[], allow_credentials[], user_verification (required|preferred), signers[]}`.
+  The arrays are never null. `target_names` maps agent ids to display names, only for agents the
+  caller may access. `allow_credentials` is the caller's own credential ids in the organization's
+  bundle; `user_verification` is `required` when the bundle sets `require_uv`. `signers` names the
+  owners who have signed so far. `summary` and `target_names` are the server's words; `manifest`
+  is what a signature covers.
   A run's `status` is `queued|running|done|failed|timeout|cancelled` — a cancel is not a failure
   and raises no `script_failed` alert. `exit_code` is the interpreter's, sign-extended on Windows
   (`exit -1` reads `-1`, not `4294967295`), or `-1` when the run never produced one.
@@ -188,13 +229,72 @@ See `routes()` in `internal/server/api.go`. Highlights:
   `GET /api/portal/tickets`, `GET /api/portal/tickets/{id}`,
   `POST /api/portal/tickets` (`{subject, description, requester_name, requester_email?, requester_phone?, priority?}`),
   `POST /api/portal/tickets/{id}/comments` (`{body}`).
+- Transparency log (`GET`, 503 when the server has no log): `/api/log/head` → `{size, hash, key, note}`
+  (`key` is the note verifier key bundles pin as `log_key`, `note` the base64 signed head);
+  `/api/log/proof?index=` → `{size, hash, note, index, proof}`, the inclusion proof at the current head
+  (400 for a bad index, 404 for a leaf past the end); `/api/log/consistency?from=&to=` → `{from, to, proof}`
+  (`from` at least 1, `to` defaults to the current size, 400 outside that range). These three need no
+  session, since they hold only hashes and sizes. `/api/log/entries/{index}` → `{index, kind, data, ts}`
+  with `data` the base64 leaf (`manifest`, `bundle` or `audit`) is admin only (403 for a technician, 401
+  without a session). The `approvals` table keeps each standing approval's leaf in `log_index`; the API
+  does not return it, but the approval's dispatch carries the proof. A trust proposal accepts
+  `require_log_proof` and `log_key`; the latter must be this server's own key, and `require_log_proof`
+  needs one. The head of a device's `executed.log` is the agent's `executed_head` field (and `inventory.executed_head`) in `GET /api/agents` and `GET /api/agents/{id}`.
 - In-Place & Fleet Updates: `GET /api/server/version` (version, arch, staged update status),
   `POST /api/server/update` (admin only: in-place server executable swap & service restart),
-  `POST /api/agents/update-all` (admin only: fleet-wide agent update trigger),
-  `POST /api/agents/{id}/update` (dispatch update to specific agent),
-  `GET /api/agent/update-check` (unauthenticated version probe).
-- Admin: `/api/settings` (GET/PUT `Settings`), `POST /api/settings/test-mail`,
-  `/api/users` (manage accounts, roles, and `org_scope`), `GET /api/audit?limit=`, `GET /api/system`, `GET /api/dashboard`.
+  `POST /api/agents/update-all` (admin only: updates at once the online devices of organizations that do
+  not sign actions, counted in `dispatched_to`. It dispatches nothing to the online devices of the others
+  and returns them as `signed_groups`, one entry per organization and agent build (OS and architecture):
+  `{org, org_name, os, arch, version, sha256, agent_ids}`, each of which is meant for `update-batch`. A
+  build that more than 2000 online devices of one organization run comes back as several entries, in
+  device-ID order, because 2000 is what `update-batch` takes. Online devices the server has no agent
+  build for (their OS or architecture) are sent nothing and counted in `skipped_no_build`, so an empty
+  `signed_groups` with `dispatched_to` 0 does not mean that they were up to date. The build a device
+  gets is chosen by the architecture it announced when it connected, never by its inventory, so every
+  entry is accepted by `update-batch` as it stands. Online devices whose recorded digest says they
+  already run the build are left out of both and counted in `up_to_date`. Audited as `fleet.update_all`
+  with the counts),
+  `POST /api/agents/update-batch` (admin only: `{agent_ids}`, at most 2000, which must all belong to one
+  organization and run one build, otherwise 400. It goes through the signing flow (428, then a retry
+  with `X-Action-Auth`) as one high-risk `agent.update` manifest whose payload is
+  `{url, sha256, version}`, so it needs `high_threshold` signers and may answer 202 and wait in the
+  approvals queue for the others; for an organization that does not sign actions it sends at once.
+  Each device checks the binary's SHA-256 after it downloads it; a device that already runs that
+  build answers as done and downloads and restarts nothing, though the manifest still needed its
+  signature. Devices already on the build by their recorded digest are dropped before the manifest is
+  built, so it names only the rest; when none are left it answers 200
+  `{ok, dispatched_to: 0, up_to_date, signed: false, message}` with no 428. Answers
+  `{ok, dispatched_to, signed, accepted, installing, offline, up_to_date, failed: [{id, name, error}], message}`,
+  where `dispatched_to`, `accepted`, `installing` and `offline` count devices: `accepted` have
+  downloaded and checked the binary, `installing` did not reply within 20 seconds (a device replies
+  only once the binary is staged), `offline` were not connected, and `dispatched_to` is `accepted`
+  plus `installing`. `results` has one entry per device that confirmed, `{id, name, source, bytes, resumed_chunks, version}`, and `by_source` counts them as `cache`, `origin`, `origin_cache_failed` and `unreported` (an agent too old to send the reply is still accepted; its source is empty). Both are also recorded as `update` events on each device, and `by_source` is in the `fleet.update` audit details. `failed` lists, with the device's name, the devices that answered with an error
+  or could not be sent the request, and the `message` names them as devices that did not take the
+  update, never as unreachable (that word is for `offline`). `signed` says whether the update went
+  out under a signature: it is false for an organization that does not sign actions, for an operator
+  who chose *Continue without signing* in `audit` mode, and when the organization stopped signing
+  between the listing and the request. Audited as `fleet.update` with the name and source address of
+  the operator who asked, not of whoever added the last signature, the counts, and for the first 20
+  failed devices their `id`, `name` and clipped `error` under `failures`; see `docs/SECURITY.md`,
+  Signed actions),
+  `POST /api/agents/{id}/update` (dispatch update to specific agent; waits as long as `update-batch`
+  does. A device still downloading and checking the binary answers 200
+  `{ok: true, installing: true, message, result}`, where `result` is the agent's
+  `{source, bytes, resumed_chunks, version}` (`source` is `origin`, `cache <leader> over h3|https`, or
+  `origin (the cache failed: reason)`, empty from an agent too old to report it; the same fields are
+  recorded as an `update` event on the device and in the `agent.self_update` audit row) and restarts on its own when done, an offline device 409,
+  any other error 400 with the device's reason. A device that already runs the build, by the digest
+  it reported at its last update-check (recorded for 24 hours), answers 200
+  `{ok: true, up_to_date: true, message}` before any signature is asked for, unless `?force=1`),
+  `GET /api/agent/update-check` (the version probe every agent makes every 5 minutes, sent with the
+  agent's key rather than a console session. Where it would advertise a build to a device of an
+  organization in `enforce` mode, it answers `update_available: false` and
+  `signed_update_required: true` instead, with that build's `version` and `sha256` but no `url`; the
+  device refuses an unsigned update by itself in any case. `os` must be `windows` or `linux` and
+  `arch` one of `amd64`, `arm64`, `arm` or `386`: the server looks a build up by that name only, so
+  any other value gets `update_available: false`).
+- Admin: `/api/settings` (GET/PUT `Settings`; `mesh_cache: {enabled, port, max_bytes}` is the subnet update cache, off by default, with a port of at least 1024 and `max_bytes` of at least 64 MiB or 400, and unchanged by a PUT that omits it), `POST /api/settings/test-mail`,
+  `/api/users` (manage accounts, roles, and `org_scope`), `GET /api/audit?limit=` (rows carry `log_index`, the entry's leaf in the transparency log, -1 for one that was never logged), `GET /api/system` (also `telemetry_engine` and `telemetry_bytes`, -1 when the engine cannot report a size), `GET /api/dashboard`.
 
 ## Event log
 
