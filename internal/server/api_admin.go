@@ -268,7 +268,7 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	role, scope := curRole, parseOrgScope(curScope)
 	me := userFrom(r.Context())
 	if in.Role != "" {
-		if !validRole(in.Role) {
+		if !s.db.roleExists(in.Role) {
 			writeErr(w, 400, "invalid role")
 			return
 		}

@@ -269,7 +269,7 @@ func (d *DB) signerIsLive(credID, owner string) bool {
 	if err != nil {
 		return false
 	}
-	return username == owner && (&User{Role: role}).CanWrite()
+	return username == owner && (&User{Base: d.resolveRole(role).Base}).CanWrite()
 }
 
 func markInBundle(creds []Credential, inBundle map[string][]string) {

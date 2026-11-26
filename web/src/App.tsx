@@ -19,6 +19,7 @@ import { Alerts } from './pages/Alerts';
 import { Patches } from './pages/Patches';
 import { Settings } from './pages/Settings';
 import { Users } from './pages/Users';
+import { Roles } from './pages/Roles';
 import { Organizations } from './pages/Organizations';
 import { SoftwareCatalog } from './pages/SoftwareCatalog';
 import { Discovery } from './pages/Discovery';
@@ -43,7 +44,7 @@ function Guard({ children }: { children: ReactNode }) {
   // A client contact has the support portal and their own account page
   // (password, two-step sign-in), never the console. The server refuses them
   // everything else anyway; this keeps them from landing on empty pages.
-  if (user.role === 'poc') {
+  if (user.base_role === 'poc') {
     return loc.pathname === '/account' ? (
       <div className="content" style={{ maxWidth: 720, margin: '0 auto', padding: 24 }}>
         <p>
@@ -61,6 +62,12 @@ function Guard({ children }: { children: ReactNode }) {
 function AdminOnly({ children }: { children: ReactNode }) {
   const { isAdmin } = useAuth();
   if (!isAdmin) return <Navigate to="/" replace />;
+  return <>{children}</>;
+}
+
+function AutomationsOnly({ children }: { children: ReactNode }) {
+  const { canAutomations } = useAuth();
+  if (!canAutomations) return <Navigate to="/" replace />;
   return <>{children}</>;
 }
 
@@ -102,7 +109,14 @@ export function App() {
         <Route path="scripts/:id" element={<ScriptEditor />} />
         <Route path="runs" element={<Runs />} />
         <Route path="tasks" element={<Tasks />} />
-        <Route path="automations" element={<Automations />} />
+        <Route
+          path="automations"
+          element={
+            <AutomationsOnly>
+              <Automations />
+            </AutomationsOnly>
+          }
+        />
         <Route path="baselines" element={<Baselines />} />
         {/* static before dynamic: /baselines/new must not be read as an id */}
         <Route path="baselines/new" element={<BaselineEditor />} />
@@ -144,6 +158,14 @@ export function App() {
           element={
             <AdminOnly>
               <Users />
+            </AdminOnly>
+          }
+        />
+        <Route
+          path="roles"
+          element={
+            <AdminOnly>
+              <Roles />
             </AdminOnly>
           }
         />

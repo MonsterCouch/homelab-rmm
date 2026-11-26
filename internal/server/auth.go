@@ -30,15 +30,14 @@ const (
 	RoleContact = "poc"
 )
 
-func validRole(role string) bool {
-	return role == RoleAdmin || role == RoleTech || role == RoleViewer || role == RoleContact
-}
+// A role is valid when it is built in or a custom role that resolves; see
+// DB.roleExists in roles.go.
 
 // checkRoleScope is the one rule tying a role to its organizations: a client
 // contact belongs to exactly one, which must exist. Everyone else may have
 // any scope (none means every organization).
 func (d *DB) checkRoleScope(role string, orgScope []string) error {
-	if role != RoleContact {
+	if d.resolveRole(role).Base != RoleContact {
 		return nil
 	}
 	if len(orgScope) != 1 {
@@ -61,6 +60,13 @@ type User struct {
 	TOTPEnabled bool     `json:"totp_enabled"`
 	CreatedAt   int64    `json:"created_at"`
 	LastLogin   int64    `json:"last_login"`
+	// What the role works out to (roles.go). Role is a built-in role or a
+	// custom role's id; Base is the built-in at the root of its chain, which
+	// is what the broad gates go by.
+	RoleName        string          `json:"role_name"`
+	Base            string          `json:"base_role"`
+	Permissions     map[string]bool `json:"permissions"`
+	AutomationScope automationScope `json:"automation_scope"`
 }
 
 func parseOrgScope(s string) []string {
@@ -87,12 +93,13 @@ func userFrom(ctx context.Context) *User {
 // techs can do everything except manage users and global settings. It names
 // the roles that may, so a role added later is read-only until it is listed.
 func (u *User) CanWrite() bool {
-	return u != nil && (u.Role == RoleAdmin || u.Role == RoleTech)
+	b := u.base()
+	return b == RoleAdmin || b == RoleTech
 }
-func (u *User) IsAdmin() bool { return u != nil && u.Role == RoleAdmin }
+func (u *User) IsAdmin() bool { return u.base() == RoleAdmin }
 
 // IsPOC reports whether u is a client contact (see RoleContact).
-func (u *User) IsPOC() bool { return u != nil && u.Role == RoleContact }
+func (u *User) IsPOC() bool { return u.base() == RoleContact }
 
 // ContactOrg is the one organization a client contact belongs to, or "" if
 // u is not a contact or (from an old record) has no single organization, in
@@ -139,7 +146,7 @@ func (d *DB) CreateUserWithScope(username, password, role, email string, orgScop
 	if len(password) < 8 {
 		return 0, errors.New("password must be at least 8 characters")
 	}
-	if !validRole(role) {
+	if !d.roleExists(role) {
 		return 0, errors.New("invalid role")
 	}
 	if err := d.checkRoleScope(role, orgScope); err != nil {
@@ -184,7 +191,15 @@ func (d *DB) ListUsers() ([]User, error) {
 		u.OrgScope = parseOrgScope(scope)
 		out = append(out, u)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Resolved after the cursor is done: a role lookup is another query.
+	rows.Close()
+	for i := range out {
+		d.fillRole(&out[i])
+	}
+	return out, nil
 }
 
 type loginResult struct {
@@ -211,6 +226,7 @@ func (d *DB) authenticate(username, password, code string) (*loginResult, error)
 		return nil, errors.New("invalid credentials")
 	}
 	u.OrgScope = parseOrgScope(scope)
+	d.fillRole(&u)
 	if !checkPassword(hash, password) {
 		return nil, errors.New("invalid credentials")
 	}
@@ -244,6 +260,7 @@ func (d *DB) userBySession(token string) *User {
 		return nil
 	}
 	u.OrgScope = parseOrgScope(scope)
+	d.fillRole(&u)
 	return &u
 }
 

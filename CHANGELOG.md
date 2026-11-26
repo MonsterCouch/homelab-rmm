@@ -6,6 +6,12 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Roles an administrator can define:** beside the built-in Administrator, Technician, Viewer and Client contact, a custom
+  role inherits from Technician, Viewer or another custom role and then grants or denies individual permissions: changing
+  baselines, the script library, groups, scheduled tasks, alert rules, patch policies and automations. Automations can be
+  opened to a non-administrator role for all of them or a named list. The defaults match what each route required before, so
+  nothing changes until a role is created. Managed on the new Roles page and `/api/roles`; see "Custom roles" in
+  `docs/SECURITY.md`.
 - **Remote terminal over WebRTC:** the terminal moves its bytes over a WebRTC data channel (`term`, raw pty bytes, no string
   conversion) and keeps the WebSocket relay as the fallback; the switch is ordered so no byte is lost or reordered, and the
   browser falls back after 4 s or on any failure. The ICE servers from `RMM_ICE_SERVERS`, credentials included, now reach the

@@ -75,6 +75,8 @@ import type {
   UpdateAllResult,
   UpdateBatchResult,
   User,
+  RoleInput,
+  RolesResponse,
   WebAuthnCredential,
   WolResult,
 } from './types';
@@ -520,6 +522,12 @@ export const api = {
   updateUser: (id: number, u: { role?: string; email?: string; password?: string; reset_totp?: boolean; org_scope?: string[] }) =>
     put<Ok>(`/api/users/${id}`, u),
   deleteUser: (id: number) => del<Ok>(`/api/users/${id}`),
+
+  // ---- roles ----
+  listRoles: () => get<RolesResponse>('/api/roles').then((r) => ({ permissions: arr(r.permissions), roles: arr(r.roles).map((x) => ({ ...x, grants: x.grants ?? {} })) })),
+  createRole: (r: RoleInput) => post<{ id: string }>('/api/roles', r),
+  updateRole: (id: string, r: RoleInput) => put<Ok>(`/api/roles/${enc(id)}`, r),
+  deleteRole: (id: string) => del<Ok>(`/api/roles/${enc(id)}`),
 
   // ---- software catalog & privileged execution ----
   softwareCatalog: (os?: string) => list(get<SoftwareCatalogItem[] | null>(`/api/software-catalog${os ? `?os=${encodeURIComponent(os)}` : ''}`)),

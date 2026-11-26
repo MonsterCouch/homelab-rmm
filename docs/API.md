@@ -163,7 +163,15 @@ See `routes()` in `internal/server/api.go`. Highlights:
 - Tasks `/api/tasks` (`kind`: script|patch_scan|patch_install|reboot|inventory; `schedule` is a
   5-field cron or `@hourly`/`@daily`; `targets` = `{all, agents[], groups[], tags[], os}`),
   `POST /api/tasks/{id}/run`.
-- Automations `/api/automations` (`trigger`: agent_online|agent_offline|alert_opened|alert_resolved|
+- `GET /api/me` and every user object carry what the role works out to: `role_name`, `base_role`
+  (`admin`, `tech`, `viewer`, `poc`, or empty for a role that cannot be resolved), `permissions`
+  (`{permission: bool}`) and `automation_scope` (`"all"` or a list of ids). Creating, changing and
+  deleting baselines, library scripts, groups, tasks, alert rules and patch policies each need
+  their permission (`baselines.edit`, `scripts.edit`, `groups.edit`, `tasks.edit`,
+  `alert_rules.edit`, `patch_policies.edit`) and answer 403 without it.
+- Automations need `automations.edit` and an account with no organization scope; with a listed
+  `automation_scope` the list and `PUT` cover those automations only (others are 404), and `POST`
+  and `DELETE` need `"all"`. `/api/automations` (`trigger`: agent_online|agent_offline|alert_opened|alert_resolved|
   enrolled|reboot_required|patch_installed|drift_detected|drift_fixed; `action`:
   run_script|email|webhook; `action_params`:
   `{script_id, args}` / `{subject}` / `{url}`; `filter`: `{targets, rule_ids[], severity}`).
@@ -294,7 +302,8 @@ See `routes()` in `internal/server/api.go`. Highlights:
   `arch` one of `amd64`, `arm64`, `arm` or `386`: the server looks a build up by that name only, so
   any other value gets `update_available: false`).
 - Admin: `/api/settings` (GET/PUT `Settings`; `mesh_cache: {enabled, port, max_bytes}` is the subnet update cache, off by default, with a port of at least 1024 and `max_bytes` of at least 64 MiB or 400, and unchanged by a PUT that omits it), `POST /api/settings/test-mail`,
-  `/api/users` (manage accounts, roles, and `org_scope`), `GET /api/audit?limit=` (rows carry `log_index`, the entry's leaf in the transparency log, -1 for one that was never logged), `GET /api/system` (also `telemetry_engine` and `telemetry_bytes`, -1 when the engine cannot report a size), `GET /api/dashboard`.
+  `/api/users` (manage accounts, roles, and `org_scope`; `role` is a built-in role or a custom role's id),
+  `/api/roles` (`GET` returns `{permissions: [{key, label, help, tech}], roles: [{id, name, parent, builtin, grants, automations, effective: {base, permissions, automation_scope}, users}]}`; `POST` and `PUT /api/roles/{id}` take `{name, parent, grants: {permission: bool}, automations: null | "all" | [ids]}` where `parent` is `tech`, `viewer` or a custom role and an absent grant is inherited; `DELETE /api/roles/{id}` answers 409 while accounts have the role or roles inherit from it; built-in roles answer 400), `GET /api/audit?limit=` (rows carry `log_index`, the entry's leaf in the transparency log, -1 for one that was never logged), `GET /api/system` (also `telemetry_engine` and `telemetry_bytes`, -1 when the engine cannot report a size), `GET /api/dashboard`.
 
 ## Event log
 

@@ -138,9 +138,9 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("POST /api/agents/{id}/grant", s.requireWrite(s.handleGrant))
 
 	api.HandleFunc("GET /api/groups", s.handleListGroups)
-	api.HandleFunc("POST /api/groups", s.requireWrite(s.handleCreateGroup))
-	api.HandleFunc("PUT /api/groups/{id}", s.requireWrite(s.handleUpdateGroup))
-	api.HandleFunc("DELETE /api/groups/{id}", s.requireWrite(s.handleDeleteGroup))
+	api.HandleFunc("POST /api/groups", s.requirePerm(PermGroupsEdit, s.handleCreateGroup))
+	api.HandleFunc("PUT /api/groups/{id}", s.requirePerm(PermGroupsEdit, s.handleUpdateGroup))
+	api.HandleFunc("DELETE /api/groups/{id}", s.requirePerm(PermGroupsEdit, s.handleDeleteGroup))
 
 	// The listing carries the token VALUES, which are bearer credentials for
 	// enrolling a device - a write. A viewer must not read them.
@@ -149,46 +149,46 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("DELETE /api/enroll/{id}", s.requireWrite(s.handleDeleteEnroll))
 
 	api.HandleFunc("GET /api/scripts", s.handleListScripts)
-	api.HandleFunc("POST /api/scripts", s.requireWrite(s.handleCreateScript))
+	api.HandleFunc("POST /api/scripts", s.requirePerm(PermScriptsEdit, s.handleCreateScript))
 	api.HandleFunc("GET /api/scripts/{id}", s.handleGetScript)
-	api.HandleFunc("PUT /api/scripts/{id}", s.requireWrite(s.handleUpdateScript))
-	api.HandleFunc("DELETE /api/scripts/{id}", s.requireWrite(s.handleDeleteScript))
+	api.HandleFunc("PUT /api/scripts/{id}", s.requirePerm(PermScriptsEdit, s.handleUpdateScript))
+	api.HandleFunc("DELETE /api/scripts/{id}", s.requirePerm(PermScriptsEdit, s.handleDeleteScript))
 	api.HandleFunc("POST /api/scripts/run", s.requireWrite(s.handleRunScript))
 	api.HandleFunc("GET /api/runs", s.handleListRuns)
 	api.HandleFunc("GET /api/runs/{id}", s.handleGetRun)
 	api.HandleFunc("POST /api/runs/{id}/cancel", s.requireWrite(s.handleCancelRun))
 
 	api.HandleFunc("GET /api/tasks", s.handleListTasks)
-	api.HandleFunc("POST /api/tasks", s.requireWrite(s.handleCreateTask))
-	api.HandleFunc("PUT /api/tasks/{id}", s.requireWrite(s.handleUpdateTask))
-	api.HandleFunc("DELETE /api/tasks/{id}", s.requireWrite(s.handleDeleteTask))
+	api.HandleFunc("POST /api/tasks", s.requirePerm(PermTasksEdit, s.handleCreateTask))
+	api.HandleFunc("PUT /api/tasks/{id}", s.requirePerm(PermTasksEdit, s.handleUpdateTask))
+	api.HandleFunc("DELETE /api/tasks/{id}", s.requirePerm(PermTasksEdit, s.handleDeleteTask))
 	api.HandleFunc("POST /api/tasks/{id}/run", s.requireWrite(s.handleRunTask))
 
-	api.HandleFunc("GET /api/automations", s.requireAdmin(s.handleListAutomations))
-	api.HandleFunc("POST /api/automations", s.requireAdmin(s.handleCreateAutomation))
-	api.HandleFunc("PUT /api/automations/{id}", s.requireAdmin(s.handleUpdateAutomation))
-	api.HandleFunc("DELETE /api/automations/{id}", s.requireAdmin(s.handleDeleteAutomation))
+	api.HandleFunc("GET /api/automations", s.requireAutomations(s.handleListAutomations))
+	api.HandleFunc("POST /api/automations", s.requireAutomations(s.handleCreateAutomation))
+	api.HandleFunc("PUT /api/automations/{id}", s.requireAutomations(s.handleUpdateAutomation))
+	api.HandleFunc("DELETE /api/automations/{id}", s.requireAutomations(s.handleDeleteAutomation))
 
 	api.HandleFunc("GET /api/alert-rules", s.handleListAlertRules)
-	api.HandleFunc("POST /api/alert-rules", s.requireWrite(s.handleCreateAlertRule))
-	api.HandleFunc("PUT /api/alert-rules/{id}", s.requireWrite(s.handleUpdateAlertRule))
-	api.HandleFunc("DELETE /api/alert-rules/{id}", s.requireWrite(s.handleDeleteAlertRule))
+	api.HandleFunc("POST /api/alert-rules", s.requirePerm(PermAlertRulesEdit, s.handleCreateAlertRule))
+	api.HandleFunc("PUT /api/alert-rules/{id}", s.requirePerm(PermAlertRulesEdit, s.handleUpdateAlertRule))
+	api.HandleFunc("DELETE /api/alert-rules/{id}", s.requirePerm(PermAlertRulesEdit, s.handleDeleteAlertRule))
 	api.HandleFunc("GET /api/alerts", s.handleListAlerts)
 	api.HandleFunc("POST /api/alerts/{id}/ack", s.requireWrite(s.handleAckAlert))
 	api.HandleFunc("POST /api/alerts/{id}/resolve", s.requireWrite(s.handleResolveAlert))
 	api.HandleFunc("POST /api/alerts/resolve-all", s.requireWrite(s.handleResolveAllAlerts))
 
 	// Baselines. Reads are session-only (a viewer may look at compliance);
-	// every mutation is requireWrite, and preview/evaluate/remediate are
-	// writes too because they run code on a device. The admin-only gates for
+	// saving and deleting one is its own permission, and preview/evaluate/
+	// remediate are requireWrite because they run code on a device. The admin-only gates for
 	// `command`, `file` outside the config trees and allow_reboot live inside
 	// the save handler, since the route itself is requireWrite.
 	api.HandleFunc("GET /api/baselines", s.handleListBaselines)
-	api.HandleFunc("POST /api/baselines", s.requireWrite(s.handleCreateBaseline))
+	api.HandleFunc("POST /api/baselines", s.requirePerm(PermBaselinesEdit, s.handleCreateBaseline))
 	api.HandleFunc("POST /api/baselines/preview", s.requireWrite(s.handleBaselinePreview))
 	api.HandleFunc("GET /api/baselines/{id}", s.handleGetBaseline)
-	api.HandleFunc("PUT /api/baselines/{id}", s.requireWrite(s.handleUpdateBaseline))
-	api.HandleFunc("DELETE /api/baselines/{id}", s.requireWrite(s.handleDeleteBaseline))
+	api.HandleFunc("PUT /api/baselines/{id}", s.requirePerm(PermBaselinesEdit, s.handleUpdateBaseline))
+	api.HandleFunc("DELETE /api/baselines/{id}", s.requirePerm(PermBaselinesEdit, s.handleDeleteBaseline))
 	api.HandleFunc("GET /api/baselines/{id}/status", s.handleBaselineStatus)
 	api.HandleFunc("POST /api/baselines/{id}/evaluate", s.requireWrite(s.handleBaselineEvaluate))
 	api.HandleFunc("POST /api/baselines/{id}/remediate", s.requireWrite(s.handleBaselineRemediate))
@@ -199,9 +199,9 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("GET /api/patches", s.handleListPatches)
 	api.HandleFunc("POST /api/patches/status", s.requireWrite(s.handlePatchStatus))
 	api.HandleFunc("GET /api/patch-policies", s.handleListPatchPolicies)
-	api.HandleFunc("POST /api/patch-policies", s.requireWrite(s.handleCreatePatchPolicy))
-	api.HandleFunc("PUT /api/patch-policies/{id}", s.requireWrite(s.handleUpdatePatchPolicy))
-	api.HandleFunc("DELETE /api/patch-policies/{id}", s.requireWrite(s.handleDeletePatchPolicy))
+	api.HandleFunc("POST /api/patch-policies", s.requirePerm(PermPatchPoliciesEdit, s.handleCreatePatchPolicy))
+	api.HandleFunc("PUT /api/patch-policies/{id}", s.requirePerm(PermPatchPoliciesEdit, s.handleUpdatePatchPolicy))
+	api.HandleFunc("DELETE /api/patch-policies/{id}", s.requirePerm(PermPatchPoliciesEdit, s.handleDeletePatchPolicy))
 
 	// Software Catalog & Privileged Self-Service Execution
 	api.HandleFunc("GET /api/software-catalog", s.handleListSoftwareCatalog)
@@ -237,6 +237,12 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("POST /api/users", s.requireAdmin(s.handleCreateUser))
 	api.HandleFunc("PUT /api/users/{id}", s.requireAdmin(s.handleUpdateUser))
 	api.HandleFunc("DELETE /api/users/{id}", s.requireAdmin(s.handleDeleteUser))
+	// Roles: the built-in ones plus what an administrator has defined, and
+	// the permissions a role can grant or deny (roles.go).
+	api.HandleFunc("GET /api/roles", s.requireAdmin(s.handleListRoles))
+	api.HandleFunc("POST /api/roles", s.requireAdmin(s.handleCreateRole))
+	api.HandleFunc("PUT /api/roles/{id}", s.requireAdmin(s.handleUpdateRole))
+	api.HandleFunc("DELETE /api/roles/{id}", s.requireAdmin(s.handleDeleteRole))
 	api.HandleFunc("GET /api/audit", s.requireAdmin(s.handleAudit))
 	api.HandleFunc("GET /api/system", s.handleSystemInfo)
 
@@ -628,7 +634,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	defer s.trackStream(r, func(u *User) bool {
-		return me != nil && u.Role == me.Role && slices.Equal(u.OrgScope, me.OrgScope)
+		// Base too: editing a custom role's parent changes what its accounts
+		// are without changing the role they are assigned.
+		return me != nil && u.Role == me.Role && u.Base == me.Base && slices.Equal(u.OrgScope, me.OrgScope)
 	}, cancel)()
 	for {
 		select {

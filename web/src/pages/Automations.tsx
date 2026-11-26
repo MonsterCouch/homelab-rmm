@@ -35,7 +35,7 @@ const ACTIONS: { id: AutomationAction; label: string }[] = [
 const blank = (): Automation => ({ id: 0, name: '', trigger: 'alert_opened', filter: { targets: EMPTY_TARGETS }, action: 'email', action_params: {}, enabled: true, created_at: 0 });
 
 export function Automations() {
-  const { canWrite } = useAuth();
+  const { canAutomations, allAutomations } = useAuth();
   const toast = useToast();
   const confirm = useConfirm();
   const autos = useAsync(() => api.automations(), []);
@@ -88,19 +88,21 @@ export function Automations() {
     { key: 'trigger', header: 'Trigger', sort: (a) => a.trigger, render: (a) => <Chip outline>{TRIGGERS.find((t) => t.id === a.trigger)?.label ?? titleCase(a.trigger)}</Chip> },
     { key: 'filter', header: 'Filter', render: (a) => <span className="muted">{describeFilter(a)}</span> },
     { key: 'action', header: 'Action', sort: (a) => a.action, render: (a) => <span className="truncate" style={{ maxWidth: 320, display: 'inline-block' }}>{describeAction(a)}</span> },
-    { key: 'enabled', header: 'Enabled', sort: (a) => (a.enabled ? 0 : 1), render: (a) => <Switch checked={a.enabled} disabled={!canWrite} ariaLabel={`Enable automation ${a.name}`} onChange={(v) => toggle(a, v)} /> },
+    { key: 'enabled', header: 'Enabled', sort: (a) => (a.enabled ? 0 : 1), render: (a) => <Switch checked={a.enabled} disabled={!canAutomations} ariaLabel={`Enable automation ${a.name}`} onChange={(v) => toggle(a, v)} /> },
     {
       key: 'actions',
       header: '',
       render: (a) =>
-        canWrite ? (
+        canAutomations ? (
           <div className="cell-actions">
             <Button size="xs" onClick={() => setEditing(a)}>
               Edit
             </Button>
-            <Button size="xs" variant="danger" onClick={() => remove(a)}>
-              Delete
-            </Button>
+            {allAutomations && (
+              <Button size="xs" variant="danger" onClick={() => remove(a)}>
+                Delete
+              </Button>
+            )}
           </div>
         ) : null,
     },
@@ -110,14 +112,14 @@ export function Automations() {
     <>
       <div className="page-head">
         <h1>Automations</h1>
-        {canWrite && (
+        {allAutomations && (
           <Button variant="primary" onClick={() => setEditing(blank())}>
             <IconPlus /> New automation
           </Button>
         )}
       </div>
       {autos.error && <ErrorBox error={autos.error} onRetry={autos.reload} />}
-      <DataTable columns={columns} rows={autos.data} loading={autos.loading} rowKey={(a) => String(a.id)} onRowClick={canWrite ? (a) => setEditing(a) : undefined} defaultSort={{ key: 'name', dir: 'asc' }} emptyTitle="No automations" emptyBody="React to events: run a script when a device comes online, email on critical alerts, or call a webhook." />
+      <DataTable columns={columns} rows={autos.data} loading={autos.loading} rowKey={(a) => String(a.id)} onRowClick={canAutomations ? (a) => setEditing(a) : undefined} defaultSort={{ key: 'name', dir: 'asc' }} emptyTitle="No automations" emptyBody="React to events: run a script when a device comes online, email on critical alerts, or call a webhook." />
       {editing && (
         <AutomationEditor
           automation={editing}

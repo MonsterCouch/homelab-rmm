@@ -42,7 +42,8 @@ const blank = (): Task => ({
 });
 
 export function Tasks() {
-  const { canWrite } = useAuth();
+  const { canWrite, can } = useAuth();
+  const canEdit = can('tasks.edit');
   const toast = useToast();
   const confirm = useConfirm();
   const tasks = useAsync(() => api.tasks(), []);
@@ -120,7 +121,7 @@ export function Tasks() {
       ),
     },
     { key: 'targets', header: 'Targets', render: (t) => <span className="muted">{targetsSummary(t.targets, agents.data, groups.data)}</span> },
-    { key: 'enabled', header: 'Enabled', sort: (t) => (t.enabled ? 0 : 1), render: (t) => <Switch checked={t.enabled} disabled={!canWrite} ariaLabel={`Enable task ${t.name}`} onChange={(v) => toggle(t, v)} /> },
+    { key: 'enabled', header: 'Enabled', sort: (t) => (t.enabled ? 0 : 1), render: (t) => <Switch checked={t.enabled} disabled={!canEdit} ariaLabel={`Enable task ${t.name}`} onChange={(v) => toggle(t, v)} /> },
     { key: 'last', header: 'Last run', sort: (t) => t.last_run, render: (t) => <span className="muted">{relTime(t.last_run)}</span> },
     {
       key: 'result',
@@ -146,17 +147,23 @@ export function Tasks() {
       key: 'actions',
       header: '',
       render: (t) =>
-        canWrite ? (
+        canWrite || canEdit ? (
           <div className="cell-actions">
-            <Button size="xs" onClick={() => runNow(t)}>
-              <IconRuns /> Run now
-            </Button>
-            <Button size="xs" onClick={() => setEditing(t)}>
-              Edit
-            </Button>
-            <Button size="xs" variant="danger" onClick={() => remove(t)}>
-              Delete
-            </Button>
+            {canWrite && (
+              <Button size="xs" onClick={() => runNow(t)}>
+                <IconRuns /> Run now
+              </Button>
+            )}
+            {canEdit && (
+              <>
+                <Button size="xs" onClick={() => setEditing(t)}>
+                  Edit
+                </Button>
+                <Button size="xs" variant="danger" onClick={() => remove(t)}>
+                  Delete
+                </Button>
+              </>
+            )}
           </div>
         ) : null,
     },
@@ -166,14 +173,14 @@ export function Tasks() {
     <>
       <div className="page-head">
         <h1>Scheduled tasks</h1>
-        {canWrite && (
+        {canEdit && (
           <Button variant="primary" onClick={() => setEditing(blank())}>
             <IconPlus /> New task
           </Button>
         )}
       </div>
       {tasks.error && <ErrorBox error={tasks.error} onRetry={tasks.reload} />}
-      <DataTable columns={columns} rows={tasks.data} loading={tasks.loading} rowKey={(t) => String(t.id)} onRowClick={canWrite ? (t) => setEditing(t) : undefined} defaultSort={{ key: 'name', dir: 'asc' }} emptyTitle="No tasks" emptyBody="Schedule scripts, patch scans, installs, reboots or inventory refreshes." />
+      <DataTable columns={columns} rows={tasks.data} loading={tasks.loading} rowKey={(t) => String(t.id)} onRowClick={canEdit ? (t) => setEditing(t) : undefined} defaultSort={{ key: 'name', dir: 'asc' }} emptyTitle="No tasks" emptyBody="Schedule scripts, patch scans, installs, reboots or inventory refreshes." />
       {editing && (
         <TaskEditor
           task={editing}

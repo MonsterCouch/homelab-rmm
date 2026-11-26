@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { api } from '../api/client';
-import type { Role, User } from '../api/types';
+import type { BuiltinRole, Role, RoleDef, User } from '../api/types';
 import { DataTable, type Column } from '../components/DataTable';
 import { IconPlus } from '../components/Icons';
 import { Modal, useConfirm } from '../components/Modal';
@@ -10,19 +10,52 @@ import { dateTime, relTime } from '../lib/format';
 import { useAuth } from '../state/auth';
 import { errMsg, useToast } from '../state/toast';
 
-const ROLES: { id: Role; label: string; help: string }[] = [
+const ROLES: { id: BuiltinRole; label: string; help: string }[] = [
   { id: 'admin', label: 'Admin', help: 'Everything, including users and settings.' },
   { id: 'tech', label: 'Tech', help: 'Manage devices, scripts, alerts and patches; no users or settings.' },
   { id: 'viewer', label: 'Viewer', help: 'Read-only.' },
   { id: 'poc', label: 'Client contact', help: "Someone at a client business. Sees their organization's support tickets and nothing else; cannot use this console." },
 ];
 
-const roleLabel = (r: Role) => ROLES.find((x) => x.id === r)?.label ?? r;
+const isBuiltin = (r: string): r is BuiltinRole => ROLES.some((x) => x.id === r);
+
+/** The built-in at the root of a role: built-ins are their own base, custom roles report it in effective.base. */
+function baseOf(role: Role, custom: RoleDef[] | undefined): BuiltinRole | '' {
+  if (isBuiltin(role)) return role;
+  return custom?.find((r) => r.id === role)?.effective.base ?? '';
+}
 
 /** org_scope to save: a client contact has exactly their one organization. */
-function scopeFor(role: Role, allOrgs: boolean, selectedOrgs: string[], contactOrg: string): string[] {
-  if (role === 'poc') return contactOrg ? [contactOrg] : [];
-  return role === 'admin' || allOrgs ? [] : selectedOrgs;
+function scopeFor(base: BuiltinRole | '', allOrgs: boolean, selectedOrgs: string[], contactOrg: string): string[] {
+  if (base === 'poc') return contactOrg ? [contactOrg] : [];
+  return base === 'admin' || allOrgs ? [] : selectedOrgs;
+}
+
+/** Role select: built-ins first, then custom roles from /api/roles. */
+function RoleField({ value, onChange, disabled, custom, hint }: { value: Role; onChange: (r: Role) => void; disabled?: boolean; custom: RoleDef[]; hint?: string }) {
+  const sel = custom.find((r) => r.id === value);
+  const help = hint ?? (isBuiltin(value) ? ROLES.find((r) => r.id === value)?.help : sel ? `Inherits from ${custom.find((r) => r.id === sel.parent)?.name ?? ROLES.find((r) => r.id === sel.parent)?.label ?? sel.parent}.` : undefined);
+  return (
+    <Field label="Role" hint={help}>
+      <select value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
+        {ROLES.map((r) => (
+          <option key={r.id} value={r.id}>
+            {r.label}
+          </option>
+        ))}
+        {custom.length > 0 && (
+          <optgroup label="Custom roles">
+            {custom.map((r) => (
+              <option key={r.id} value={r.id}>
+                {r.name}
+              </option>
+            ))}
+          </optgroup>
+        )}
+        {!isBuiltin(value) && !sel && <option value={value}>{value}</option>}
+      </select>
+    </Field>
+  );
 }
 
 function ContactOrgField({ orgs, value, onChange }: { orgs: { id: string; name: string }[]; value: string; onChange: (id: string) => void }) {
@@ -45,6 +78,8 @@ export function Users() {
   const toast = useToast();
   const confirm = useConfirm();
   const users = useAsync(() => api.users(), []);
+  const roles = useAsync(() => api.listRoles(), []);
+  const customRoles = (roles.data?.roles ?? []).filter((r) => !r.builtin);
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<User | null>(null);
 
@@ -61,13 +96,13 @@ export function Users() {
 
   const columns: Column<User>[] = [
     { key: 'username', header: 'Username', sort: (u) => u.username, render: (u) => <b>{u.username}{u.id === me?.id && <span className="muted small"> (you)</span>}</b> },
-    { key: 'role', header: 'Role', sort: (u) => u.role, render: (u) => <Chip tone={u.role === 'admin' ? 'accent' : u.role === 'tech' ? 'info' : u.role === 'poc' ? 'purple' : ''}>{roleLabel(u.role)}</Chip> },
+    { key: 'role', header: 'Role', sort: (u) => u.role_name || u.role, render: (u) => <Chip tone={u.base_role === 'admin' ? 'accent' : u.base_role === 'tech' ? 'info' : u.base_role === 'poc' ? 'purple' : ''}>{u.role_name || u.role}</Chip> },
     {
       key: 'org_scope',
       header: 'Client Access',
       sort: (u) => (u.org_scope?.length ? u.org_scope.join(',') : ''),
       render: (u) =>
-        u.role === 'admin' ? (
+        u.base_role === 'admin' ? (
           <span className="muted small">Global (Admin)</span>
         ) : u.org_scope && u.org_scope.length > 0 ? (
           <Chip tone="purple">{u.org_scope.length} organization{u.org_scope.length === 1 ? '' : 's'}</Chip>
@@ -107,6 +142,7 @@ export function Users() {
       <DataTable columns={columns} rows={users.data ?? (users.loaded ? [] : undefined)} loading={users.loading} rowKey={(u) => String(u.id)} onRowClick={(u) => setEditing(u)} defaultSort={{ key: 'username', dir: 'asc' }} emptyTitle="No users" />
       {creating && (
         <CreateUser
+          customRoles={customRoles}
           onClose={() => setCreating(false)}
           onSaved={() => {
             setCreating(false);
@@ -117,6 +153,7 @@ export function Users() {
       {editing && (
         <EditUser
           user={editing}
+          customRoles={customRoles}
           isSelf={editing.id === me?.id}
           onClose={() => setEditing(null)}
           onSaved={() => {
@@ -129,12 +166,13 @@ export function Users() {
   );
 }
 
-function CreateUser({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
+function CreateUser({ customRoles, onClose, onSaved }: { customRoles: RoleDef[]; onClose: () => void; onSaved: () => void }) {
   const toast = useToast();
   const orgs = useAsync(() => api.organizations(), []);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [role, setRole] = useState<Role>('tech');
+  const base = baseOf(role, customRoles);
   const [email, setEmail] = useState('');
   const [allOrgs, setAllOrgs] = useState(true);
   const [selectedOrgs, setSelectedOrgs] = useState<string[]>([]);
@@ -150,7 +188,7 @@ function CreateUser({ onClose, onSaved }: { onClose: () => void; onSaved: () => 
     setError(null);
     if (!username.trim()) return setError('Username is required.');
     if (password.length < 8) return setError('Password must be at least 8 characters.');
-    if (role === 'poc' && !contactOrg) return setError('Choose the organization this contact works for.');
+    if (base === 'poc' && !contactOrg) return setError('Choose the organization this contact works for.');
     setBusy(true);
     try {
       await api.createUser({
@@ -158,7 +196,7 @@ function CreateUser({ onClose, onSaved }: { onClose: () => void; onSaved: () => 
         password,
         role,
         email: email.trim(),
-        org_scope: scopeFor(role, allOrgs, selectedOrgs, contactOrg),
+        org_scope: scopeFor(base, allOrgs, selectedOrgs, contactOrg),
       });
       toast.success(`User ${username.trim()} created`);
       onSaved();
@@ -189,17 +227,9 @@ function CreateUser({ onClose, onSaved }: { onClose: () => void; onSaved: () => 
       <Field label="Password" hint="At least 8 characters. Share it out of band; the user can change it afterwards.">
         <input type="password" value={password} autoComplete="new-password" onChange={(e) => setPassword(e.target.value)} />
       </Field>
-      <Field label="Role" hint={ROLES.find((r) => r.id === role)?.help}>
-        <select value={role} onChange={(e) => setRole(e.target.value as Role)}>
-          {ROLES.map((r) => (
-            <option key={r.id} value={r.id}>
-              {r.label}
-            </option>
-          ))}
-        </select>
-      </Field>
-      {role === 'poc' && <ContactOrgField orgs={orgs.data ?? []} value={contactOrg} onChange={setContactOrg} />}
-      {role !== 'admin' && role !== 'poc' && (
+      <RoleField value={role} onChange={setRole} custom={customRoles} />
+      {base === 'poc' && <ContactOrgField orgs={orgs.data ?? []} value={contactOrg} onChange={setContactOrg} />}
+      {base !== 'admin' && base !== 'poc' && (
         <Field label="Organization Access" hint="Restrict this technician or viewer to specific customer organizations.">
           <div className="stack" style={{ gap: 6, marginTop: 4 }}>
             <label className="row" style={{ gap: 8, cursor: 'pointer' }}>
@@ -226,16 +256,17 @@ function CreateUser({ onClose, onSaved }: { onClose: () => void; onSaved: () => 
   );
 }
 
-function EditUser({ user, isSelf, onClose, onSaved }: { user: User; isSelf: boolean; onClose: () => void; onSaved: () => void }) {
+function EditUser({ user, customRoles, isSelf, onClose, onSaved }: { user: User; customRoles: RoleDef[]; isSelf: boolean; onClose: () => void; onSaved: () => void }) {
   const toast = useToast();
   const confirm = useConfirm();
   const orgs = useAsync(() => api.organizations(), []);
   const [role, setRole] = useState<Role>(user.role);
+  const base = baseOf(role, customRoles) || user.base_role;
   const [email, setEmail] = useState(user.email);
   const [password, setPassword] = useState('');
   const [allOrgs, setAllOrgs] = useState(!user.org_scope || user.org_scope.length === 0);
   const [selectedOrgs, setSelectedOrgs] = useState<string[]>(user.org_scope ?? []);
-  const [contactOrg, setContactOrg] = useState(user.role === 'poc' ? (user.org_scope?.[0] ?? '') : '');
+  const [contactOrg, setContactOrg] = useState(user.base_role === 'poc' ? (user.org_scope?.[0] ?? '') : '');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -246,14 +277,14 @@ function EditUser({ user, isSelf, onClose, onSaved }: { user: User; isSelf: bool
   const save = async () => {
     setError(null);
     if (password && password.length < 8) return setError('Password must be at least 8 characters.');
-    if (role === 'poc' && !contactOrg) return setError('Choose the organization this contact works for.');
+    if (base === 'poc' && !contactOrg) return setError('Choose the organization this contact works for.');
     setBusy(true);
     try {
       await api.updateUser(user.id, {
         role: role !== user.role ? role : undefined,
         email: email !== user.email ? email.trim() : undefined,
         password: password || undefined,
-        org_scope: scopeFor(role, allOrgs, selectedOrgs, contactOrg),
+        org_scope: scopeFor(base, allOrgs, selectedOrgs, contactOrg),
       });
       toast.success('User updated', password ? 'Their password was reset and sessions ended.' : undefined);
       onSaved();
@@ -293,17 +324,9 @@ function EditUser({ user, isSelf, onClose, onSaved }: { user: User; isSelf: bool
       }
     >
       {error && <div className="form-error" role="alert">{error}</div>}
-      <Field label="Role" hint={isSelf ? 'You cannot change your own role.' : ROLES.find((r) => r.id === role)?.help}>
-        <select value={role} disabled={isSelf} onChange={(e) => setRole(e.target.value as Role)}>
-          {ROLES.map((r) => (
-            <option key={r.id} value={r.id}>
-              {r.label}
-            </option>
-          ))}
-        </select>
-      </Field>
-      {role === 'poc' && <ContactOrgField orgs={orgs.data ?? []} value={contactOrg} onChange={setContactOrg} />}
-      {role !== 'admin' && role !== 'poc' && (
+      <RoleField value={role} onChange={setRole} disabled={isSelf} custom={customRoles} hint={isSelf ? 'You cannot change your own role.' : undefined} />
+      {base === 'poc' && <ContactOrgField orgs={orgs.data ?? []} value={contactOrg} onChange={setContactOrg} />}
+      {base !== 'admin' && base !== 'poc' && (
         <Field label="Organization Access" hint="Restrict this technician or viewer to specific customer organizations.">
           <div className="stack" style={{ gap: 6, marginTop: 4 }}>
             <label className="row" style={{ gap: 8, cursor: 'pointer' }}>

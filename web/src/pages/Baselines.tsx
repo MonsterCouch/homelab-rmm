@@ -18,7 +18,8 @@ import { useAuth } from '../state/auth';
 import { errMsg, useToast } from '../state/toast';
 
 export function Baselines() {
-  const { canWrite } = useAuth();
+  const { canWrite, can } = useAuth();
+  const canEdit = can('baselines.edit');
   const navigate = useNavigate();
   const toast = useToast();
   const confirm = useConfirm();
@@ -153,7 +154,7 @@ export function Baselines() {
       // view, Delete on the baseline it had just deleted).
       render: (b) => (
         <span onClick={(e) => e.stopPropagation()}>
-          <Switch checked={b.enabled} disabled={!canWrite} ariaLabel={`Enable baseline ${b.name}`} onChange={(v) => toggle(b, v)} />
+          <Switch checked={b.enabled} disabled={!canEdit} ariaLabel={`Enable baseline ${b.name}`} onChange={(v) => toggle(b, v)} />
         </span>
       ),
     },
@@ -161,22 +162,28 @@ export function Baselines() {
       key: 'actions',
       header: '',
       render: (b) =>
-        canWrite ? (
+        canWrite || canEdit ? (
           <div className="cell-actions" onClick={(e) => e.stopPropagation()}>
-            <Button
-              size="xs"
-              onClick={() => evaluate(b)}
-              disabled={!b.enabled}
-              title={b.enabled ? 'Ask every matched online device to evaluate now' : 'No device is holding this baseline: enable it first'}
-            >
-              Evaluate
-            </Button>
-            <Button size="xs" onClick={() => navigate(`/baselines/${b.id}/edit`)}>
-              Edit
-            </Button>
-            <Button size="xs" variant="danger" onClick={() => remove(b)}>
-              Delete
-            </Button>
+            {canWrite && (
+              <Button
+                size="xs"
+                onClick={() => evaluate(b)}
+                disabled={!b.enabled}
+                title={b.enabled ? 'Ask every matched online device to evaluate now' : 'No device is holding this baseline: enable it first'}
+              >
+                Evaluate
+              </Button>
+            )}
+            {canEdit && (
+              <>
+                <Button size="xs" onClick={() => navigate(`/baselines/${b.id}/edit`)}>
+                  Edit
+                </Button>
+                <Button size="xs" variant="danger" onClick={() => remove(b)}>
+                  Delete
+                </Button>
+              </>
+            )}
           </div>
         ) : null,
     },
@@ -186,7 +193,7 @@ export function Baselines() {
     <>
       <div className="page-head">
         <h1>Baselines</h1>
-        {canWrite && (
+        {canEdit && (
           <Button variant="primary" onClick={() => navigate('/baselines/new')}>
             <IconPlus /> New baseline
           </Button>

@@ -168,6 +168,44 @@ account by accident. A viewer is also refused the endpoints that are reads only 
 the hostname adoption below, to take over an offline device's record). Browsing a directory
 listing stays available.
 
+**Custom roles.** Those three, and `poc`, are built in and fixed. An administrator can define
+more (`internal/server/roles.go`, the Roles page). A custom role has one parent: `tech`,
+`viewer` or another custom role. It starts with everything the parent has, then grants or denies
+individual permissions; whatever it does not mention follows the parent, including later changes
+to the parent. The built-in at the root of the chain is the role's **base**, and the base is what
+every broad gate goes by, so a custom role is a technician or a viewer wherever a permission is
+not involved. `admin` cannot be a parent: an administrator has every permission and none can be
+denied.
+
+The permissions are the fleet-wide objects whose rights are worth handing out separately:
+
+| Permission | Covers | Technician | Viewer |
+|---|---|---|---|
+| `baselines.edit` | create, change, delete baselines | yes | no |
+| `scripts.edit` | create, change, delete library scripts | yes | no |
+| `groups.edit` | create, rename, delete groups | yes | no |
+| `tasks.edit` | create, change, delete scheduled tasks | yes | no |
+| `alert_rules.edit` | create, change, delete alert rules | yes | no |
+| `patch_policies.edit` | create, change, delete patch policies | yes | no |
+| `automations.edit` | see and change automations | no | no |
+
+The defaults are what each route required before roles existed, so an installation that defines
+no role behaves as it did. Running a script or task, and evaluating or remediating a baseline,
+are not permissions: they stay with the base role.
+
+`automations.edit` comes with a scope: all automations, or a list. A role with a list sees and
+changes those and no others; creating or deleting one takes "all". Automations act on whatever
+device their trigger matches, in every organization, so an account limited to some organizations
+cannot hold this permission whatever its role says.
+
+What this is for: baselines, the script library and groups are not owned by an organization, so
+a technician scoped to one organization can change objects that act on another's devices. Give
+such technicians a role that denies those permissions. Three rules keep roles from becoming a
+way in. A role that cannot be resolved (a row removed by hand, a chain that loops) has no base
+and no permissions, which reads as "may only look". A role with accounts, or with roles built on
+it, cannot be deleted. And changing a role re-checks what its accounts have open, the same as
+changing one account's role does.
+
 **Baseline enforcement and the `command` kind.** An **enforced** baseline changes devices with no
 further confirmation, and a `command` check is arbitrary code run as SYSTEM/root on every matched
 device on a timer. Four things bound that:

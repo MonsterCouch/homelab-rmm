@@ -3,17 +3,67 @@
 // Keep them in sync by hand: the Go side is the source of truth.
 
 // 'poc' is a client contact: support tickets for one organization, no console.
-export type Role = 'admin' | 'tech' | 'viewer' | 'poc';
+export type BuiltinRole = 'admin' | 'tech' | 'viewer' | 'poc';
+/** A built-in role name or the id (slug) of a custom role. */
+export type Role = string;
+/** 'all' or the automation ids a role may touch. */
+export type AutomationScope = 'all' | number[];
 
 export interface User {
   id: number;
   username: string;
   role: Role;
+  /** display name of the role ("Technician", "Junior Tech") */
+  role_name: string;
+  /** the built-in at the root of the role's chain; '' = unresolved, treat as read-only */
+  base_role: BuiltinRole | '';
+  permissions: Record<string, boolean>;
+  automation_scope: AutomationScope;
   email: string;
   totp_enabled: boolean;
   created_at: number;
   last_login: number;
   org_scope?: string[];
+}
+
+export interface PermissionDef {
+  key: string;
+  label: string;
+  help: string;
+  tech: boolean;
+}
+
+export interface RoleEffective {
+  base: BuiltinRole | '';
+  permissions: Record<string, boolean>;
+  automation_scope: AutomationScope;
+}
+
+export interface RoleDef {
+  id: string;
+  name: string;
+  /** '' for the built-ins */
+  parent: string;
+  builtin: boolean;
+  /** this role's own overrides; an absent key is inherited */
+  grants: Record<string, boolean>;
+  /** null = inherit from the parent */
+  automations: AutomationScope | null;
+  created_at: number;
+  effective: RoleEffective;
+  users: number;
+}
+
+export interface RolesResponse {
+  permissions: PermissionDef[];
+  roles: RoleDef[];
+}
+
+export interface RoleInput {
+  name: string;
+  parent: string;
+  grants: Record<string, boolean>;
+  automations: AutomationScope | null;
 }
 
 export interface AuthState {

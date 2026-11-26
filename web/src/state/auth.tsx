@@ -14,6 +14,12 @@ interface AuthCtx {
   logout: () => Promise<void>;
   canWrite: boolean;
   isAdmin: boolean;
+  /** true for admins, else whether the role grants this permission key */
+  can: (perm: string) => boolean;
+  /** may open the Automations page: admin, or automations.edit with no organization restriction */
+  canAutomations: boolean;
+  /** may create and delete automations (every automation, not just a scoped few) */
+  allAutomations: boolean;
 }
 
 const Ctx = createContext<AuthCtx | null>(null);
@@ -59,8 +65,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const value = useMemo<AuthCtx>(
-    () => ({
+  const value = useMemo<AuthCtx>(() => {
+    const isAdmin = !!user && user.base_role === 'admin';
+    const can = (perm: string) => isAdmin || user?.permissions?.[perm] === true;
+    const canAutomations = isAdmin || (can('automations.edit') && !user?.org_scope?.length);
+    return {
       user,
       needsSetup,
       setupCodeRequired,
@@ -68,11 +77,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       refresh,
       setUser,
       logout,
-      canWrite: !!user && (user.role === 'admin' || user.role === 'tech'),
-      isAdmin: !!user && user.role === 'admin',
-    }),
-    [user, needsSetup, setupCodeRequired, version, refresh, logout],
-  );
+      canWrite: !!user && (user.base_role === 'admin' || user.base_role === 'tech'),
+      isAdmin,
+      can,
+      canAutomations,
+      allAutomations: isAdmin || (canAutomations && user?.automation_scope === 'all'),
+    };
+  }, [user, needsSetup, setupCodeRequired, version, refresh, logout]);
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

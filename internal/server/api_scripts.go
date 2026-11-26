@@ -618,6 +618,16 @@ func (d *DB) ListAutomations() ([]Automation, error) {
 }
 
 func (s *Server) saveAutomation(w http.ResponseWriter, r *http.Request, id int64) {
+	// Creating one adds to what every role with "all" can change, so it
+	// takes "all"; changing one takes that automation. One a role cannot
+	// change does not exist as far as that role is concerned.
+	if u := userFrom(r.Context()); id == 0 && !u.AllAutomations() {
+		writeErr(w, http.StatusForbidden, "creating an automation needs a role with access to all automations")
+		return
+	} else if id != 0 && !u.CanAutomation(id) {
+		writeErr(w, http.StatusNotFound, "automation not found")
+		return
+	}
 	var a Automation
 	if err := readJSON(r, &a); err != nil {
 		fail(w, err)
@@ -655,10 +665,18 @@ func (s *Server) saveAutomation(w http.ResponseWriter, r *http.Request, id int64
 }
 
 func (s *Server) handleListAutomations(w http.ResponseWriter, r *http.Request) {
-	a, err := s.db.ListAutomations()
+	all, err := s.db.ListAutomations()
 	if err != nil {
 		fail(w, err)
 		return
+	}
+	// A role that lists its automations sees those and no others.
+	u := userFrom(r.Context())
+	a := []Automation{}
+	for _, one := range all {
+		if u.CanAutomation(one.ID) {
+			a = append(a, one)
+		}
 	}
 	writeJSON(w, 200, a)
 }
@@ -671,6 +689,10 @@ func (s *Server) handleUpdateAutomation(w http.ResponseWriter, r *http.Request) 
 }
 func (s *Server) handleDeleteAutomation(w http.ResponseWriter, r *http.Request) {
 	id, _ := pathInt(r, "id")
+	if !userFrom(r.Context()).AllAutomations() {
+		writeErr(w, http.StatusForbidden, "deleting an automation needs a role with access to all automations")
+		return
+	}
 	s.db.Exec(`DELETE FROM automations WHERE id = ?`, id)
 	s.audit(r, "automation.delete", strconv.FormatInt(id, 10), nil)
 	writeJSON(w, 200, map[string]any{"ok": true})
