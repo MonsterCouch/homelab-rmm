@@ -20,6 +20,7 @@ import {
   IconBuilding,
   IconDashboard,
   IconDevices,
+  IconGrid,
   IconKey,
   IconKeyboard,
   IconLock,
@@ -69,6 +70,7 @@ const ADMIN_NAV = [
   { to: '/trust', label: 'Trust & signing', icon: IconKey },
   { to: '/settings', label: 'Settings', icon: IconSettings },
   { to: '/users', label: 'Users', icon: IconUsers },
+  { to: '/roles', label: 'Roles', icon: IconGrid },
   { to: '/audit', label: 'Audit', icon: IconAudit },
 ];
 const TAIL_NAV = [
@@ -76,7 +78,7 @@ const TAIL_NAV = [
 ];
 
 export function Layout() {
-  const { user, isAdmin, logout, version } = useAuth();
+  const { user, isAdmin, canAutomations, logout, version } = useAuth();
   const [theme, toggleTheme] = useTheme();
   const navigate = useNavigate();
   const loc = useLocation();
@@ -173,7 +175,7 @@ export function Layout() {
         ))}
 
         <div className="nav-section">Operations</div>
-        {NAV_OPS.map((n) => (
+        {NAV_OPS.filter((n) => n.to !== '/automations' || canAutomations).map((n) => (
           <NavLink
             key={n.to}
             to={n.to}
@@ -259,7 +261,7 @@ export function Layout() {
             <button className="btn ghost user-btn" style={{ gap: 8 }} aria-label="User menu">
               <span className="avatar">{(user?.username ?? '?').slice(0, 2).toUpperCase()}</span>
               <span>{user?.username}</span>
-              <span className="chip outline">{user?.role}</span>
+              <span className="chip outline">{user?.role_name || user?.role}</span>
             </button>
           }
         >

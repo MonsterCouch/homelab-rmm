@@ -13,7 +13,8 @@ import { useAuth } from '../state/auth';
 import { errMsg, useToast } from '../state/toast';
 
 export function Scripts() {
-  const { canWrite } = useAuth();
+  const { canWrite, can } = useAuth();
+  const canEdit = can('scripts.edit');
   const toast = useToast();
   const confirm = useConfirm();
   const navigate = useNavigate();
@@ -65,17 +66,23 @@ export function Scripts() {
       key: 'actions',
       header: '',
       render: (s) =>
-        canWrite ? (
+        canWrite || canEdit ? (
           <div className="cell-actions">
-            <Button size="xs" variant="primary" onClick={() => setRun({ script: s })}>
-              <IconRuns /> Run
-            </Button>
-            <Button size="xs" onClick={() => navigate(`/scripts/${s.id}`)}>
-              Edit
-            </Button>
-            <Button size="xs" variant="danger" onClick={() => remove(s)}>
-              Delete
-            </Button>
+            {canWrite && (
+              <Button size="xs" variant="primary" onClick={() => setRun({ script: s })}>
+                <IconRuns /> Run
+              </Button>
+            )}
+            {canEdit && (
+              <>
+                <Button size="xs" onClick={() => navigate(`/scripts/${s.id}`)}>
+                  Edit
+                </Button>
+                <Button size="xs" variant="danger" onClick={() => remove(s)}>
+                  Delete
+                </Button>
+              </>
+            )}
           </div>
         ) : null,
     },
@@ -86,14 +93,14 @@ export function Scripts() {
       <div className="page-head">
         <h1>Scripts</h1>
         {canWrite && (
-          <>
-            <Button onClick={() => setRun({ adHoc: true })}>
-              <IconRuns /> Ad hoc run
-            </Button>
-            <Button variant="primary" onClick={() => navigate('/scripts/new')}>
-              <IconPlus /> New script
-            </Button>
-          </>
+          <Button onClick={() => setRun({ adHoc: true })}>
+            <IconRuns /> Ad hoc run
+          </Button>
+        )}
+        {canEdit && (
+          <Button variant="primary" onClick={() => navigate('/scripts/new')}>
+            <IconPlus /> New script
+          </Button>
         )}
       </div>
       <div className="toolbar">
@@ -126,7 +133,7 @@ export function Scripts() {
         onRowClick={(s) => navigate(`/scripts/${s.id}`)}
         defaultSort={{ key: 'name', dir: 'asc' }}
         emptyTitle={scripts.data?.length ? 'No scripts match' : 'The library is empty'}
-        emptyBody={!scripts.data?.length && canWrite ? 'Create a script, or use "Ad hoc run" to execute one without saving.' : undefined}
+        emptyBody={!scripts.data?.length && canEdit ? 'Create a script, or use "Ad hoc run" to execute one without saving.' : undefined}
       />
       {run && <RunDialog onClose={() => setRun(null)} script={run.script} adHoc={run.adHoc} />}
     </>

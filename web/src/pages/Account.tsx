@@ -25,7 +25,7 @@ export function Account() {
                 <dd>{user.username}</dd>
                 <dt>Role</dt>
                 <dd>
-                  <Chip tone={user.role === 'admin' ? 'accent' : user.role === 'tech' ? 'info' : ''}>{user.role}</Chip>
+                  <Chip tone={user.base_role === 'admin' ? 'accent' : user.base_role === 'tech' ? 'info' : ''}>{user.role_name || user.role}</Chip>
                 </dd>
                 <dt>Email</dt>
                 <dd>{user.email || <span className="muted">not set</span>}</dd>
@@ -40,7 +40,7 @@ export function Account() {
         </div>
         <div className="stack" style={{ gap: 14 }}>
           <TwoFactor enabled={user.totp_enabled} onChanged={refresh} />
-          {user.role !== 'poc' && <SecurityKeys />}
+          {user.base_role !== 'poc' && <SecurityKeys />}
         </div>
       </div>
     </>

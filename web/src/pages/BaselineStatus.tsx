@@ -26,7 +26,7 @@ export function BaselineStatus() {
   const navigate = useNavigate();
   const toast = useToast();
   const confirm = useConfirm();
-  const { canWrite } = useAuth();
+  const { canWrite, can } = useAuth();
   const status = useAsync(() => api.baselineStatus(baselineId, 500), [baselineId]);
   const agentsList = useAsync(() => api.agents(), []);
   const groups = useAsync(() => api.groups(), []);
@@ -165,10 +165,12 @@ export function BaselineStatus() {
             >
               Evaluate now
             </Button>
-            <Button size="sm" onClick={() => navigate(`/baselines/${b.id}/edit`)}>
-              Edit
-            </Button>
           </>
+        )}
+        {can('baselines.edit') && (
+          <Button size="sm" onClick={() => navigate(`/baselines/${b.id}/edit`)}>
+            Edit
+          </Button>
         )}
       </div>
 

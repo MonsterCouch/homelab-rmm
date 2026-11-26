@@ -132,7 +132,8 @@ export function BaselineEditor() {
   const navigate = useNavigate();
   const toast = useToast();
   const confirm = useConfirm();
-  const { canWrite, isAdmin } = useAuth();
+  const { canWrite, can, isAdmin } = useAuth();
+  const canEdit = can('baselines.edit');
   const agents = useAsync(() => api.agents(), []);
   const groups = useAsync(() => api.groups(), []);
   const loaded = useAsync(async () => (baselineId ? api.baseline(baselineId) : null), [baselineId]);
@@ -264,12 +265,12 @@ export function BaselineEditor() {
         >
           Preview on devices
         </Button>
-        <Button variant="primary" onClick={save} busy={busy} disabled={!canWrite || adminBlocked}>
+        <Button variant="primary" onClick={save} busy={busy} disabled={!canEdit || adminBlocked}>
           {isNew ? 'Create baseline' : 'Save baseline'}
         </Button>
       </div>
 
-      {!canWrite && (
+      {!canEdit && (
         <div className="banner info">
           <span>You have read-only access: this baseline cannot be changed.</span>
         </div>
@@ -292,28 +293,28 @@ export function BaselineEditor() {
             <Field label="Target Operating System" hint="Select the OS first to filter available checks and endpoints.">
               <div className="row" style={{ gap: 16 }}>
                 <label className="row" style={{ gap: 6, cursor: 'pointer', fontWeight: !f.targets.os ? 600 : 400 }}>
-                  <input type="radio" name="bl-os" checked={!f.targets.os} disabled={!canWrite} onChange={() => upd({ targets: { ...f.targets, os: undefined } })} /> Cross-Platform / Any
+                  <input type="radio" name="bl-os" checked={!f.targets.os} disabled={!canEdit} onChange={() => upd({ targets: { ...f.targets, os: undefined } })} /> Cross-Platform / Any
                 </label>
                 <label className="row" style={{ gap: 6, cursor: 'pointer', fontWeight: f.targets.os === 'windows' ? 600 : 400 }}>
-                  <input type="radio" name="bl-os" checked={f.targets.os === 'windows'} disabled={!canWrite} onChange={() => upd({ targets: { ...f.targets, os: 'windows' } })} /> Windows
+                  <input type="radio" name="bl-os" checked={f.targets.os === 'windows'} disabled={!canEdit} onChange={() => upd({ targets: { ...f.targets, os: 'windows' } })} /> Windows
                 </label>
                 <label className="row" style={{ gap: 6, cursor: 'pointer', fontWeight: f.targets.os === 'linux' ? 600 : 400 }}>
-                  <input type="radio" name="bl-os" checked={f.targets.os === 'linux'} disabled={!canWrite} onChange={() => upd({ targets: { ...f.targets, os: 'linux' } })} /> Linux
+                  <input type="radio" name="bl-os" checked={f.targets.os === 'linux'} disabled={!canEdit} onChange={() => upd({ targets: { ...f.targets, os: 'linux' } })} /> Linux
                 </label>
               </div>
             </Field>
             <Field label="Name" htmlFor="bl-name">
-              <input id="bl-name" value={f.name} maxLength={LIMITS.name} disabled={!canWrite} onChange={(e) => upd({ name: e.target.value })} />
+              <input id="bl-name" value={f.name} maxLength={LIMITS.name} disabled={!canEdit} onChange={(e) => upd({ name: e.target.value })} />
             </Field>
             <Field label="Description" htmlFor="bl-desc" hint="Why this baseline exists. Not sent to devices.">
-              <input id="bl-desc" value={f.description} maxLength={LIMITS.description} disabled={!canWrite} onChange={(e) => upd({ description: e.target.value })} />
+              <input id="bl-desc" value={f.description} maxLength={LIMITS.description} disabled={!canEdit} onChange={(e) => upd({ description: e.target.value })} />
             </Field>
             <div className="form-row">
               <Field label="Evaluate every" htmlFor="bl-interval" hint={`Between ${duration(LIMITS.minInterval)} and ${duration(LIMITS.maxInterval)}. Devices evaluate offline too and report when they reconnect.`}>
                 <select
                   id="bl-interval"
                   value={custom || !INTERVALS.some((i) => i.sec === f.interval_sec) ? 'custom' : String(f.interval_sec)}
-                  disabled={!canWrite}
+                  disabled={!canEdit}
                   // "Custom…" has to be a state of its own: keeping the
                   // current interval (a preset) made the select snap back and
                   // the seconds field never appeared, so a custom interval
@@ -342,7 +343,7 @@ export function BaselineEditor() {
                     min={LIMITS.minInterval}
                     max={LIMITS.maxInterval}
                     value={f.interval_sec}
-                    disabled={!canWrite}
+                    disabled={!canEdit}
                     onChange={(e) => upd({ interval_sec: +e.target.value || LIMITS.defaultInterval })}
                   />
                 </Field>
@@ -351,12 +352,12 @@ export function BaselineEditor() {
             <Field label="Options" hint="A digest is sent at most once an hour per device and baseline, and only for checks that newly drift at critical severity.">
               <div className="stack" style={{ gap: 8 }}>
                 <span data-testid="bl-enabled">
-                  <Switch checked={f.enabled} disabled={!canWrite} onChange={(enabled) => upd({ enabled })} label="Enabled (assigned to matching devices)" />
+                  <Switch checked={f.enabled} disabled={!canEdit} onChange={(enabled) => upd({ enabled })} label="Enabled (assigned to matching devices)" />
                 </span>
                 <span data-testid="bl-notify">
                   <Switch
                     checked={f.notify_email}
-                    disabled={!canWrite}
+                    disabled={!canEdit}
                     onChange={(notify_email) => upd({ notify_email })}
                     label="Email a digest of new critical drift"
                   />
@@ -369,13 +370,13 @@ export function BaselineEditor() {
         <div className="card">
           <div className="card-head">Targets</div>
           <div className="card-body">
-            <TargetPicker value={f.targets} onChange={(targets) => upd({ targets })} agents={agents.data ?? []} groups={groups.data ?? []} disabled={!canWrite} />
+            <TargetPicker value={f.targets} onChange={(targets) => upd({ targets })} agents={agents.data ?? []} groups={groups.data ?? []} disabled={!canEdit} />
             {!matched.length && (
               <div className="banner warn" style={{ marginTop: 8 }}>
                 <div className="stack" style={{ gap: 6, width: '100%' }}>
                   <span>These targets match no devices, so nothing will ever evaluate this baseline.</span>
                   <label className="row" style={{ gap: 6 }}>
-                    <input type="checkbox" checked={allowEmpty} disabled={!canWrite} onChange={(e) => setAllowEmpty(e.target.checked)} /> Save anyway
+                    <input type="checkbox" checked={allowEmpty} disabled={!canEdit} onChange={(e) => setAllowEmpty(e.target.checked)} /> Save anyway
                   </label>
                 </div>
               </div>
@@ -401,7 +402,7 @@ export function BaselineEditor() {
               style={{
                 padding: '12px 14px',
                 margin: 0,
-                cursor: canWrite ? 'pointer' : 'default',
+                cursor: canEdit ? 'pointer' : 'default',
                 border: !f.enforce ? '2px solid var(--primary)' : '1px solid var(--border)',
                 background: !f.enforce ? 'rgba(59, 130, 246, 0.08)' : 'var(--bg-card)',
               }}
@@ -411,7 +412,7 @@ export function BaselineEditor() {
                   type="radio"
                   name="bl-enforce-mode"
                   checked={!f.enforce}
-                  disabled={!canWrite}
+                  disabled={!canEdit}
                   onChange={() => upd({ enforce: false })}
                 />
                 <b>Audit & Alert Only</b>
@@ -426,7 +427,7 @@ export function BaselineEditor() {
               style={{
                 padding: '12px 14px',
                 margin: 0,
-                cursor: canWrite ? 'pointer' : 'default',
+                cursor: canEdit ? 'pointer' : 'default',
                 border: f.enforce ? '2px solid var(--accent)' : '1px solid var(--border)',
                 background: f.enforce ? 'rgba(168, 85, 247, 0.08)' : 'var(--bg-card)',
               }}
@@ -436,7 +437,7 @@ export function BaselineEditor() {
                   type="radio"
                   name="bl-enforce-mode"
                   checked={f.enforce}
-                  disabled={!canWrite}
+                  disabled={!canEdit}
                   onChange={() => upd({ enforce: true })}
                 />
                 <b>Auto-Enforce & Remediate</b>
@@ -464,7 +465,7 @@ export function BaselineEditor() {
             {f.checks.length} / {LIMITS.checksPerBaseline}
           </span>
           <div className="actions">
-            {canWrite && (
+            {canEdit && (
               <Button size="sm" variant="primary" onClick={() => setEditing({ index: -1, check: blankCheck() })} disabled={f.checks.length >= LIMITS.checksPerBaseline}>
                 <IconPlus /> Add check
               </Button>
@@ -494,10 +495,10 @@ export function BaselineEditor() {
                     <tr key={`${c.id}-${i}`}>
                       <td>
                         <div className="row" style={{ gap: 2, flexWrap: 'nowrap' }}>
-                          <Button size="xs" variant="ghost" icon aria-label={`Move ${c.name} up`} disabled={!canWrite || i === 0} onClick={() => move(i, -1)}>
+                          <Button size="xs" variant="ghost" icon aria-label={`Move ${c.name} up`} disabled={!canEdit || i === 0} onClick={() => move(i, -1)}>
                             ↑
                           </Button>
-                          <Button size="xs" variant="ghost" icon aria-label={`Move ${c.name} down`} disabled={!canWrite || i === f.checks.length - 1} onClick={() => move(i, 1)}>
+                          <Button size="xs" variant="ghost" icon aria-label={`Move ${c.name} down`} disabled={!canEdit || i === f.checks.length - 1} onClick={() => move(i, 1)}>
                             ↓
                           </Button>
                         </div>
@@ -524,7 +525,7 @@ export function BaselineEditor() {
                       <td className="muted small">{c.os_filter ? osLabel(c.os_filter) : 'any'}</td>
                       <td className="muted small">{c.timeout_sec}s</td>
                       <td>
-                        {canWrite && (
+                        {canEdit && (
                           <div className="cell-actions">
                             <Button size="xs" onClick={() => setEditing({ index: i, check: c })}>
                               Edit

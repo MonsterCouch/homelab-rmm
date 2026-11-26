@@ -219,7 +219,8 @@ function PatchList() {
 const blankPolicy = (): PatchPolicy => ({ id: 0, name: '', targets: EMPTY_TARGETS, scan_schedule: '0 */6 * * *', install_schedule: '', mode: 'approved', reboot: 'never', enabled: true, repair: 'off', created_at: 0 });
 
 function PolicyList() {
-  const { canWrite } = useAuth();
+  const { can } = useAuth();
+  const canEdit = can('patch_policies.edit');
   const toast = useToast();
   const confirm = useConfirm();
   const policies = useAsync(() => api.patchPolicies(), []);
@@ -252,12 +253,12 @@ function PolicyList() {
     { key: 'install', header: 'Install', render: (p) => (p.install_schedule ? describeCron(p.install_schedule) : <span className="muted">manual approval only</span>) },
     { key: 'mode', header: 'Mode', sort: (p) => p.mode, render: (p) => <Chip outline>{p.mode}</Chip> },
     { key: 'reboot', header: 'Reboot', sort: (p) => p.reboot, render: (p) => <span className="muted">{p.reboot.replace('_', ' ')}</span> },
-    { key: 'enabled', header: 'Enabled', sort: (p) => (p.enabled ? 0 : 1), render: (p) => <Switch checked={p.enabled} disabled={!canWrite} ariaLabel={`Enable policy ${p.name}`} onChange={(v) => toggle(p, v)} /> },
+    { key: 'enabled', header: 'Enabled', sort: (p) => (p.enabled ? 0 : 1), render: (p) => <Switch checked={p.enabled} disabled={!canEdit} ariaLabel={`Enable policy ${p.name}`} onChange={(v) => toggle(p, v)} /> },
     {
       key: 'actions',
       header: '',
       render: (p) =>
-        canWrite ? (
+        canEdit ? (
           <div className="cell-actions">
             <Button size="xs" onClick={() => setEditing(p)}>
               Edit
@@ -275,14 +276,14 @@ function PolicyList() {
       <div className="toolbar">
         <span className="muted small">A policy scans its targets on a schedule and, optionally, installs on another schedule according to its mode.</span>
         <span className="grow" />
-        {canWrite && (
+        {canEdit && (
           <Button variant="primary" onClick={() => setEditing(blankPolicy())}>
             <IconPlus /> New policy
           </Button>
         )}
       </div>
       {policies.error && <ErrorBox error={policies.error} onRetry={policies.reload} />}
-      <DataTable columns={columns} rows={policies.data} loading={policies.loading} rowKey={(p) => String(p.id)} onRowClick={canWrite ? (p) => setEditing(p) : undefined} defaultSort={{ key: 'name', dir: 'asc' }} emptyTitle="No patch policies" />
+      <DataTable columns={columns} rows={policies.data} loading={policies.loading} rowKey={(p) => String(p.id)} onRowClick={canEdit ? (p) => setEditing(p) : undefined} defaultSort={{ key: 'name', dir: 'asc' }} emptyTitle="No patch policies" />
       {editing && (
         <PolicyEditor
           policy={editing}

@@ -6,7 +6,7 @@ import { Modal, useConfirm } from './Modal';
 import { Button } from './ui';
 import { IconCheck, IconEdit, IconTrash, IconX } from './Icons';
 
-export function GroupsDialog({ groups, onClose, onChanged, canWrite }: { groups: Group[]; onClose: () => void; onChanged: () => void; canWrite: boolean }) {
+export function GroupsDialog({ groups, onClose, onChanged, canEdit }: { groups: Group[]; onClose: () => void; onChanged: () => void; canEdit: boolean }) {
   const toast = useToast();
   const confirm = useConfirm();
   const [name, setName] = useState('');
@@ -60,7 +60,7 @@ export function GroupsDialog({ groups, onClose, onChanged, canWrite }: { groups:
 
   return (
     <Modal title="Device groups" onClose={onClose} size="sm" footer={<Button onClick={onClose}>Done</Button>}>
-      {canWrite && (
+      {canEdit && (
         <div className="row mb" style={{ flexWrap: 'nowrap' }}>
           <input placeholder="New group name" value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && create()} />
           <Button variant="primary" onClick={create} busy={busy} disabled={!name.trim()}>
@@ -89,7 +89,7 @@ export function GroupsDialog({ groups, onClose, onChanged, canWrite }: { groups:
                     {g.agent_count} device{g.agent_count === 1 ? '' : 's'}
                   </div>
                 </div>
-                {canWrite && (
+                {canEdit && (
                   <>
                     <Button
                       size="sm"

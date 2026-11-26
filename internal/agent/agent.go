@@ -251,8 +251,7 @@ func (a *Agent) dialQUIC(ctx context.Context, port int) (*quicLink, protocol.Env
 	var ref *quicRefusal
 	if errors.As(err, &ref) && ref.msg == protocol.ErrUnknownAgentKey && a.cfg.Key != "" && a.cfg.EnrollToken != "" {
 		slog.Warn("agent key rejected, re-enrolling with stored token")
-		a.cfg.Key, a.cfg.AgentID = "", ""
-		a.cfg.Save()
+		a.forgetKey()
 	}
 	return link, env, err
 }
@@ -271,8 +270,7 @@ func (a *Agent) sessionWS(ctx context.Context) error {
 		if resp != nil && resp.StatusCode == http.StatusUnauthorized && a.cfg.Key != "" && a.cfg.EnrollToken != "" {
 			// key revoked (device deleted on the server) but we still hold a token: re-enroll
 			slog.Warn("agent key rejected, re-enrolling with stored token")
-			a.cfg.Key, a.cfg.AgentID = "", ""
-			a.cfg.Save()
+			a.forgetKey()
 		}
 		return err
 	}
@@ -343,6 +341,17 @@ func (a *Agent) sessionQUIC(ctx context.Context, link *quicLink, welcome protoco
 	return err
 }
 
+// forgetKey drops a key the server rejected so the next dial enrolls with the
+// stored token. The identity that went with it is remembered until that
+// enrollment lands (see welcomed).
+func (a *Agent) forgetKey() {
+	if a.cfg.AgentID != "" {
+		a.cfg.PrevAgentID = a.cfg.AgentID
+	}
+	a.cfg.Key, a.cfg.AgentID = "", ""
+	a.cfg.Save()
+}
+
 // welcomed handles the server's answer to hello, whichever transport carried
 // it: a refusal is an error, an enrollment saves the key it brings, and the
 // pushed configuration is applied.
@@ -359,7 +368,24 @@ func (a *Agent) welcomed(env protocol.Envelope) error {
 		return err
 	}
 	if welcome.AgentKey != "" {
-		a.cfg.AgentID, a.cfg.Key = welcome.AgentID, welcome.AgentKey
+		// A new identity is only ever the answer to an enrollment. The server
+		// sends agent_key when the device dialled with a token and never when
+		// it dialled with its key, so a keyed session that is handed one is a
+		// server rewriting which device this is - and with it, which signed
+		// manifests and grants the device will accept as addressed to itself.
+		if a.cfg.Key != "" {
+			return errors.New("server sent a new device identity on a session that was not an enrollment; refused")
+		}
+		// Re-enrolling after a rejected key is the other way to be renamed:
+		// the server decides whether the key is rejected and which ID comes
+		// back. Under an enforcing trust bundle the device keeps the identity
+		// approvals were signed for, or none.
+		if prev := a.cfg.PrevAgentID; prev != "" && welcome.AgentID != prev && a.trust.identityPinned() {
+			return fmt.Errorf("server assigned device identity %s in place of %s while an enforcing trust bundle is pinned; refused. "+
+				"Signed approvals name devices by identity. If this device was removed on purpose and should enroll as new, delete trust.json and log_head.json in %s and restart the agent",
+				welcome.AgentID, prev, ConfigDir())
+		}
+		a.cfg.AgentID, a.cfg.Key, a.cfg.PrevAgentID = welcome.AgentID, welcome.AgentKey, ""
 		if err := a.cfg.Save(); err != nil {
 			slog.Error("cannot save enrollment; the device will re-enroll next start", "err", err)
 		} else {

@@ -6,6 +6,12 @@ and versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Roles an administrator can define:** beside the built-in Administrator, Technician, Viewer and Client contact, a custom
+  role inherits from Technician, Viewer or another custom role and then grants or denies individual permissions: changing
+  baselines, the script library, groups, scheduled tasks, alert rules, patch policies and automations. Automations can be
+  opened to a non-administrator role for all of them or a named list. The defaults match what each route required before, so
+  nothing changes until a role is created. Managed on the new Roles page and `/api/roles`; see "Custom roles" in
+  `docs/SECURITY.md`.
 - **Remote terminal over WebRTC:** the terminal moves its bytes over a WebRTC data channel (`term`, raw pty bytes, no string
   conversion) and keeps the WebSocket relay as the fallback; the switch is ordered so no byte is lost or reordered, and the
   browser falls back after 4 s or on any failure. The ICE servers from `RMM_ICE_SERVERS`, credentials included, now reach the
@@ -54,6 +60,23 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - **Wayland capture:** the PipeWire stream never wrote `active_driver_id`, so the driver never scheduled it and no frame arrived.
 
 ### Security & Hardening
+- **Revoking access now ends what the account has open:** a terminal, a remote desktop or the live event stream used to be
+  checked once, when it opened, and then ran until the tab closed. Signing out, a password change or reset, a demotion, a
+  narrower organization scope and deleting the account now close them at once (close code 1008), and the shell or desktop helper
+  on the device is torn down with them. A sweep every 30 s catches what the server cannot see happen: an expired session, a
+  password reset from the CLI, a device moved to another organization.
+- **A device's identity is no longer the server's to reassign:** the agent accepts a new agent ID and key only as the answer
+  to an enrollment, never on a session it opened with its key. With an enforcing trust bundle pinned, re-enrolling after a
+  rejected key must return the identity the device already had; anything else is refused, so a grant or action signed for one
+  device cannot be run on another. A device that was deleted on purpose and should enroll as new needs `trust.json` and
+  `log_head.json` removed first. Without an enforcing bundle, re-enrollment is unchanged.
+- **Two-step sign-in cannot be replaced with a session alone:** `POST /api/me/totp/begin` is refused (409) while a factor is
+  enabled. Turn it off with the password first, as before.
+- **The login limit is per address again:** a successful sign-in takes back its own attempt and no longer clears the
+  address's count, which let anyone with a working account reset the limit and keep guessing someone else's password.
+- **Former operators stop counting as signers:** a user whose security key is in a trust bundle cannot be deleted until the
+  key is removed from the bundle (409, the rule deleting a single key already followed), and a signature made with a key whose
+  owner is no longer a technician or administrator is rejected (403) instead of counting toward the threshold.
 - **Security Audit Mitigations (VULN-001 - VULN-016):**
   - Strict tenant IDOR verification across all agent, task, baseline, and ticket endpoints (`VULN-001`, `VULN-006`).
   - Fleet tag bypass prevention: dynamic intersection of tag selectors with user's `org_scope` (`VULN-007`, `VULN-015`, `VULN-016`).

@@ -39,7 +39,8 @@ export function ScriptEditor() {
   const navigate = useNavigate();
   const toast = useToast();
   const confirm = useConfirm();
-  const { canWrite } = useAuth();
+  const { canWrite, can } = useAuth();
+  const canEdit = can('scripts.edit');
   const existing = useAsync(() => api.script(+id!), [id], { enabled: !isNew });
   const [form, setForm] = useState<Script>(blank);
   const [dirty, setDirty] = useState(false);
@@ -106,7 +107,7 @@ export function ScriptEditor() {
 
   if (!isNew && existing.error && !existing.data) return <ErrorBox error={existing.error} onRetry={existing.reload} />;
   if (!isNew && !existing.data) return <Loading />;
-  const ro = !canWrite;
+  const ro = !canEdit;
 
   return (
     <>
@@ -124,12 +125,12 @@ export function ScriptEditor() {
             <IconRuns /> Run
           </Button>
         )}
-        {!isNew && canWrite && (
+        {!isNew && canEdit && (
           <Button variant="danger" onClick={remove}>
             <IconTrash /> Delete
           </Button>
         )}
-        {canWrite && (
+        {canEdit && (
           <Button variant="primary" onClick={save} busy={busy} disabled={!dirty && !isNew}>
             {isNew ? 'Create' : 'Save'}
           </Button>
@@ -188,7 +189,7 @@ export function ScriptEditor() {
           <div className="card">
             <div className="card-head">
               Parameters
-              {canWrite && (
+              {canEdit && (
                 <div className="actions">
                   <Button size="sm" onClick={() => upd({ params: [...form.params, { name: '', description: '', default: '', required: false }] })}>
                     <IconPlus /> Add
@@ -208,7 +209,7 @@ export function ScriptEditor() {
                     <label className="row small" style={{ gap: 4, whiteSpace: 'nowrap', flexWrap: 'nowrap' }}>
                       <input type="checkbox" checked={p.required} disabled={ro} onChange={(e) => setParam(i, { required: e.target.checked })} /> required
                     </label>
-                    {canWrite && (
+                    {canEdit && (
                       <Button size="sm" icon variant="ghost" aria-label="Remove parameter" onClick={() => upd({ params: form.params.filter((_, j) => j !== i) })}>
                         <IconTrash />
                       </Button>

@@ -268,7 +268,8 @@ function ruleSummary(r: AlertRule): string {
 }
 
 function RuleList() {
-  const { canWrite } = useAuth();
+  const { can } = useAuth();
+  const canEdit = can('alert_rules.edit');
   const toast = useToast();
   const confirm = useConfirm();
   const rules = useAsync(() => api.alertRules(), []);
@@ -301,12 +302,12 @@ function RuleList() {
     { key: 'targets', header: 'Targets', render: (r) => <span className="muted">{targetsSummary(r.targets, agents.data, groups.data)}</span> },
     { key: 'email', header: 'Email', sort: (r) => (r.notify_email ? 0 : 1), render: (r) => (r.notify_email ? 'yes' : <span className="faint">no</span>) },
     { key: 'auto', header: 'Auto-resolve', sort: (r) => (r.auto_resolve ? 0 : 1), render: (r) => (r.auto_resolve ? 'yes' : <span className="faint">no</span>) },
-    { key: 'enabled', header: 'Enabled', sort: (r) => (r.enabled ? 0 : 1), render: (r) => <Switch checked={r.enabled} disabled={!canWrite} ariaLabel={`Enable rule ${r.name}`} onChange={(v) => toggle(r, v)} /> },
+    { key: 'enabled', header: 'Enabled', sort: (r) => (r.enabled ? 0 : 1), render: (r) => <Switch checked={r.enabled} disabled={!canEdit} ariaLabel={`Enable rule ${r.name}`} onChange={(v) => toggle(r, v)} /> },
     {
       key: 'actions',
       header: '',
       render: (r) =>
-        canWrite ? (
+        canEdit ? (
           <div className="cell-actions">
             <Button size="xs" onClick={() => setEditing(r)}>
               Edit
@@ -324,14 +325,14 @@ function RuleList() {
       <div className="toolbar">
         <span className="muted small">Rules are evaluated on every metrics sample and every 30 seconds for offline detection.</span>
         <span className="grow" />
-        {canWrite && (
+        {canEdit && (
           <Button variant="primary" onClick={() => setEditing(blankRule())}>
             <IconPlus /> New rule
           </Button>
         )}
       </div>
       {rules.error && <ErrorBox error={rules.error} onRetry={rules.reload} />}
-      <DataTable columns={columns} rows={rules.data} loading={rules.loading} rowKey={(r) => String(r.id)} onRowClick={canWrite ? (r) => setEditing(r) : undefined} defaultSort={{ key: 'name', dir: 'asc' }} csvName="alert-rules" emptyTitle="No alert rules" emptyBody="Add rules for CPU, memory, disk, offline devices, services and more." />
+      <DataTable columns={columns} rows={rules.data} loading={rules.loading} rowKey={(r) => String(r.id)} onRowClick={canEdit ? (r) => setEditing(r) : undefined} defaultSort={{ key: 'name', dir: 'asc' }} csvName="alert-rules" emptyTitle="No alert rules" emptyBody="Add rules for CPU, memory, disk, offline devices, services and more." />
       {editing && (
         <RuleEditor
           rule={editing}

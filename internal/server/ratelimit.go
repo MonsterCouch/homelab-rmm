@@ -48,3 +48,16 @@ func (r *rateLimiter) reset(key string) {
 	delete(r.hits, key)
 	r.mu.Unlock()
 }
+
+// forgive takes back one hit, for an attempt that turned out to be
+// legitimate. It is what a successful login uses instead of reset: the key is
+// a client address that several accounts share, and deleting it let anyone
+// with a working account wipe out the failures counted against everyone
+// else's, so guessing another user's password or code was never limited.
+func (r *rateLimiter) forgive(key string) {
+	r.mu.Lock()
+	if e := r.hits[key]; e != nil && e.n > 0 {
+		e.n--
+	}
+	r.mu.Unlock()
+}

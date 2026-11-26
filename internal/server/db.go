@@ -749,6 +749,20 @@ CREATE TABLE IF NOT EXISTS servicing_repairs (
 );
 CREATE INDEX IF NOT EXISTS idx_servicing_repairs_agent ON servicing_repairs(agent_id, started_at DESC);
 `,
+	// 19: custom roles. users.role holds a built-in role's name or one of
+	// these ids. parent is a built-in (tech, viewer) or another row here;
+	// grants is {"permission": true|false}, absent meaning inherited;
+	// automations is null (inherit), "all" or a list of automation ids.
+	`
+CREATE TABLE IF NOT EXISTS roles (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	parent TEXT NOT NULL,
+	grants TEXT NOT NULL DEFAULT '{}',
+	automations TEXT NOT NULL DEFAULT 'null',
+	created_at INTEGER NOT NULL
+);
+`,
 }
 
 // Close checkpoints the write-ahead log before closing, so a short-lived

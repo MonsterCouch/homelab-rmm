@@ -314,6 +314,17 @@ func (t *trustState) modeNow() string {
 	return t.bundle.Mode()
 }
 
+// identityPinned reports whether the device's identity is part of what the
+// pinned bundle protects. Signed manifests name the devices they are for by
+// agent ID, so under an enforcing bundle the ID must not be the server's to
+// reassign. An unusable trust state counts too: it refuses every action until
+// it is re-pinned, and must not be a way around this either.
+func (t *trustState) identityPinned() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.failed != nil || t.bundle.Mode() == actionauth.ModeEnforce
+}
+
 // ---- baseline specs ----
 
 // splitConfig decodes an agent.config frame twice: typed, and again to keep

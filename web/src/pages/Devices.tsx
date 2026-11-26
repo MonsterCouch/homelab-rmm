@@ -35,7 +35,7 @@ function diskMax(m: Metrics | undefined): number | undefined {
 }
 
 export function Devices() {
-  const { canWrite } = useAuth();
+  const { canWrite, can } = useAuth();
   const toast = useToast();
   const confirm = useConfirm();
   const navigate = useNavigate();
@@ -594,7 +594,7 @@ export function Devices() {
       {groupsOpen && (
         <GroupsDialog
           groups={groups.data ?? []}
-          canWrite={canWrite}
+          canEdit={can('groups.edit')}
           onClose={() => setGroupsOpen(false)}
           onChanged={() => {
             void groups.reload();

@@ -74,6 +74,17 @@ brand-new record with no history, so removing a machine for good means stopping 
 its agent first, or waiting out the token. The rejoin is auditable (`agent.enrolled`, or
 `agent.rekeyed` when it adopts an existing record).
 
+**The server cannot rename a device.** Signed manifests and grants name the devices they are for
+by agent ID, and the ID comes from the server, so the agent limits when it will take one
+(`welcomed` in `internal/agent/agent.go`). A new ID and key are accepted only as the answer to an
+enrollment; a session the agent opened with its key that is handed a new identity is refused. And
+when a trust bundle in `enforce` mode is pinned, re-enrolling after a rejected key must return the
+identity the device already had (it is kept as `prev_agent_id` in `agent.json` until then). A
+different one is refused and logged, and the device stays un-enrolled. That is the price of the
+guarantee: a device deleted in the console under an enforcing bundle does not come back as a new
+record on its own. To enroll it as new, delete `trust.json` and `log_head.json` on the device and
+restart the agent. Without an enforcing bundle the rejoin above is unchanged.
+
 **The desktop helper** connects with a single-use 24-byte token minted for one viewer session,
 consumed on first use and discarded when the viewer disconnects.
 
@@ -83,9 +94,33 @@ with `--insecure`, where the proxy provides TLS). Every state-changing API reque
 `X-Requested-With` — any value, because what matters is that a cross-site form or a CORS
 "simple request" cannot set a custom header at all; together with `SameSite=Strict` that is the
 CSRF defence. Browser WebSockets are accepted only when `Origin` matches `Host`. Login is
-rate-limited to 10 attempts per minute per client address, and failed logins are audited.
+rate-limited to 10 attempts per minute per client address, and failed logins are audited. A
+successful sign-in takes back its own attempt only; it does not clear the address's count, so
+signing in with one account buys no extra guesses at another. Two-step sign-in can be set up
+only while it is off: replacing an enabled factor means turning it off first, which asks for the
+password, so a session cookie alone cannot remove or swap it.
 Changing your own password **deletes your other sessions**, so reacting to a stolen cookie by
 changing the password actually ends it.
+
+**Revocation reaches open connections.** A terminal, a remote desktop and the live event stream
+are long-lived, and each is authorized when it opens. The server keeps a registry of them
+(`internal/server/livestreams.go`) and re-checks it whenever access is taken away - sign-out, a
+password change or reset, a role change, a narrower organization scope, deleting the account -
+and every 30 seconds for what it cannot see happen (an expired session, a password reset from
+the CLI, a device moved to another organization). A terminal or desktop whose operator can no
+longer write, or can no longer reach the device's organization, is closed with code 1008 and
+the shell or desktop helper on the device is torn down. The event stream ends when the role or
+scope changes and the browser reconnects under the new one.
+
+**Removing an operator who signs actions.** The trust bundle is what agents verify against, and
+it changes only by a signed rotation, so a key stays in it after its owner's account changes.
+Two rules keep that from mattering in the meantime. A user whose key is in a current bundle
+cannot be deleted (409) until the key is removed from the bundle, the same rule deleting a
+single key follows. And the server rejects a signature (403) made with a key whose owner is no
+longer a technician or administrator, so a demoted operator does not count toward a threshold.
+To offboard someone: change their role or reset their password (immediate), rotate the bundle
+without their key, then delete the account. Their key may still sign the rotation that removes
+it; rotation follows the bundle's own rule.
 
 **First-run setup.** Until an account exists, `POST /api/auth/setup` creates the initial
 administrator account — which has administrative control over every device enrolled in the system.
@@ -132,6 +167,44 @@ account by accident. A viewer is also refused the endpoints that are reads only 
 **values**, and a token is all anyone needs to add a device of their own to the fleet (and, via
 the hostname adoption below, to take over an offline device's record). Browsing a directory
 listing stays available.
+
+**Custom roles.** Those three, and `poc`, are built in and fixed. An administrator can define
+more (`internal/server/roles.go`, the Roles page). A custom role has one parent: `tech`,
+`viewer` or another custom role. It starts with everything the parent has, then grants or denies
+individual permissions; whatever it does not mention follows the parent, including later changes
+to the parent. The built-in at the root of the chain is the role's **base**, and the base is what
+every broad gate goes by, so a custom role is a technician or a viewer wherever a permission is
+not involved. `admin` cannot be a parent: an administrator has every permission and none can be
+denied.
+
+The permissions are the fleet-wide objects whose rights are worth handing out separately:
+
+| Permission | Covers | Technician | Viewer |
+|---|---|---|---|
+| `baselines.edit` | create, change, delete baselines | yes | no |
+| `scripts.edit` | create, change, delete library scripts | yes | no |
+| `groups.edit` | create, rename, delete groups | yes | no |
+| `tasks.edit` | create, change, delete scheduled tasks | yes | no |
+| `alert_rules.edit` | create, change, delete alert rules | yes | no |
+| `patch_policies.edit` | create, change, delete patch policies | yes | no |
+| `automations.edit` | see and change automations | no | no |
+
+The defaults are what each route required before roles existed, so an installation that defines
+no role behaves as it did. Running a script or task, and evaluating or remediating a baseline,
+are not permissions: they stay with the base role.
+
+`automations.edit` comes with a scope: all automations, or a list. A role with a list sees and
+changes those and no others; creating or deleting one takes "all". Automations act on whatever
+device their trigger matches, in every organization, so an account limited to some organizations
+cannot hold this permission whatever its role says.
+
+What this is for: baselines, the script library and groups are not owned by an organization, so
+a technician scoped to one organization can change objects that act on another's devices. Give
+such technicians a role that denies those permissions. Three rules keep roles from becoming a
+way in. A role that cannot be resolved (a row removed by hand, a chain that loops) has no base
+and no permissions, which reads as "may only look". A role with accounts, or with roles built on
+it, cannot be deleted. And changing a role re-checks what its accounts have open, the same as
+changing one account's role does.
 
 **Baseline enforcement and the `command` kind.** An **enforced** baseline changes devices with no
 further confirmation, and a `command` check is arbitrary code run as SYSTEM/root on every matched
