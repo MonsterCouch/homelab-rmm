@@ -312,6 +312,9 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	if in.ResetTOTP {
 		s.db.disableTOTP(id)
 	}
+	// A new role, a narrower scope or a reset password must reach what the
+	// account already has open, not only its next request.
+	s.recheckStreams()
 	s.audit(r, "user.update", strconv.FormatInt(id, 10), map[string]any{
 		"role":           in.Role,
 		"org_scope":      in.OrgScope,
@@ -327,7 +330,22 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "you cannot delete yourself")
 		return
 	}
+	// Deleting the account cascades to its security keys, but not to the
+	// trust bundles that list them: agents would go on counting a key whose
+	// owner no longer exists. This is the rule deleting a single key already
+	// follows. Console access can be cut at once without deleting anything:
+	// reset the password, or change the role.
+	held, err := s.db.bundleKeysOf(id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	if held {
+		writeErr(w, http.StatusConflict, "this user's security key is in a trust bundle that agents rely on: remove it from the trust bundle first. To cut their console access now, reset their password or change their role")
+		return
+	}
 	s.db.Exec(`DELETE FROM users WHERE id = ?`, id)
+	s.recheckStreams()
 	s.audit(r, "user.delete", strconv.FormatInt(id, 10), nil)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }

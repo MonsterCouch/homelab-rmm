@@ -90,6 +90,9 @@ type Server struct {
 	quic atomic.Pointer[quicServer]
 	// mesh holds the subnet cache assignments (cache_assign.go).
 	mesh meshAssigner
+	// live is the registry of open terminals, remote desktops and event
+	// streams, so revoking access can end them (livestreams.go).
+	live liveStreams
 }
 
 // jobContext is the context long background work runs under. It is cancelled
@@ -458,6 +461,7 @@ func (s *Server) Run(ctx context.Context) error {
 	s.sched.start(ctx)
 	s.goJob(func() { s.alerts.run(ctx) })
 	s.goJob(func() { s.meshLoop(ctx) })
+	s.goJob(func() { s.watchStreams(ctx) })
 	if s.cfg.TailscaleCert && s.tsCertHost != "" {
 		s.goJob(func() { s.renewTailscaleCert(ctx) })
 	}

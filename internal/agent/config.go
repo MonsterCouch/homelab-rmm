@@ -23,6 +23,11 @@ import (
 type Config struct {
 	ServerURL   string `json:"server_url"`
 	AgentID     string `json:"agent_id,omitempty"`
+	// PrevAgentID is the identity the device held when its key was rejected
+	// and it fell back to re-enrolling with the stored token. It is kept
+	// until the re-enrollment lands, so the agent can tell being given its
+	// own record back from being given a different identity.
+	PrevAgentID string `json:"prev_agent_id,omitempty"`
 	Key         string `json:"key,omitempty"`
 	EnrollToken string `json:"enroll_token,omitempty"`
 	Fingerprint string `json:"fingerprint,omitempty"` // sha256 hex of the server certificate; "" = system trust

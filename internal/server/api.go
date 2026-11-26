@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -509,7 +511,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
-	loginLimiter.reset(ip)
+	// Only this attempt is taken back. The address's other failures stay
+	// counted: they may be guesses at someone else's account.
+	loginLimiter.forgive(ip)
 	s.db.Audit(res.User.Username, ip, "login", "", nil)
 	s.setSessionCookie(w, r, tok, int(sessionTTL.Seconds()))
 	writeJSON(w, 200, map[string]any{"ok": true, "user": res.User})
@@ -518,6 +522,8 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if c, _ := r.Cookie(sessionCookie); c != nil {
 		s.db.deleteSession(c.Value)
+		// a terminal or remote desktop this session left open ends with it
+		s.recheckStreams()
 	}
 	s.setSessionCookie(w, r, "", -1)
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -554,12 +560,18 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	} else {
 		s.db.Exec(`DELETE FROM sessions WHERE user_id = ?`, u.ID)
 	}
+	// ... and so does anything those sessions still had open
+	s.recheckStreams()
 	s.audit(r, "password.changed", u.Username, nil)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 func (s *Server) handleTOTPBegin(w http.ResponseWriter, r *http.Request) {
 	secret, url, err := s.db.beginTOTP(userFrom(r.Context()))
+	if errors.Is(err, errTOTPAlreadyOn) {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
 	if err != nil {
 		fail(w, err)
 		return
@@ -609,9 +621,18 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	ping := time.NewTicker(25 * time.Second)
 	defer ping.Stop()
 	me := userFrom(r.Context())
+	// The stream filters with the account as it was when it opened. End it
+	// when the session goes away, and also when the role or organization
+	// scope changes: the browser reconnects and the new stream filters with
+	// the account as it is now.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	defer s.trackStream(r, func(u *User) bool {
+		return me != nil && u.Role == me.Role && slices.Equal(u.OrgScope, me.OrgScope)
+	}, cancel)()
 	for {
 		select {
-		case <-r.Context().Done():
+		case <-ctx.Done():
 			return
 		case <-ping.C:
 			fmt.Fprint(w, ": ping\n\n")

@@ -257,13 +257,26 @@ func (d *DB) purgeSessions() {
 
 // ---- TOTP ----
 
+// errTOTPAlreadyOn is beginTOTP's refusal to touch a factor that is in use.
+var errTOTPAlreadyOn = errors.New("two-step sign-in is already on: turn it off with your password before setting it up again")
+
+// beginTOTP stores a new, not yet confirmed secret. It only does so while
+// two-step sign-in is off. Beginning used to clear an enabled factor and
+// replace its secret with nothing but a session, while turning it off asks
+// for the password: whoever held a session cookie could remove the second
+// factor, or swap in a secret only they knew. The condition is in the UPDATE
+// so a concurrent confirm cannot slip between a check and the write.
 func (d *DB) beginTOTP(u *User) (secret, url string, err error) {
 	key, err := totp.Generate(totp.GenerateOpts{Issuer: "Homelab RMM", AccountName: u.Username})
 	if err != nil {
 		return "", "", err
 	}
-	if _, err := d.Exec(`UPDATE users SET totp_secret = ?, totp_enabled = 0 WHERE id = ?`, key.Secret(), u.ID); err != nil {
+	res, err := d.Exec(`UPDATE users SET totp_secret = ?, totp_enabled = 0 WHERE id = ? AND totp_enabled = 0`, key.Secret(), u.ID)
+	if err != nil {
 		return "", "", err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return "", "", errTOTPAlreadyOn
 	}
 	return key.Secret(), key.URL(), nil
 }

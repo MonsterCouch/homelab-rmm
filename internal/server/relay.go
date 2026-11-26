@@ -133,6 +133,15 @@ func (s *Server) handleShellWS(w http.ResponseWriter, r *http.Request) {
 	// socket goes.
 	defer keepViewerAlive(ws)()
 	sw := &wsWriter{c: ws}
+	// The checks above ran once. Keep this socket answerable to them: signing
+	// out, a password reset, a demotion, a narrower scope or deleting the
+	// account ends the terminal instead of leaving it open until the tab
+	// closes. Closing the socket fails the read below, and the handler's own
+	// teardown then closes the shell on the device.
+	defer s.trackStream(r, func(u *User) bool { return s.mayOperate(u, agentID) }, func() {
+		sw.writeClose(websocket.ClosePolicyViolation, "your access to this device ended")
+		ws.Close()
+	})()
 	send := func(v any) { sw.json(v) }
 	// ?webrtc=1: the viewer wants the terminal bytes over a WebRTC data
 	// channel (docs/TERMINAL-PROTOCOL.md); the relay stays the fallback.
@@ -585,6 +594,13 @@ func (s *Server) handleDesktopViewerWS(w http.ResponseWriter, r *http.Request) {
 	// read deadline is installed before anything reads this socket.
 	defer keepViewerAlive(viewer)()
 	vw := &wsWriter{c: viewer}
+	// As for the terminal: revoking the operator's access ends the session.
+	// Closing the viewer is what every wait below and the bridge already
+	// treat as the end, so the helper on the device is torn down with it.
+	defer s.trackStream(r, func(u *User) bool { return s.mayOperate(u, agentID) }, func() {
+		vw.writeClose(websocket.ClosePolicyViolation, "your access to this device ended")
+		viewer.Close()
+	})()
 	// Read the viewer from the moment it is upgraded. The waits below need to
 	// know when the viewer goes away, and r.Context() cannot tell them: after
 	// the hijack it is only cancelled once this handler returns.

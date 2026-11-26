@@ -482,9 +482,19 @@ func (s *Server) takePending(id string) *pendingManifest {
 	return p
 }
 
+// staleSignerMsg is the refusal for a signature made with a key that is still
+// in the trust bundle but whose owner is no longer an operator.
+func staleSignerMsg(owner string) string {
+	return "signature rejected: " + owner + " is in the trust bundle but is no longer an operator who can sign. An administrator must remove the key from the trust bundle"
+}
+
 // verifyAndAdd checks one assertion against the manifest and the bundle in
 // force, stores it, and reports where the manifest stands. When it returns
 // complete the caller must dispatch (the manifest is already claimed).
+//
+// The bundle says which keys count; the accounts table says whether a key's
+// owner is still someone who may operate devices. Both must hold, because the
+// bundle outlives a demotion until it is rotated.
 func (s *Server) verifyAndAdd(p *pendingManifest, a protocol.Assertion, r *http.Request) (have, need int, owner string, complete bool, status int, msg string) {
 	b := s.activeBundle(p.org)
 	if b == nil {
@@ -497,6 +507,9 @@ func (s *Server) verifyAndAdd(p *pendingManifest, a protocol.Assertion, r *http.
 			m += ": " + strings.Join(errs, "; ")
 		}
 		return 0, 0, "", false, http.StatusBadRequest, m
+	}
+	if !s.db.signerIsLive(a.Cred, owners[0]) {
+		return 0, 0, "", false, http.StatusForbidden, staleSignerMsg(owners[0])
 	}
 	st := &s.signing
 	st.mu.Lock()

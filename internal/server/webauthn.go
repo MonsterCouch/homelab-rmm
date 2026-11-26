@@ -228,6 +228,50 @@ func (d *DB) bundleCredentials() (map[string][]string, error) {
 	return out, rows.Err()
 }
 
+// bundleKeysOf reports whether any security key of the user is listed in a
+// current trust bundle.
+func (d *DB) bundleKeysOf(userID int64) (bool, error) {
+	inBundle, err := d.bundleCredentials()
+	if err != nil {
+		return false, err
+	}
+	rows, err := d.Query(`SELECT id FROM webauthn_credentials WHERE user_id = ?`, userID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return false, err
+		}
+		if len(inBundle[id]) > 0 {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// signerIsLive reports whether the key behind an assertion still belongs to
+// an account that may operate devices. Agents verify against the trust
+// bundle, and the bundle only changes by a signed rotation, so a key stays in
+// it after its owner is demoted (or, before deletion was guarded, deleted).
+// Until the bundle is rotated the server is the one place that can refuse to
+// count that key, and it must: otherwise a former operator still completes a
+// two-person approval that any remaining technician submits for them.
+func (d *DB) signerIsLive(credID, owner string) bool {
+	if raw, err := b64dec(credID); err == nil {
+		credID = actionauth.EncodeB64(raw)
+	}
+	var username, role string
+	err := d.QueryRow(`SELECT u.username, u.role FROM webauthn_credentials c JOIN users u ON u.id = c.user_id WHERE c.id = ?`, credID).
+		Scan(&username, &role)
+	if err != nil {
+		return false
+	}
+	return username == owner && (&User{Role: role}).CanWrite()
+}
+
 func markInBundle(creds []Credential, inBundle map[string][]string) {
 	for i := range creds {
 		if orgs := inBundle[creds[i].ID]; len(orgs) > 0 {
